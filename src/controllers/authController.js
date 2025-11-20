@@ -2,7 +2,7 @@ import User from "../models/user.model.js";
 import bcrypt from "bcryptjs"
 import crypto from "crypto"
 import { sign } from "../services/jwtService.js";
-import { generateOtp, sendOtpEmail, sendOtpSms } from "../services/otpService.js";
+import { generateOtp, sendOtpEmail, sendOtpSms } from "../services/OTPService.js";
 
 export const signUp = async (req,res) => {
     try {
