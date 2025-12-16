@@ -1,15 +1,58 @@
 import express from "express";
-import { authMiddleware } from "../middleware/authMiddleware.js";
-import * as friendCtrl from "../controllers/friendController.js"
+import { authMiddleware as auth } from "../middleware/authMiddleware.js";
 
-// import { authMiddleware } from "../middlewares/auth.middleware.js"; // if you have auth
+import {
+  sendRequest,
+  respond,
+  searchFriends,
+  createDummyIncomingRequest,
+} from "../controllers/friendController.js";
 
-export default (io, presence) => {
+/**
+ * Friend routes need access to:
+ * - io       → to emit socket events
+ * - presence → to know who is online
+ */
+export default function friendRoutes(io, presence) {
   const router = express.Router();
 
-  router.post("/send", authMiddleware, (req, res) => friendCtrl.sendRequest(req, res, io, presence));
-  router.post("/respond", authMiddleware, (req, res) => friendCtrl.respond(req, res, io, presence));
-  router.get("/search", authMiddleware, friendCtrl.searchFriends);
+  /**
+   * Search friends
+   * GET /api/friend/search?q=
+   */
+  router.get("/search", auth, searchFriends);
+
+  /**
+   * Send friend request
+   * POST /api/friend/request
+   * body: { toUserId }
+   */
+  router.post(
+    "/request",
+    auth,
+    (req, res) => sendRequest(req, res, io, presence)
+  );
+
+  /**
+   * Respond to friend request
+   * POST /api/friend/respond
+   * body: { requestId, accept }
+   */
+  router.post(
+    "/respond",
+    auth,
+    (req, res) => respond(req, res, io, presence)
+  );
+
+  /**
+   * Create dummy incoming request (dev/testing only)
+   * POST /api/friend/dummy_incoming
+   */
+  router.post(
+    "/dummy_incoming",
+    auth,
+    createDummyIncomingRequest
+  );
 
   return router;
-};
+}

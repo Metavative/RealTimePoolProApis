@@ -1,80 +1,87 @@
-// src/socketHandlers/matchHandler.js
-// import  getSocketId  from "../redisPresence.js"; // Aapke redisPresence.js se zaroori function
+// services/socket_handler/matchHandler.js
 
-import { getSocketId } from "../redisPresence..js";
-
-// import { getSocketId } from "../redisPresence.js";
+function getSocketIdFromPresence(presence, userId) {
+  if (!presence) return null;
+  if (!userId) return null;
+  return presence.get(String(userId)) || null;
+}
 
 /**
- * Match Challenge ke Real-Time events ko handle karta hai.
- * @param {SocketIO.Server} io
- * @param {SocketIO.Socket} socket
+ * Match challenge real time events
+ * @param {import("socket.io").Server} io
+ * @param {import("socket.io").Socket} socket
+ * @param {Map<string,string>} presence
  */
-export default function registerMatchHandlers(io, socket) {
-  
-  // ==================================
-  // 1. CHALLENGE SENT (Server-to-Opponent)
-  // Yeh event HTTP POST /match/challenge se call nahi hoga. 
-  // Yeh event client khud chalayega. Jab /match/challenge API hit ho, 
-  // uske response mein client yeh event chalaega.
-  socket.on("match:challenge_sent", async ({ opponentId, matchId, entryFee, challengerInfo }) => {
+export default function registerMatchHandlers(io, socket, presence) {
+  // 1) challenge sent (server forwards to opponent)
+  socket.on("match:challenge_sent", async (payload) => {
     try {
-      if (!opponentId) return;
+      const opponentId = payload?.opponentId;
+      const matchId = payload?.matchId;
+      const entryFee = payload?.entryFee;
+      const challengerInfo = payload?.challengerInfo;
 
-      // Opponent ka socket ID Redis se dhoondo
-      const opponentSocketId = await getSocketId(opponentId);
+      if (!opponentId || !matchId) return;
 
-      if (opponentSocketId) {
-        console.log(`Sending challenge to ${opponentId} at socket ${opponentSocketId}`);
-        
-        // Opponent ko 'challenge:received' event bhejo
-        io.to(opponentSocketId).emit("match:challenge_received", {
-          matchId,
-          entryFee,
-          challenger: challengerInfo, // nickname, avatar, level jaisi info
-          timestamp: Date.now(),
-        });
-      }
+      const opponentSocketId = getSocketIdFromPresence(presence, opponentId);
+      if (!opponentSocketId) return;
+
+      io.to(opponentSocketId).emit("match:challenge_received", {
+        matchId,
+        entryFee,
+        challengerInfo,
+        timestamp: Date.now(),
+      });
     } catch (error) {
-      console.error("Error in match:challenge_sent:", error.message);
+      console.error("match:challenge_sent error", error?.message || error);
     }
   });
 
-  // ==================================
-  // 2. CHALLENGE ACCEPTED (Server-to-Challenger)
-  // Yeh event /match/accept API call ke response ke baad client chalaega.
-  socket.on("match:challenge_accepted", async ({ challengerId, matchId }) => {
+  // 2) challenge accepted (server forwards to challenger)
+  socket.on("match:challenge_accepted", async (payload) => {
     try {
-      if (!challengerId) return;
-      
-      const challengerSocketId = await getSocketId(challengerId);
+      const challengerId = payload?.challengerId;
+      const matchId = payload?.matchId;
 
-      if (challengerSocketId) {
-        // Challenger ko 'match:started' event bhejo
-        io.to(challengerSocketId).emit("match:started", {
-          matchId,
-          message: "Your challenge has been accepted. Starting match...",
-        });
-      }
+      if (!challengerId || !matchId) return;
+
+      const challengerSocketId = getSocketIdFromPresence(presence, challengerId);
+      if (!challengerSocketId) return;
+
+      io.to(challengerSocketId).emit("match:started", {
+        matchId,
+        message: "Your challenge has been accepted. Starting match.",
+      });
     } catch (error) {
-      console.error("Error in match:challenge_accepted:", error.message);
+      console.error("match:challenge_accepted error", error?.message || error);
     }
   });
-  
-  // ==================================
-  // 3. MATCH RESULT NOTIFICATION
-  // Yeh event /match/finish API call ke response ke baad client chalaega.
-  socket.on("match:completed_notification", async ({ players, matchId, winnerId }) => {
-    // Dono players ko result bhejo
-    for (const userId of players) {
-      const targetSocketId = await getSocketId(userId);
-      if (targetSocketId) {
+
+  // 3) match completed (server notifies both players)
+  socket.on("match:completed_notification", async (payload) => {
+    try {
+      const players = payload?.players;
+      const matchId = payload?.matchId;
+      const winnerId = payload?.winnerId;
+
+      if (!matchId) return;
+      if (!Array.isArray(players) || players.length === 0) return;
+
+      for (const userId of players) {
+        const targetSocketId = getSocketIdFromPresence(presence, userId);
+        if (!targetSocketId) continue;
+
         io.to(targetSocketId).emit("match:result", {
           matchId,
           winnerId,
-          message: winnerId === userId ? "Congratulations! You won the match." : "You lost the match. Better luck next time.",
+          message:
+            String(winnerId) === String(userId)
+              ? "Congratulations! You won the match."
+              : "You lost the match. Better luck next time.",
         });
       }
+    } catch (error) {
+      console.error("match:completed_notification error", error?.message || error);
     }
   });
 }

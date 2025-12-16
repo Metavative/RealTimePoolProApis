@@ -1,150 +1,143 @@
 import FriendRequest from "../models/friend.model.js";
 import User from "../models/user.model.js";
+import crypto from "crypto";
 
 /**
- * ==========================
  * SEND FRIEND REQUEST
- * ==========================
  */
 export async function sendRequest(req, res, io, presence) {
   try {
     const from = req.userId;
     const { to } = req.body;
-    console.log("📤 Sending request:", { from, to });
 
     if (!to) {
-      console.log("❌ No recipient provided");
       return res.status(400).json({ message: "Recipient (to) is required" });
     }
-    if (from === to) {
-      console.log("❌ Tried to send to self");
+
+    if (String(from) === String(to)) {
       return res.status(400).json({ message: "You cannot send a request to yourself" });
     }
 
-    const sender = await User.findById(from);
-    if (sender?.friends?.includes(to)) {
-      console.log("❌ Already friends");
+    const sender = await User.findById(from).select("friends");
+    if (!sender) {
+      return res.status(404).json({ message: "Sender not found" });
+    }
+
+    if (sender.friends?.some((id) => String(id) === String(to))) {
       return res.status(400).json({ message: "Already friends" });
     }
 
-    const exists = await FriendRequest.findOne({ from, to, status: "pending" });
-    if (exists) {
-      console.log("❌ Request already pending");
+    const existing = await FriendRequest.findOne({
+      from,
+      to,
+      status: "pending",
+    }).select("_id");
+
+    if (existing) {
       return res.status(400).json({ message: "Friend request already pending" });
     }
 
-    const fr = await FriendRequest.create({ from, to });
-    console.log("✅ Friend request created:", fr._id);
+    const fr = await FriendRequest.create({
+      from,
+      to,
+      status: "pending",
+    });
 
-    const toSocket = presence.get(to?.toString());
-    if (toSocket) io.to(toSocket).emit("friend:request:new", { from, request: fr });
+    // 🔔 Notify receiver if online
+    const toSocket = presence.get(String(to));
+    if (toSocket) {
+      io.to(toSocket).emit("friend:request:new", {
+        requestId: fr._id,
+        from,
+      });
+    }
 
-    res.json({ success: true, fr });
+    return res.json({ success: true, fr });
   } catch (error) {
-    console.error("❌ sendRequest error:", error);
-    res.status(500).json({ message: error.message });
+    console.error("sendRequest error:", error);
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
 }
 
-
 /**
- * ==========================
  * RESPOND TO FRIEND REQUEST
- * ==========================
  */
 export async function respond(req, res, io, presence) {
   try {
+    const userId = req.userId;
     const { requestId, accept } = req.body;
-    const fr = await FriendRequest.findById(requestId);
-    if (!fr) return res.status(404).json({ message: "Request not found" });
 
-    // Update request status
+    if (!requestId) {
+      return res.status(400).json({ message: "requestId required" });
+    }
+
+    const fr = await FriendRequest.findById(requestId);
+    if (!fr) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    // Only receiver can respond
+    if (String(fr.to) !== String(userId)) {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+
     fr.status = accept ? "accepted" : "rejected";
     await fr.save();
 
-    // If accepted, add to both users' friend lists
     if (accept) {
-      await User.findByIdAndUpdate(fr.from, { $addToSet: { friends: fr.to } });
-      await User.findByIdAndUpdate(fr.to, { $addToSet: { friends: fr.from } });
+      await User.findByIdAndUpdate(fr.from, {
+        $addToSet: { friends: fr.to },
+      });
+
+      await User.findByIdAndUpdate(fr.to, {
+        $addToSet: { friends: fr.from },
+      });
     }
 
-    // ⚡ Real-time sync: notify both users
-    const fromSocket = presence.get(fr.from?.toString());
-    const toSocket = presence.get(fr.to?.toString());
+    // 🔔 Notify both users if online
+    const fromSocket = presence.get(String(fr.from));
+    const toSocket = presence.get(String(fr.to));
 
-    if (fromSocket) io.to(fromSocket).emit("friend:request:updated", fr);
-    if (toSocket) io.to(toSocket).emit("friend:request:updated", fr);
+    if (fromSocket) {
+      io.to(fromSocket).emit("friend:request:updated", fr);
+    }
 
-    res.json({ success: true, fr });
-  } catch (err) {
-    console.error("❌ respond error:", err);
-    res.status(500).json({ message: err.message });
+    if (toSocket) {
+      io.to(toSocket).emit("friend:request:updated", fr);
+    }
+
+    return res.json({ success: true, fr });
+  } catch (error) {
+    console.error("respond error:", error);
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
- 
 }
 
 /**
- * ==========================
  * SEARCH FRIENDS
- * ==========================
  */
-// export async function searchFriends(req, res) {
-//   try {
-//     const userId = req.userId;
-//     const { query } = req.query; // nickname or userIdTag
-
-//     // Get current user's friends
-//     const currentUser = await User.findById(userId).populate(
-//       "friends",
-//       "profile.nickname profile.avatar stats.userIdTag profile.onlineStatus"
-//     );
-
-//     const friendIds = currentUser?.friends?.map((f) => f._id.toString()) || [];
-
-//     // Build search filter
-//     const searchFilter = query
-//       ? {
-//           $or: [
-//             { "profile.nickname": { $regex: query, $options: "i" } },
-//             { "stats.userIdTag": { $regex: query, $options: "i" } },
-//           ],
-//         }
-//       : {};
-
-//     // Find matching users
-//     const users = await User.find(searchFilter)
-//       .select("profile.nickname profile.avatar stats.userIdTag profile.onlineStatus")
-//       .lean();
-
-//     // Mark relation status
-//     const result = users.map((u) => {
-//       let relation = "none";
-//       if (friendIds.includes(u._id.toString())) relation = "friend";
-//       return { ...u, relation };
-//     });
-
-//     res.json({ success: true, data: result });
-//   } catch (error) {
-//     console.error("❌ searchFriends error:", error);
-//     res.status(500).json({ message: error.message });
-//   }
-// }
-
 export async function searchFriends(req, res) {
   try {
     const userId = req.userId;
-    const { query } = req.query;
+    const query = (req.query.query || "").trim();
 
-    // Get current user's friends
-    const currentUser = await User.findById(userId).populate(
-      "friends",
-      "profile.nickname profile.avatar stats.userIdTag profile.onlineStatus"
+    const currentUser = await User.findById(userId)
+      .populate("friends", "_id")
+      .lean();
+
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const friendIds = (currentUser.friends || []).map((f) =>
+      String(f._id)
     );
 
-    const friendIds = currentUser?.friends?.map((f) => f._id.toString()) || [];
-
-    // Build search filter
-    const searchFilter = query
+    const filter = query
       ? {
           $or: [
             { "profile.nickname": { $regex: query, $options: "i" } },
@@ -153,56 +146,117 @@ export async function searchFriends(req, res) {
         }
       : {};
 
-    // Find matching users
-    const users = await User.find(searchFilter)
-      .select("profile.nickname profile.avatar stats.userIdTag profile.onlineStatus")
+    const users = await User.find(filter)
+      .select(
+        "profile.nickname profile.avatar profile.onlineStatus stats.userIdTag"
+      )
       .lean();
 
-    // Find all pending requests involving this user
     const requests = await FriendRequest.find({
       $or: [{ from: userId }, { to: userId }],
       status: "pending",
     }).lean();
 
-    // Build response
-    const result = users.map((u) => {
-      const uid = u._id.toString();
-      let status = "none";
-      let requestId = null;
+    const result = users
+      .filter((u) => String(u._id) !== String(userId))
+      .map((u) => {
+        const uid = String(u._id);
 
-      if (friendIds.includes(uid)) {
-        status = "friend";
-      } else {
-        const sentByMe = requests.find(
-          (r) => r.from.toString() === userId && r.to.toString() === uid
-        );
-        const sentToMe = requests.find(
-          (r) => r.to.toString() === userId && r.from.toString() === uid
-        );
+        let status = "none";
+        let requestId = null;
 
-        if (sentByMe) {
-          status = "pending"; // ✅ I sent request
-          requestId = sentByMe._id;
-        } else if (sentToMe) {
-          status = "incoming"; // ✅ They sent me request
-          requestId = sentToMe._id;
+        if (friendIds.includes(uid)) {
+          status = "friend";
+        } else {
+          const sentByMe = requests.find(
+            (r) =>
+              String(r.from) === String(userId) &&
+              String(r.to) === uid
+          );
+
+          const sentToMe = requests.find(
+            (r) =>
+              String(r.to) === String(userId) &&
+              String(r.from) === uid
+          );
+
+          if (sentByMe) {
+            status = "pending";
+            requestId = String(sentByMe._id);
+          } else if (sentToMe) {
+            status = "incoming";
+            requestId = String(sentToMe._id);
+          }
         }
-      }
 
-      return {
-        _id: uid,
-        nickname: u?.profile?.nickname || "Unknown User",
-        avatar: u?.profile?.avatar || "",
-        userIdTag: u?.stats?.userIdTag || "",
-        onlineStatus: u?.profile?.onlineStatus || false,
-        status,
-        requestId,
-      };
+        return {
+          id: uid,
+          nickname: u.profile?.nickname || "Unknown",
+          avatar: u.profile?.avatar || "",
+          userIdTag: u.stats?.userIdTag || "",
+          onlineStatus: Boolean(u.profile?.onlineStatus),
+          status,
+          requestId,
+        };
+      });
+
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    console.error("searchFriends error:", error);
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
+  }
+}
+
+/**
+ * DUMMY INCOMING REQUEST (DEV ONLY)
+ */
+export async function createDummyIncomingRequest(req, res) {
+  try {
+    const userId = req.userId;
+
+    let dummyUser = await User.findOne({
+      email: "dummy@poolpro.dev",
+    }).select("_id");
+
+    if (!dummyUser) {
+      const tag = `player_${crypto.randomBytes(3).toString("hex")}`;
+      dummyUser = await User.create({
+        email: "dummy@poolpro.dev",
+        profile: {
+          nickname: "DummyPlayer",
+          avatar: "",
+          onlineStatus: true,
+        },
+        stats: { userIdTag: tag },
+      });
+    }
+
+    const exists = await FriendRequest.findOne({
+      from: dummyUser._id,
+      to: userId,
+      status: "pending",
     });
 
-    res.json({ success: true, data: result });
+    if (exists) {
+      return res.json({
+        success: true,
+        message: "Dummy request already exists",
+      });
+    }
+
+    const fr = await FriendRequest.create({
+      from: dummyUser._id,
+      to: userId,
+      status: "pending",
+    });
+
+    return res.json({ success: true, fr });
   } catch (error) {
-    console.error("❌ searchFriends error:", error);
-    res.status(500).json({ message: error.message });
+    console.error("createDummyIncomingRequest error:", error);
+    return res.status(500).json({
+      message: "Failed to create dummy request",
+    });
   }
 }

@@ -1,95 +1,175 @@
 import User from "../../models/user.model.js";
 
-/**
- * Zaroori Utility: GeoJSON $near query se qareebi online players ko nikalta hai.
- */
-async function getNearbyPlayers(userId, radiusKm = 5) {
-  const user = await User.findById(userId);
-  // Agar user ka location data nahi hai, to ruk jayen.
-  if (!user || !user.location?.coordinates) return []; 
+const DASH = String.fromCharCode(45);
 
-  const [lng, lat] = user.location.coordinates;
+async function getOnlineUsersFromPresence(presence) {
+  const ids = Array.from(presence.keys());
+  if (ids.isEmpty) return [];
+
+  const users = await User.find({ _id: { $in: ids } })
+    .select(
+      "profile.nickname profile.avatar profile.onlineStatus profile.verified stats.userIdTag stats.rank stats.totalWinnings"
+    )
+    .lean();
+
+  const map = new Map(users.map((u) => [String(u._id), u]));
+  return ids.map((id) => map.get(String(id))).filter(Boolean);
+}
+
+async function getNearbyPlayersByCoords(userId, lng, lat, radiusKm = 5) {
+  if (lng === null || lng === undefined || lat === null || lat === undefined) {
+    return [];
+  }
 
   return User.find({
     _id: { $ne: userId },
-    // Conflict 3 Fix: Query ko 'profile.onlineStatus' se theek kiya gaya
-    "profile.onlineStatus": true, 
+    "profile.onlineStatus": true,
     location: {
       $near: {
         $geometry: { type: "Point", coordinates: [lng, lat] },
-        $maxDistance: radiusKm * 1000, // meters
+        $maxDistance: radiusKm * 1000,
       },
     },
-  }).select("profile.nickname profile.avatar stats.totalWinnings profile.verified location");
+  })
+    .select(
+      "profile.nickname profile.avatar profile.onlineStatus profile.verified stats.userIdTag stats.rank stats.totalWinnings location"
+    )
+    .lean();
 }
 
-/**
- * Socket.IO logic for live presence (status, location, nearby players)
- */
+function pickLngLat(location) {
+  if (!location) return { lng: null, lat: null };
+
+  const lng = location.lng ?? location.longitude ?? null;
+  const lat = location.lat ?? location.latitude ?? null;
+
+  if (typeof lng !== "number" || typeof lat !== "number") {
+    return { lng: null, lat: null };
+  }
+  return { lng, lat };
+}
+
 export default function registerPresenceHandlers(io, socket, presence) {
-  
-  // Event: Client ki taraf se userId aur location bhej kar identification shuru hoti hai.
-  // Yeh 'player:online' aur 'identify' ka mel hai.
-  socket.on("user:identify", async ({ userId, location }) => {
+  async function identifyUser(userId, location) {
     if (!userId) return;
 
-    // 1. DB Update (Status aur Location dono GeoJSON format mein)
+    const { lng, lat } = pickLngLat(location);
+
     const updateData = {
       "profile.onlineStatus": true,
       lastSeen: new Date(),
     };
-    if (location && location.lng && location.lat) {
-      // Conflict 1 Fix: Location hamesha GeoJSON Point ki tarah save hogi.
-      updateData.location = { type: "Point", coordinates: [location.lng, location.lat] };
+
+    if (lng !== null && lat !== null) {
+      updateData.location = { type: "Point", coordinates: [lng, lat] };
+      updateData["profile.longitude"] = lng;
+      updateData["profile.latitude"] = lat;
     }
+
     await User.findByIdAndUpdate(userId, updateData);
 
-    // 2. Presence Map Update (index.js se shift kiya gaya)
-    socket.userId = userId;
-    presence.set(userId, socket.id);
+    socket.userId = String(userId);
+    presence.set(String(userId), socket.id);
 
-    // 3. Emit global update
-    io.emit("presence:update", {
-      userId,
-      status: "online",
-      onlineUsers: Array.from(presence.keys()),
-    });
-    console.log(`🟢 User ${userId} is now online and identified`);
+    const onlineUsers = await getOnlineUsersFromPresence(presence);
+    io.emit("presence:update", onlineUsers);
 
-    // 4. Nearby Players logic (Agar location update hui hai to)
-    if (location && location.lng && location.lat) {
-      const nearbyPlayers = await getNearbyPlayers(userId);
+    if (lng !== null && lat !== null) {
+      const nearbyPlayers = await getNearbyPlayersByCoords(String(userId), lng, lat);
       socket.emit("nearbyPlayers", nearbyPlayers);
-      
-      // Notify others nearby
-      for (const player of nearbyPlayers) {
-        // io.to() se dusre players ko notify karein
-        const targetSocketId = presence.get(player._id.toString());
-        if(targetSocketId) {
-             io.to(targetSocketId).emit("playerNearby", {
-              userId,
-              nickname: user.profile.nickname, // Agar yahan pura user object mil jaaye to behtar hai
-              location,
-            });
-        }
-      }
     }
-  });
+  }
 
-  // Event: Sirf location update karna (previously 'player:move' and 'updateLocation')
-  socket.on("user:move", async ({ userId, location }) => {
-    if (!userId || !location || !location.lng || !location.lat) return;
-    
-    // Conflict 1 Fix: GeoJSON Point update
-    await User.findByIdAndUpdate(userId, {
-      location: { type: "Point", coordinates: [location.lng, location.lat] },
+  async function moveUser(userId, location) {
+    if (!userId) return;
+
+    const { lng, lat } = pickLngLat(location);
+    if (lng === null || lat === null) return;
+
+    await User.findByIdAndUpdate(String(userId), {
+      location: { type: "Point", coordinates: [lng, lat] },
+      "profile.longitude": lng,
+      "profile.latitude": lat,
       lastSeen: new Date(),
     });
 
-    // Nearby player list ko client ko wapas bhejo
-    const nearbyPlayers = await getNearbyPlayers(userId);
+    const nearbyPlayers = await getNearbyPlayersByCoords(String(userId), lng, lat);
     socket.emit("nearbyPlayers", nearbyPlayers);
+  }
+
+  socket.on("user:identify", async (payload) => {
+    try {
+      await identifyUser(payload?.userId, payload?.location);
+    } catch (e) {
+      console.log("user:identify error", e);
+    }
   });
 
-  // Conflict 2 Fix: Sirf index.js ka disconnect handler use hoga, baaki files se hata diya gaya.
+  socket.on("identify", async (payload) => {
+    try {
+      await identifyUser(payload?.userId, payload?.location);
+    } catch (e) {
+      console.log("identify error", e);
+    }
+  });
+
+  socket.on("player:online", async (payload) => {
+    try {
+      await identifyUser(payload?.userId, payload?.location);
+    } catch (e) {
+      console.log("player:online error", e);
+    }
+  });
+
+  socket.on("userOnline", async (payload) => {
+    try {
+      const id = typeof payload === "string" ? payload : payload?.userId;
+      await identifyUser(id, payload?.location);
+    } catch (e) {
+      console.log("userOnline error", e);
+    }
+  });
+
+  socket.on("user:move", async (payload) => {
+    try {
+      await moveUser(payload?.userId, payload?.location);
+    } catch (e) {
+      console.log("user:move error", e);
+    }
+  });
+
+  socket.on("updateLocation", async (payload) => {
+    try {
+      const loc = { lng: payload?.lng, lat: payload?.lat };
+      await moveUser(payload?.userId, loc);
+    } catch (e) {
+      console.log("updateLocation error", e);
+    }
+  });
+
+  socket.on("player:move", async (payload) => {
+    try {
+      await moveUser(payload?.userId, payload?.location);
+    } catch (e) {
+      console.log("player:move error", e);
+    }
+  });
+
+  socket.on("disconnect", async () => {
+    try {
+      if (!socket.userId) return;
+
+      presence.delete(String(socket.userId));
+
+      await User.findByIdAndUpdate(String(socket.userId), {
+        "profile.onlineStatus": false,
+        lastSeen: new Date(),
+      });
+
+      const onlineUsers = await getOnlineUsersFromPresence(presence);
+      io.emit("presence:update", onlineUsers);
+    } catch (e) {
+      console.log("disconnect presence error", e);
+    }
+  });
 }

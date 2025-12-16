@@ -4,12 +4,12 @@ const FeedbackSchema = new mongoose.Schema({
   avatar: String,
   name: String,
   feedback: String,
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
 });
 
 const ProfileSchema = new mongoose.Schema({
   nickname: String,
-  avatar: { type: String, default: ""},
+  avatar: { type: String, default: "" },
   highestLevelAchieve: String,
   musicPlayer: { type: Boolean, default: true },
   homeTable: String,
@@ -25,7 +25,7 @@ const ProfileSchema = new mongoose.Schema({
   veryCompetitive: { type: String, default: "" },
   onlineStatus: { type: Boolean, default: false },
   onLiveStream: { type: Boolean, default: false },
-   lastSeen: { type: Date, default: Date.now },
+  lastSeen: { type: Date, default: Date.now },
   latitude: { type: Number, default: null },
   longitude: { type: Number, default: null },
 });
@@ -37,7 +37,7 @@ const EarningsSchema = new mongoose.Schema({
   withdrawable: { type: Boolean, default: true },
   entryFeesPaid: { type: Number, default: 0 },
   availableBalance: { type: Number, default: 0 },
-  transactionHistory: [{ type: mongoose.Schema.Types.ObjectId, ref: "Transaction" }]
+  transactionHistory: [{ type: mongoose.Schema.Types.ObjectId, ref: "Transaction" }],
 });
 
 const StatsSchema = new mongoose.Schema({
@@ -53,13 +53,15 @@ const StatsSchema = new mongoose.Schema({
   gamesDrawn: { type: Number, default: 0 },
   avgMatchDurationMinutes: { type: Number, default: 0 },
   tournaments: { type: Number, default: 0 },
-  disputeHistoryCount: { type: Number, default: 0 }
+  disputeHistoryCount: { type: Number, default: 0 },
 });
 
 const UserSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true },
   phone: { type: String, index: true, unique: true, sparse: true },
-  passwordHash: String,
+
+  passwordHash: { type: String, select: false },
+
   clerkId: { type: String, index: true, unique: true, sparse: true },
   googleId: { type: String, index: true, unique: true, sparse: true },
   facebookId: { type: String, index: true, unique: true, sparse: true },
@@ -71,29 +73,29 @@ const UserSchema = new mongoose.Schema({
   stats: StatsSchema,
   friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   createdAt: { type: Date, default: Date.now },
+
   otp: {
     code: String,
-    // expiresAt: Date
+    expiresAt: Date,
   },
-  location: {
-  type: { type: String, enum: ["Point"], default: "Point" },
-  coordinates: { type: [Number], default: [0, 0] }, // [lng, lat]
-},
-lastSeen: { type: Date, default: Date.now },
 
+  location: {
+    type: { type: String, enum: ["Point"], default: "Point" },
+    coordinates: { type: [Number], default: [0, 0] },
+  },
+
+  lastSeen: { type: Date, default: Date.now },
 });
 
 UserSchema.index({ location: "2dsphere" });
 
-
-// ✅ Pre-save hook for profile avatar
 UserSchema.pre("save", function (next) {
   if (this.profile) {
     if (!this.profile.avatar || this.profile.avatar === "") {
       if (this.profile.nickname && this.profile.nickname.length > 0) {
-        this.profile.avatar = this.profile.nickname[0].toUpperCase(); // e.g. "Hassan" => "H"
+        this.profile.avatar = this.profile.nickname[0].toUpperCase();
       } else {
-        this.profile.avatar = "?"; // fallback
+        this.profile.avatar = "?";
       }
     }
   }

@@ -1,219 +1,342 @@
 import User from "../models/user.model.js";
-import bcrypt from "bcryptjs"
-import crypto from "crypto"
+import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import { sign } from "../services/jwtService.js";
 import { generateOtp, sendOtpEmail, sendOtpSms } from "../services/OTPService.js";
 
-export const signUp = async (req,res) => {
-    try {
-        const { email, phone, password, nickname } = req.body;
-    
-    if(!email && !phone) return res.status(400).json({
-        message: "Email or phone required"
-    });
+function safeUser(user) {
+  if (!user) return null;
+  const obj = user.toObject ? user.toObject() : user;
+  delete obj.passwordHash;
+  delete obj.otp;
+  return obj;
+}
 
-    const exists = await User.findOne({ $or: [{ email }, {
-        phone
-    }]});
+function toStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
 
-    if (exists) return res.status(400).json({
-        message: "User exists"
-    });
+function normalizeEmail(email) {
+  const v = toStr(email);
+  if (!v) return undefined;
+  return v.toLowerCase();
+}
 
-    const hash = await bcrypt.hash(password, 10);
+function normalizePhone(phone) {
+  const v = toStr(phone);
+  if (!v) return undefined;
+  return v;
+}
+
+function pickEmailOrPhone(body) {
+  const emailOrPhone = toStr(body.emailOrPhone);
+  if (emailOrPhone) {
+    if (emailOrPhone.includes("@")) return { email: normalizeEmail(emailOrPhone) };
+    return { phone: normalizePhone(emailOrPhone) };
+  }
+
+  const email = normalizeEmail(body.email);
+  const phone = normalizePhone(body.phone);
+
+  if (email) return { email };
+  if (phone) return { phone };
+  return {};
+}
+
+function otpToString(value) {
+  return toStr(value);
+}
+
+async function createUniqueTag() {
+  for (let i = 0; i < 5; i += 1) {
     const tag = `player_${crypto.randomBytes(3).toString("hex")}`;
+    const exists = await User.findOne({ "stats.userIdTag": tag }).select("_id");
+    if (!exists) return tag;
+  }
+  return `player_${crypto.randomBytes(6).toString("hex")}`;
+}
+
+export const signUp = async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const phone = normalizePhone(req.body.phone);
+    const password = toStr(req.body.password);
+    const nickname = toStr(req.body.nickname);
+
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
+    }
+    if (!password) {
+      return res.status(400).json({ message: "Password required" });
+    }
+
+    const queryOr = [
+      email ? { email } : null,
+      phone ? { phone } : null,
+    ].filter(Boolean);
+
+    const existing = await User.findOne({ $or: queryOr }).select("+passwordHash");
+
+    if (existing) {
+      if (!existing.passwordHash) {
+        existing.passwordHash = await bcrypt.hash(password, 10);
+        if (!existing.profile) existing.profile = {};
+        if (!existing.profile.nickname) existing.profile.nickname = nickname || "Player";
+        if (!existing.stats || !existing.stats.userIdTag) {
+          const tag = await createUniqueTag();
+          existing.stats = { ...(existing.stats || {}), userIdTag: tag };
+        }
+        await existing.save();
+
+        const token = sign({ id: existing._id });
+        return res.json({ user: safeUser(existing), token, upgraded: true });
+      }
+
+      return res.status(409).json({ message: "User exists" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const tag = await createUniqueTag();
 
     const user = await User.create({
-        email,
-        phone,
-        passwordHash: hash,
-        profile: { nickname },
-        "state.userIdTaq": tag,
+      email,
+      phone,
+      passwordHash,
+      profile: { nickname: nickname || "Player" },
+      stats: { userIdTag: tag },
     });
-    const token = sign({ id: user._id});
-    res.json({ user, token });
-    } catch (error) {
-        res.status(500).json({
-            messgae: error.message
-        });
+
+    const token = sign({ id: user._id });
+    return res.json({ user: safeUser(user), token });
+  } catch (error) {
+    if (error && error.code === 11000) {
+      return res.status(409).json({ message: "User exists" });
     }
-    
-}  
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
 
-// ==================== LOGIN  ======================
 export async function login(req, res) {
-    
-    try {
-        const { emailOrPhone, password } = req.body;
-    const user = await User.findOne({ $or: [{ email: emailOrPhone}, { phone: emailOrPhone }]});
+  try {
+    const password = toStr(req.body.password);
+    if (!password) {
+      return res.status(400).json({ message: "Password required" });
+    }
 
-    if( !user ) {
-        return res.status(404).json({message: "User not found" });
+    const lookup = pickEmailOrPhone(req.body);
+    if (!lookup.email && !lookup.phone) {
+      return res.status(400).json({ message: "Email or phone required" });
+    }
+
+    const user = await User.findOne(lookup).select("+passwordHash");
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
     }
 
     if (!user.passwordHash) {
-        return res.status(400).json({
-            message: "No local password set"
-        });
+      return res.status(400).json({ message: "No local password set" });
     }
 
-    const matchPassword = await bcrypt.compare(password, user.passwordHash);
-
-    if( !matchPassword ) {
-        return res.status(401).json({
-            message: "Invalid credentials"
-        });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) {
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const token = sign({ id: user._id });
-    res.json({ user, token});
-
-    } catch (error) {
-        res.status(500).json({
-            message: error.message
-        })
-    }
-
+    return res.json({ user: safeUser(user), token });
+  } catch (error) {
+    return res.status(500).json({ message: "Internal server error" });
+  }
 }
 
 export async function requestOtp(req, res) {
-    try {
-        const { email, phone } = req.body;
+  try {
+    const email = normalizeEmail(req.body.email);
+    const phone = normalizePhone(req.body.phone);
 
-        if(!email && !phone) return res.status(400).json({
-            message: "Email or phone required"
-        });
-
-        // Generate OTP
-        const code = generateOtp(4);
-        // EXPIRE AT
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-        let user = await User.findOne( email ? { email } : { phone });
-
-        if( !user ) {
-            user = await User.create({ email, phone, otp: {code, expiresAt}});
-
-        } else {
-            user.otp = { code, expiresAt };
-            await user.save();
-        }
-
-        if (email) await sendOtpEmail(email, code);
-        if( phone ) await sendOtpSms(phone, code);
-
-        res.json({ message: "OTP sent"});
-
-    } catch (error) {
-        res.status(500).json({ message: error.message});
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
     }
+
+    const code = otpToString(generateOtp(4));
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    const query = email ? { email } : { phone };
+
+    let user = await User.findOne(query);
+    if (!user) {
+      const tag = await createUniqueTag();
+      user = await User.create({
+        ...query,
+        otp: { code, expiresAt },
+        profile: { nickname: "Player" },
+        stats: { userIdTag: tag },
+      });
+    } else {
+      user.otp = { code, expiresAt };
+      await user.save();
+    }
+
+    if (email) await sendOtpEmail(email, code);
+    if (phone) await sendOtpSms(phone, code);
+
+    return res.json({ message: "OTP sent" });
+  } catch (error) {
+    if (error && error.code === 11000) {
+      return res.json({ message: "OTP sent" });
+    }
+    return res.status(500).json({ message: "Internal server error" });
+  }
 }
 
 export async function verifyOtp(req, res) {
-    try {
-        const { email, phone, otp } = req.body;
+  try {
+    const email = normalizeEmail(req.body.email);
+    const phone = normalizePhone(req.body.phone);
+    const otp = otpToString(req.body.otp);
 
-        const user = await User.findOne( email ? {email} : { phone } );
-
-        if(!user || !user.otp ) {
-            return res.status(404).json({
-                message: "OTP not found"
-            });
-        }
-
-        if ( user.otp.expiresAt < new Date()) return res.status(400).json({ message: "OTP expired"});
-
-        if (user.otp.code !== otp) return res.status(400).json({
-            message: "Invalid OTP"
-        });
-
-        user.otp = null;
-        user.profile.verified = true;
-        await user.save();
-
-        const token = sign({ id: user._id });
-        res.json({ user, token });
-
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
     }
+    if (!otp) {
+      return res.status(400).json({ message: "OTP required" });
+    }
+
+    const query = email ? { email } : { phone };
+    const user = await User.findOne(query);
+
+    if (!user || !user.otp || !user.otp.code) {
+      return res.status(404).json({ message: "OTP not found" });
+    }
+
+    if (user.otp.expiresAt && user.otp.expiresAt.getTime() < Date.now()) {
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    const expected = otpToString(user.otp.code);
+    if (expected !== otp) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    user.otp = undefined;
+    user.profile = user.profile || {};
+    user.profile.verified = true;
+    await user.save();
+
+    const token = sign({ id: user._id });
+    return res.json({ user: safeUser(user), token });
+  } catch (error) {
+    return res.status(500).json({ message: "Internal server error" });
+  }
 }
 
 export async function forgotPassword(req, res) {
-    try {
-        const { email } = req.body;
-        const user = await User.findOne({ email });
+  try {
+    const email = normalizeEmail(req.body.email);
+    const phone = normalizePhone(req.body.phone);
 
-        if(!user) return res.status(404).json({ message: "User not found" });
-
-        const code = generateOtp(4);
-        user.otp = { code, expiresAt: new Date(Date.now() + 10 + 60 + 1000) };
-
-        await user.save();
-        await sendOtpEmail(email, code);
-        res.json({ message: "Reset OTP sent to email "});
-
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
     }
+
+    const query = email ? { email } : { phone };
+    const user = await User.findOne(query);
+    if (!user) {
+      return res.json({ message: "If the account exists, an OTP was sent" });
+    }
+
+    const code = otpToString(generateOtp(4));
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    user.otp = { code, expiresAt };
+    await user.save();
+
+    if (email) await sendOtpEmail(email, code);
+    if (phone) await sendOtpSms(phone, code);
+
+    return res.json({ message: "Reset OTP sent" });
+  } catch (error) {
+    return res.status(500).json({ message: "Internal server error" });
+  }
 }
 
 export async function resetPassword(req, res) {
-   try {
-     const { email, otp, newPassword } = req.body;
+  try {
+    const email = normalizeEmail(req.body.email);
+    const phone = normalizePhone(req.body.phone);
+    const otp = otpToString(req.body.otp);
+    const newPassword = toStr(req.body.newPassword);
 
-    const user = await User.findOne({ email });
-    if ( !user || !user.otp ) {
-        return res.status(400).json({
-            message: " OTP not found"
-        });
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
+    }
+    if (!otp || !newPassword) {
+      return res.status(400).json({ message: "otp and newPassword required" });
     }
 
-    // if (user.otp.expiresAt < new Date()) return res.status(400).json({ message: "OTP expired" });
-    if (user.otp.code !== otp) return res.status(400).json({ message: "Invalid OTP" });
-    user.passwordHash = await bcrypt.hash( newPassword, 10);
+    const query = email ? { email } : { phone };
+    const user = await User.findOne(query).select("+passwordHash");
 
-    user.otp.code = null;
+    if (!user || !user.otp || !user.otp.code) {
+      return res.status(400).json({ message: "OTP not found" });
+    }
+
+    if (user.otp.expiresAt && user.otp.expiresAt.getTime() < Date.now()) {
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    const expected = otpToString(user.otp.code);
+    if (expected !== otp) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    user.otp = undefined;
     await user.save();
-    res.json({ message: "Password reset"});
-   } catch (error) {
-    res.status(500).json({ message: error.message });
-   }
 
+    return res.json({ message: "Password reset" });
+  } catch (error) {
+    return res.status(500).json({ message: "Internal server error" });
+  }
 }
 
-// Clerk login route: when frontend sends verified Clerk JWT, this endpoint created/fetches user
 export async function clerkLogin(req, res) {
-    try {
-        const { clerkUserId, email, name } = req.body; // Frontend should send basic propfile after Clerk verifies
+  try {
+    const clerkUserId = toStr(req.body.clerkUserId);
+    const email = normalizeEmail(req.body.email);
+    const name = toStr(req.body.name);
 
-        if( !clerkUserId ) return res.status(400).json({ message: "clerkUserId required" });
-
-        let user = await User.findOne({ clerkId: clerkUserId });
-
-        if( !user ) {
-            // If email exists, attach clerkId to existing user
-            if(email) {
-                user = await User.findOne({ email });
-            }
-            if(user) {
-                user.clerkUd = clerkUserId;
-                await user.save();
-            } else {
-                const tag = `player_${crypto.randomBytes(3).toString('hex')}`;
-
-                user = await User.create({
-                    clerkId: clerkUserId,
-                    email,
-                    profile: { nickname: name || "Player" },
-                    "stats.userIdTag": tag
-                });
-            }
-        }
-        const token = sign({ id: user._id });
-        res.json({ user, token });
-    } catch (error) {
-     res.status(500).json({ message: error.message });
-       
+    if (!clerkUserId) {
+      return res.status(400).json({ message: "clerkUserId required" });
     }
+
+    let user = await User.findOne({ clerkId: clerkUserId });
+
+    if (!user && email) {
+      user = await User.findOne({ email });
+      if (user) {
+        user.clerkId = clerkUserId;
+        await user.save();
+      }
+    }
+
+    if (!user) {
+      const tag = await createUniqueTag();
+      user = await User.create({
+        clerkId: clerkUserId,
+        email,
+        profile: { nickname: name || "Player" },
+        stats: { userIdTag: tag },
+      });
+    }
+
+    const token = sign({ id: user._id });
+    return res.json({ user: safeUser(user), token });
+  } catch (error) {
+    if (error && error.code === 11000) {
+      return res.status(409).json({ message: "User exists" });
+    }
+    return res.status(500).json({ message: "Internal server error" });
+  }
 }
