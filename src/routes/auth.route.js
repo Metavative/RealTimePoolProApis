@@ -1,27 +1,36 @@
 import express from "express";
-import * as authctrl from "../controllers/authController.js";
+import {
+  signUp,
+  login,
+  requestOtp,
+  verifyOtp,
+  forgotPassword,
+  resetPassword,
+  clerkLogin,
+} from "../controllers/authController.js";
 
 const router = express.Router();
 
-router.post("/signup", authctrl.signUp);
+router.post("/signup", signUp);
 
-router.post("/login", authctrl.login);
-router.post("/signin", authctrl.login);
+router.post("/login", login);
+router.post("/signin", login);
 
 // Canonical OTP endpoints
-router.post("/otp/request", authctrl.requestOtp);
-router.post("/otp/verify", authctrl.verifyOtp);
+router.post("/otp/request", requestOtp);
+router.post("/otp/verify", verifyOtp);
 
-// ✅ Aliases (organizer/customer often mismatch these)
-router.post("/otp/send", authctrl.requestOtp);
-router.post("/otp/resend", authctrl.requestOtp);
-router.post("/otp/request-otp", authctrl.requestOtp);
-router.post("/otp/validate", authctrl.verifyOtp);
-router.post("/otp/confirm", authctrl.verifyOtp);
+// Aliases (organizer/customer mismatch protection)
+router.post("/otp/send", requestOtp);
+router.post("/otp/resend", requestOtp);
+router.post("/otp/request-otp", requestOtp);
+router.post("/otp/validate", verifyOtp);
+router.post("/otp/confirm", verifyOtp);
 
-router.post("/forgot", authctrl.forgotPassword);
-router.post("/reset", authctrl.resetPassword);
+router.post("/forgot", forgotPassword);
+router.post("/reset", resetPassword);
 
-router.post("/clerk", authctrl.clerkLogin);
+// Keep only if you really use Clerk
+router.post("/clerk", clerkLogin);
 
 export default router;
