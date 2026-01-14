@@ -26,19 +26,30 @@ import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 
 dotenv.config();
 
+// ---- Global crash logging (so Railway ALWAYS shows something) ----
+process.on("unhandledRejection", (reason) => {
+  console.error("🔥 UNHANDLED REJECTION:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("🔥 UNCAUGHT EXCEPTION:", err);
+});
+
 const app = express();
+
+// ✅ Railway runs behind a reverse proxy; required for express-rate-limit + real IP
 app.set("trust proxy", 1);
 
 // Middleware setup
 app.use(helmet());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 // CORS setup
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000", // Restrict origin to your frontend URL or localhost
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
     credentials: true,
   })
 );
@@ -46,10 +57,16 @@ app.use(
 // Logger
 app.use(morgan("dev"));
 
+// ✅ Force-log every request (even if morgan doesn’t show it in some env)
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 // Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200, // Limit requests to 200 per 15 minutes
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -63,9 +80,9 @@ app.use("/api/club", clubRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/zego", zegoRoutes);
 
-// Health check endpoint with additional logging
+// Health check endpoint
 app.get("/api/health", (req, res) => {
-  console.log("Health check endpoint hit");
+  console.log("✅ Health check endpoint hit");
   res.status(200).json({
     status: "ok",
     message: "Server is healthy",
@@ -73,18 +90,12 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error("Server Error:", err.stack);
-  res.status(500).json({
-    success: false,
-    message: "Internal Server Error",
-    error: err.message,
-  });
-});
-
 // Server and Socket.io setup
 const server = Http.createServer(app);
+
+server.on("error", (err) => {
+  console.error("🔥 HTTP SERVER ERROR:", err);
+});
 
 const io = new Server(server, {
   cors: {
@@ -96,7 +107,7 @@ const io = new Server(server, {
 // Presence map for online players
 const presence = new Map();
 
-// Routes
+// Friend routes need io/presence
 app.use("/api/friend", friendRoutes(io, presence));
 
 // User status endpoint
@@ -114,7 +125,9 @@ async function emitOnlinePlayers() {
   }
 
   const users = await User.find({ _id: { $in: ids } })
-    .select("profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag")
+    .select(
+      "profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag"
+    )
     .lean();
 
   io.emit("presence:update", users);
@@ -122,7 +135,9 @@ async function emitOnlinePlayers() {
 
 // Get nearby players based on the user's location
 async function getNearbyPlayersForUser(userId, radiusKm = 5) {
-  const me = await User.findById(userId).select("location profile.latitude profile.longitude").lean();
+  const me = await User.findById(userId)
+    .select("location profile.latitude profile.longitude")
+    .lean();
   if (!me) return [];
 
   const coords = me.location?.coordinates;
@@ -141,7 +156,9 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
       },
     },
   })
-    .select("profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location")
+    .select(
+      "profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location"
+    )
     .lean();
 
   return nearby;
@@ -149,7 +166,7 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
 
 // Socket.io connection handler
 io.on("connection", (socket) => {
-  console.log(`Socket connected: ${socket.id}`);
+  console.log(`🔌 Socket connected: ${socket.id}`);
 
   registerMatchHandlers(io, socket, presence);
 
@@ -204,7 +221,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("updateLocation", async (payload) => {
-    if (!payload || !payload.userId || typeof payload.lat !== "number" || typeof payload.lng !== "number") {
+    if (
+      !payload ||
+      !payload.userId ||
+      typeof payload.lat !== "number" ||
+      typeof payload.lng !== "number"
+    ) {
       console.error("Invalid location update payload:", payload);
       return;
     }
@@ -236,13 +258,32 @@ io.on("connection", (socket) => {
           lastSeen: new Date(),
         });
         await emitOnlinePlayers();
-        console.log(`User offline: ${uid}`);
+        console.log(`👤 User offline: ${uid}`);
       } catch (err) {
         console.error("Error updating user status on disconnect:", err);
       }
     }
 
-    console.log(`Socket disconnected: ${socket.id}`);
+    console.log(`❌ Socket disconnected: ${socket.id}`);
+  });
+});
+
+// ✅ Error handling middleware MUST be after routes
+app.use((err, req, res, next) => {
+  console.error("🔥 EXPRESS ERROR:");
+  console.error("Route:", req.method, req.originalUrl);
+  console.error("Message:", err?.message);
+  console.error("Stack:", err?.stack);
+
+  // Log body safely (avoid huge dumps)
+  try {
+    console.error("Body:", JSON.stringify(req.body || {}).slice(0, 2000));
+  } catch (_) {}
+
+  res.status(500).json({
+    success: false,
+    message: "Internal Server Error",
+    error: err?.message || "Unknown error",
   });
 });
 
@@ -251,13 +292,18 @@ const PORT = process.env.PORT || 4000;
 // Start server
 (async () => {
   try {
+    console.log("🚀 Booting server...");
     await connectDb();
+    console.log("✅ DB connected");
+
     await connectCloudinary();
+    console.log("✅ Cloudinary connected");
+
     server.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running on port ${PORT}`.bgBrightGreen.black.bold);
     });
   } catch (err) {
-    console.error("Failed to start server:", err.message);
+    console.error("🔥 Failed to start server:", err);
     process.exit(1);
   }
 })();
