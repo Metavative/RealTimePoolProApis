@@ -78,8 +78,9 @@ export async function createBooking(req, res) {
 // - business_license (pdf)
 export async function uploadVerificationDocuments(req, res) {
   try {
-    const venueName = String(req.body.venue_name || "").trim();
-    const venueAddress = String(req.body.venue_address || "").trim();
+    const venueName = String(req.body.venue_name || req.body.venueName || "").trim();
+const venueAddress = String(req.body.venue_address || req.body.venueAddress || "").trim();
+
 
     if (!venueName) {
       return res.status(400).json({ message: "venue_name is required" });
