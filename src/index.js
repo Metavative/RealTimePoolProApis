@@ -27,6 +27,7 @@ import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1);
 
 // Middleware setup
 app.use(helmet());
