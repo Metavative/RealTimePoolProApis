@@ -7,8 +7,12 @@ import { generateOtp, sendOtpEmail, sendOtpSms } from "../services/OTPService.js
 function safeUser(user) {
   if (!user) return null;
   const obj = user.toObject ? user.toObject() : user;
+
+  // Remove sensitive fields (support both naming styles)
   delete obj.passwordHash;
+  delete obj.password;
   delete obj.otp;
+
   return obj;
 }
 
@@ -32,6 +36,7 @@ function normalizePhone(phone) {
 /**
  * Supports:
  * - { emailOrPhone: "abc@email.com" } OR { emailOrPhone: "+447..." }
+ * - { identifier: "..." }
  * - { email: "..." } or { phone: "..." }
  */
 function pickEmailOrPhone(body) {
@@ -39,6 +44,12 @@ function pickEmailOrPhone(body) {
   if (emailOrPhone) {
     if (emailOrPhone.includes("@")) return { email: normalizeEmail(emailOrPhone) };
     return { phone: normalizePhone(emailOrPhone) };
+  }
+
+  const identifier = toStr(body.identifier);
+  if (identifier) {
+    if (identifier.includes("@")) return { email: normalizeEmail(identifier) };
+    return { phone: normalizePhone(identifier) };
   }
 
   const email = normalizeEmail(body.email);
@@ -68,14 +79,45 @@ async function createUniqueTag() {
   return `player_${crypto.randomBytes(6).toString("hex")}`;
 }
 
+// Detect which password field exists on schema (helps strict schemas)
+function getPasswordFromUser(user) {
+  // Support both field names
+  return user?.passwordHash || user?.password || "";
+}
+
+function setPasswordOnUser(user, hash) {
+  // Set both; strict schema will keep whichever exists
+  user.passwordHash = hash;
+  user.password = hash;
+}
+
+function pickNickname(body, email, phone) {
+  const nickname = toStr(body.nickname);
+  if (nickname) return nickname;
+
+  // fallback: email left side or phone, but NEVER "Player"
+  if (email && email.includes("@")) {
+    const left = email.split("@")[0]?.trim();
+    if (left) return left;
+  }
+  if (phone) return phone;
+  return "";
+}
+
 export const signUp = async (req, res) => {
+  const requestId = crypto.randomBytes(4).toString("hex");
   try {
     const body = getBody(req);
 
     const email = normalizeEmail(body.email);
     const phone = normalizePhone(body.phone);
     const password = toStr(body.password);
-    const nickname = toStr(body.nickname);
+
+    // Organizer/player fields: accept but do not break
+    const role = toStr(body.role) || toStr(body.userType) || "";
+    const organizer = body.organizer && typeof body.organizer === "object" ? body.organizer : null;
+
+    const nickname = pickNickname(body, email, phone);
 
     if (!email && !phone) {
       return res.status(400).json({ message: "Email or phone required" });
@@ -86,17 +128,37 @@ export const signUp = async (req, res) => {
 
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
 
-    const existing = await User.findOne({ $or: queryOr }).select("+passwordHash");
+    // Select both password fields in case your schema uses one or the other
+    const existing = await User.findOne({ $or: queryOr }).select("+passwordHash +password");
 
     if (existing) {
-      if (!existing.passwordHash) {
-        existing.passwordHash = await bcrypt.hash(password, 10);
-        if (!existing.profile) existing.profile = {};
-        if (!existing.profile.nickname) existing.profile.nickname = nickname || "Player";
-        if (!existing.stats || !existing.stats.userIdTag) {
+      const existingPass = getPasswordFromUser(existing);
+
+      // If user exists but had no local password, "upgrade" it
+      if (!existingPass) {
+        const hash = await bcrypt.hash(password, 10);
+        setPasswordOnUser(existing, hash);
+
+        existing.profile = existing.profile || {};
+        if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
+
+        existing.stats = existing.stats || {};
+        if (!existing.stats.userIdTag) {
           const tag = await createUniqueTag();
-          existing.stats = { ...(existing.stats || {}), userIdTag: tag };
+          existing.stats.userIdTag = tag;
         }
+
+        // Optional: store role/type if your schema supports it
+        if (role) {
+          existing.profile.role = existing.profile.role || role;
+          existing.profile.userType = existing.profile.userType || role;
+        }
+
+        // Optional: store organizer draft if schema supports it (won't crash if strict)
+        if (organizer) {
+          existing.profile.organizer = organizer;
+        }
+
         await existing.save();
 
         const token = sign({ id: existing._id });
@@ -106,28 +168,40 @@ export const signUp = async (req, res) => {
       return res.status(409).json({ message: "User exists" });
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const hash = await bcrypt.hash(password, 10);
     const tag = await createUniqueTag();
 
-    const user = await User.create({
+    const createDoc = {
       email,
       phone,
-      passwordHash,
-      profile: { nickname: nickname || "Player" },
+      passwordHash: hash,
+      password: hash, // harmless if schema strict: true (ignored if not defined)
+      profile: {
+        ...(nickname ? { nickname } : {}),
+        ...(role ? { role, userType: role } : {}),
+        ...(organizer ? { organizer } : {}),
+      },
       stats: { userIdTag: tag },
-    });
+    };
+
+    const user = await User.create(createDoc);
 
     const token = sign({ id: user._id });
     return res.json({ user: safeUser(user), token });
   } catch (error) {
+    console.error("[AUTH][SIGNUP][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+
     if (error && error.code === 11000) {
       return res.status(409).json({ message: "User exists" });
     }
-    return res.status(500).json({ message: "Internal server error" });
+
+    // Return the real message so you can debug (remove later if you want)
+    return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 };
 
 export async function login(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
   try {
     const body = getBody(req);
 
@@ -141,16 +215,18 @@ export async function login(req, res) {
       return res.status(400).json({ message: "Email or phone required" });
     }
 
-    const user = await User.findOne(lookup).select("+passwordHash");
+    // Select both possible password fields
+    const user = await User.findOne(lookup).select("+passwordHash +password");
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    if (!user.passwordHash) {
+    const stored = getPasswordFromUser(user);
+    if (!stored) {
       return res.status(400).json({ message: "No local password set" });
     }
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
+    const ok = await bcrypt.compare(password, stored);
     if (!ok) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
@@ -158,15 +234,16 @@ export async function login(req, res) {
     const token = sign({ id: user._id });
     return res.json({ user: safeUser(user), token });
   } catch (error) {
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("[AUTH][LOGIN][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
 
 export async function requestOtp(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
   try {
     const body = getBody(req);
 
-    // ✅ FIX: support emailOrPhone as well
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
@@ -186,7 +263,7 @@ export async function requestOtp(req, res) {
       user = await User.create({
         ...query,
         otp: { code, expiresAt },
-        profile: { nickname: "Player" },
+        profile: { ...(email ? { nickname: email.split("@")[0] } : {}) },
         stats: { userIdTag: tag },
       });
     } else {
@@ -194,32 +271,32 @@ export async function requestOtp(req, res) {
       await user.save();
     }
 
-    // Helpful debug
     console.log("[OTP][REQUEST]", {
+      requestId,
       via: email ? "email" : "phone",
       to: email || phone,
       userId: user?._id?.toString?.(),
     });
 
     if (email) await sendOtpEmail(email, code);
-    if (phone) await sendOtpSms(phone, code); // will throw unless SMS implemented
+    if (phone) await sendOtpSms(phone, code);
 
     return res.json({ message: "OTP sent" });
   } catch (error) {
-    console.error("[OTP][REQUEST][ERROR]", error?.message || error);
+    console.error("[OTP][REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+
     if (error && error.code === 11000) {
       return res.json({ message: "OTP sent" });
     }
-    // If SMS not implemented, return a clear message
     return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
 
 export async function verifyOtp(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
   try {
     const body = getBody(req);
 
-    // ✅ FIX: support emailOrPhone as well
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
@@ -257,15 +334,14 @@ export async function verifyOtp(req, res) {
     const token = sign({ id: user._id });
     return res.json({ user: safeUser(user), token });
   } catch (error) {
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("[OTP][VERIFY][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
 
 export async function forgotPassword(req, res) {
   try {
     const body = getBody(req);
-
-    // ✅ FIX: support emailOrPhone as well
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
@@ -287,7 +363,7 @@ export async function forgotPassword(req, res) {
     await user.save();
 
     if (email) await sendOtpEmail(email, code);
-    if (phone) await sendOtpSms(phone, code); // will throw unless SMS implemented
+    if (phone) await sendOtpSms(phone, code);
 
     return res.json({ message: "Reset OTP sent" });
   } catch (error) {
@@ -298,8 +374,6 @@ export async function forgotPassword(req, res) {
 export async function resetPassword(req, res) {
   try {
     const body = getBody(req);
-
-    // ✅ FIX: support emailOrPhone as well
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
@@ -315,7 +389,7 @@ export async function resetPassword(req, res) {
     }
 
     const query = email ? { email } : { phone };
-    const user = await User.findOne(query).select("+passwordHash");
+    const user = await User.findOne(query).select("+passwordHash +password");
 
     if (!user || !user.otp || !user.otp.code) {
       return res.status(400).json({ message: "OTP not found" });
@@ -330,17 +404,20 @@ export async function resetPassword(req, res) {
       return res.status(400).json({ message: "Invalid OTP" });
     }
 
-    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    const hash = await bcrypt.hash(newPassword, 10);
+    setPasswordOnUser(user, hash);
+
     user.otp = undefined;
     await user.save();
 
     return res.json({ message: "Password reset" });
   } catch (error) {
-    return res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
 
 export async function clerkLogin(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
   try {
     const body = getBody(req);
 
@@ -367,7 +444,7 @@ export async function clerkLogin(req, res) {
       user = await User.create({
         clerkId: clerkUserId,
         email,
-        profile: { nickname: name || "Player" },
+        profile: { ...(name ? { nickname: name } : {}) },
         stats: { userIdTag: tag },
       });
     }
@@ -375,9 +452,10 @@ export async function clerkLogin(req, res) {
     const token = sign({ id: user._id });
     return res.json({ user: safeUser(user), token });
   } catch (error) {
+    console.error("[AUTH][CLERK][ERROR]", { requestId, message: error?.message, stack: error?.stack });
     if (error && error.code === 11000) {
       return res.status(409).json({ message: "User exists" });
     }
-    return res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
