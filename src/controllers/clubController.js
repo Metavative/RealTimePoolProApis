@@ -78,6 +78,10 @@ export async function createBooking(req, res) {
 // - business_license (pdf)
 export async function uploadVerificationDocuments(req, res) {
   try {
+    console.log("[VERIFY UPLOAD] content-type:", req.headers["content-type"]);
+console.log("[VERIFY UPLOAD] body keys:", Object.keys(req.body || {}));
+console.log("[VERIFY UPLOAD] file present:", !!req.file);
+
     const venueName = String(req.body.venue_name || req.body.venueName || "").trim();
 const venueAddress = String(req.body.venue_address || req.body.venueAddress || "").trim();
 
