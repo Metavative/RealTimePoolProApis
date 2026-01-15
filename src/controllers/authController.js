@@ -456,6 +456,6 @@ export async function clerkLogin(req, res) {
     if (error && error.code === 11000) {
       return res.status(409).json({ message: "User exists" });
     }
-    return res.status(500).json({ message: error?.message || "Internal server error" });
+    return res.status(500).json({ message: error?.message || "server error" });
   }
 }
