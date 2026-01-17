@@ -220,7 +220,7 @@ export async function clubRequestOtp(req, res) {
     }
 
     const code = otpToString(generateOtp(4));
-    const expiresAt = new Date(Date.now() + 10 * 60 *_toggle*1000);
+    const expiresAt = new Date(Date.now() + 10 * 60 *1000);
 
     const query = email ? { email } : { phone };
 
