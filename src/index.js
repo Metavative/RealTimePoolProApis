@@ -15,6 +15,8 @@ import connectCloudinary from "./config/cloudinary.config.js";
 import User from "./models/user.model.js";
 
 import authRoutes from "./routes/auth.route.js";
+import clubAuthRoutes from "./routes/clubAuth.route.js"; // ✅ NEW
+
 import userRoutes from "./routes/user.route.js";
 import friendRoutes from "./routes/friend.route.js";
 import matchRoutes from "./routes/match.route.js";
@@ -74,6 +76,8 @@ app.use(limiter);
 
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/auth/club", clubAuthRoutes); // ✅ NEW (parallel auth)
+
 app.use("/api/user", userRoutes);
 app.use("/api/match", matchRoutes);
 app.use("/api/club", clubRoutes);

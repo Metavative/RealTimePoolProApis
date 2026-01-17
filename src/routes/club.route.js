@@ -1,5 +1,6 @@
 import express from "express";
 import { authMiddleware } from "../middleware/authMiddleware.js";
+import { clubAuthMiddleware } from "../middleware/clubAuthMiddleware.js"; // ✅ NEW
 import * as clubCtrl from "../controllers/clubController.js";
 import multer from "multer";
 
@@ -20,19 +21,16 @@ const upload = multer({
   },
 });
 
+// Keep existing behavior for now (player-auth or shared auth)
 router.post("/", authMiddleware, clubCtrl.createClub);
 router.get("/nearby", authMiddleware, clubCtrl.listNearby);
 router.post("/booking", authMiddleware, clubCtrl.createBooking);
 
 // ✅ STEP 3: Organizer verification document upload
-// Flutter should call: POST /api/club/verification/documents
-// form-data:
-// - venue_name (text)
-// - venue_address (text)
-// - business_license (file: pdf)
+// Now requires CLUB token
 router.post(
   "/verification/documents",
-  authMiddleware,
+  clubAuthMiddleware,
   upload.single("business_license"),
   clubCtrl.uploadVerificationDocuments
 );
