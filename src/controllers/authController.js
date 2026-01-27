@@ -4,6 +4,7 @@ import crypto from "crypto";
 import { sign } from "../services/jwtService.js";
 import { generateOtp, sendOtpEmail, sendOtpSms } from "../services/OTPService.js";
 
+<<<<<<< HEAD
 import twilio from "twilio";
 
 // =========================
@@ -48,6 +49,8 @@ async function twilioCheckVerifyCode(toPhone, code) {
 // =========================
 // Existing helpers (unchanged)
 // =========================
+=======
+>>>>>>> 596c6fc785edc18a3da75574e8b94d521d22f762
 function safeUser(user) {
   if (!user) return null;
   const obj = user.toObject ? user.toObject() : user;
@@ -148,6 +151,7 @@ function pickNickname(body, email, phone) {
   return "";
 }
 
+<<<<<<< HEAD
 // =========================
 // ✅ NEW: phone field picker (accept phone or phoneNumber)
 // =========================
@@ -171,6 +175,8 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
 // =========================
 // Existing endpoints (unchanged)
 // =========================
+=======
+>>>>>>> 596c6fc785edc18a3da75574e8b94d521d22f762
 export const signUp = async (req, res) => {
   const requestId = crypto.randomBytes(4).toString("hex");
   try {
@@ -527,6 +533,7 @@ export async function clerkLogin(req, res) {
   }
 }
 
+<<<<<<< HEAD
 // =========================
 // ✅ NEW: Phone OTP-only (Twilio Verify) endpoints
 // =========================
@@ -694,3 +701,5 @@ export async function phoneLoginVerifyOtp(req, res) {
     return res.status(error?.statusCode || 500).json({ message: error?.message || "Service error. Please try again." });
   }
 }
+=======
+>>>>>>> 596c6fc785edc18a3da75574e8b94d521d22f762
