@@ -60,13 +60,10 @@ const UserSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true },
   phone: { type: String, index: true, unique: true, sparse: true },
 
-<<<<<<< HEAD
   // ✅ Twilio Verify phone auth flags
   phoneVerified: { type: Boolean, default: false, index: true },
   lastOtpSent: { type: Date, default: null },
 
-=======
->>>>>>> 596c6fc785edc18a3da75574e8b94d521d22f762
   passwordHash: { type: String, select: false },
 
   clerkId: { type: String, index: true, unique: true, sparse: true },
