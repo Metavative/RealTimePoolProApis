@@ -9,8 +9,8 @@ import { generateOtp, sendOtpEmail } from "../services/OTPService.js";
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || "").trim();
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || "").trim();
 
-// ✅ Verify Service SID (VA...)
-const TWILIO_VERIFY_SERVICE_SID = (process.env.TWILIO_VERIFY_SERVICE_SID || "VA5340451db0245afdf3c1515254edf2cf").trim();
+// ✅ Hardcode Verify Service SID (VA...)
+const TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
@@ -23,6 +23,7 @@ function assertTwilioConfigured() {
   }
 }
 
+// Any country supported as long as E.164 format
 function isValidE164(phone) {
   return typeof phone === "string" && /^\+\d{8,15}$/.test(phone.trim());
 }
@@ -150,8 +151,6 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
 // =========================
 export const signUp = async (req, res) => {
   const requestId = crypto.randomBytes(4).toString("hex");
-  const log = (step, extra = {}) => console.log(`[AUTH][SIGNUP][${requestId}] ${step}`, extra);
-
   try {
     const body = getBody(req);
 
@@ -164,19 +163,40 @@ export const signUp = async (req, res) => {
 
     const nickname = pickNickname(body, email, phone);
 
-    log("INPUT", { email, phone, role });
-
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!password) return res.status(400).json({ message: "Password required" });
-
-    if (phone && !isValidE164(phone)) {
-      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
-    }
 
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
 
     const existing = await User.findOne({ $or: queryOr }).select("+passwordHash +password");
-    if (existing) return res.status(409).json({ message: "User exists" });
+    if (existing) {
+      const existingPass = getPasswordFromUser(existing);
+
+      // upgrade if password missing
+      if (!existingPass) {
+        const hash = await bcrypt.hash(password, 10);
+        setPasswordOnUser(existing, hash);
+
+        existing.profile = existing.profile || {};
+        if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
+
+        existing.stats = existing.stats || {};
+        if (!existing.stats.userIdTag) existing.stats.userIdTag = await createUniqueTag();
+
+        if (role) {
+          existing.profile.role = existing.profile.role || role;
+          existing.profile.userType = existing.profile.userType || role;
+        }
+        if (organizer) existing.profile.organizer = organizer;
+
+        await existing.save();
+
+        const token = sign({ id: existing._id });
+        return res.json({ user: safeUser(existing), token, upgraded: true });
+      }
+
+      return res.status(409).json({ message: "User exists" });
+    }
 
     const hash = await bcrypt.hash(password, 10);
     const tag = await createUniqueTag();
@@ -198,16 +218,8 @@ export const signUp = async (req, res) => {
       lastOtpChannel: null,
     });
 
-    // IMPORTANT: signup returns token but app should still require OTP verification
     const token = sign({ id: user._id });
-
-    return res.json({
-      ok: true,
-      user: safeUser(user),
-      token,
-      needsOtp: true,
-      otpTargets: { ...(email ? { email } : {}), ...(phone ? { phone } : {}) },
-    });
+    return res.json({ user: safeUser(user), token });
   } catch (error) {
     console.error("[AUTH][SIGNUP][ERROR]", { requestId, message: error?.message, stack: error?.stack });
     if (error && error.code === 11000) return res.status(409).json({ message: "User exists" });
@@ -215,32 +227,65 @@ export const signUp = async (req, res) => {
   }
 };
 
+export async function login(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
+  try {
+    const body = getBody(req);
+
+    const password = toStr(body.password);
+    if (!password) return res.status(400).json({ message: "Password required" });
+
+    const lookup = pickEmailOrPhone(body);
+    if (!lookup.email && !lookup.phone) return res.status(400).json({ message: "Email or phone required" });
+
+    const user = await User.findOne(lookup).select("+passwordHash +password");
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const stored = getPasswordFromUser(user);
+    if (!stored) return res.status(400).json({ message: "No local password set" });
+
+    const ok = await bcrypt.compare(password, stored);
+    if (!ok) return res.status(401).json({ message: "Invalid credentials" });
+
+    const token = sign({ id: user._id });
+    return res.json({ user: safeUser(user), token });
+  } catch (error) {
+    console.error("[AUTH][LOGIN][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(500).json({ message: error?.message || "Internal server error" });
+  }
+}
+
+// =======================================================
+// ✅ SIGNUP OTP REQUEST (send to BOTH email + phone)
+// =======================================================
 // =======================================================
 // ✅ SIGNUP OTP REQUEST (send to BOTH email + phone)
 // =======================================================
 export async function requestSignupOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
-  const log = (step, extra = {}) => console.log(`[OTP][SIGNUP_REQUEST][${requestId}] ${step}`, extra);
+
+  const log = (step, extra = {}) => {
+    // eslint-disable-next-line no-console
+    console.log(`[OTP][SIGNUP_REQUEST][${requestId}] ${step}`, extra);
+  };
 
   try {
     const body = getBody(req);
 
-    // ✅ Accept both separate fields AND identifier/emailOrPhone
-    const rawIdentifier = toStr(body.emailOrPhone) || toStr(body.identifier);
-
     const email =
       normalizeEmail(body.email) ||
-      (rawIdentifier && isEmailIdentifier(rawIdentifier) ? normalizeEmail(rawIdentifier) : undefined);
+      (isEmailIdentifier(toStr(body.identifier)) ? normalizeEmail(body.identifier) : undefined);
 
     const phone =
       normalizePhone(body.phone) ||
-      (rawIdentifier && !isEmailIdentifier(rawIdentifier) ? normalizePhone(rawIdentifier) : undefined);
+      (!isEmailIdentifier(toStr(body.identifier)) ? normalizePhone(body.identifier) : undefined);
 
-    log("INPUT", { email, phone, rawIdentifier });
+    log("INPUT", { email, phone, raw: { email: body.email, phone: body.phone, identifier: body.identifier } });
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
     if (phone && !isValidE164(phone)) {
+      log("INVALID_PHONE_FORMAT", { phone });
       return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
@@ -248,8 +293,9 @@ export async function requestSignupOtp(req, res) {
 
     let user = await User.findOne({ $or: queryOr });
 
+    // Create if doesn't exist yet
     if (!user) {
-      log("USER_NOT_FOUND_CREATING_FALLBACK");
+      log("USER_NOT_FOUND_CREATING");
       user = await User.create({
         ...(email ? { email } : {}),
         ...(phone ? { phone } : {}),
@@ -263,17 +309,18 @@ export async function requestSignupOtp(req, res) {
     }
 
     if (isRateLimited(user.lastOtpSent, 60_000)) {
+      log("RATE_LIMITED", { lastOtpSent: user.lastOtpSent });
       return res.status(429).json({ message: "Please wait 60 seconds before requesting another code." });
     }
 
     user.lastOtpSent = new Date();
     user.lastOtpChannel = "multi";
 
-    const channelsAttempted = [];
     const channelsSent = [];
-    const channelsFailed = [];
+    const channelsFailed = []; // { channel, error }
+    const channelsAttempted = [];
 
-    // EMAIL OTP
+    // ===== EMAIL OTP (DB stored) =====
     if (user.email) {
       channelsAttempted.push("email");
       try {
@@ -283,28 +330,47 @@ export async function requestSignupOtp(req, res) {
         user.otp = { code, expiresAt };
         await user.save();
 
+        log("EMAIL_OTP_SAVED", { email: user.email, expiresAt });
         await sendOtpEmail(user.email, code);
+        log("EMAIL_SENT_OK", { email: user.email });
+
         channelsSent.push("email");
       } catch (e) {
+        log("EMAIL_SEND_FAILED", { message: e?.message, code: e?.code });
         channelsFailed.push({ channel: "email", error: e?.message || "email_failed" });
       }
+    } else {
+      user.otp = undefined;
+      await user.save();
     }
 
-    // PHONE OTP (Twilio Verify)
+    // ===== PHONE OTP via Twilio Verify =====
     if (user.phone) {
       channelsAttempted.push("phone");
       try {
         if (!isValidE164(user.phone)) {
+          log("INVALID_PHONE_E164_STORED", { phone: user.phone });
           channelsFailed.push({ channel: "phone", error: "invalid_e164" });
         } else {
+          // IMPORTANT log env config status (don’t print secrets)
+          log("TWILIO_CONFIG", {
+            hasAccountSid: !!TWILIO_ACCOUNT_SID,
+            hasAuthToken: !!TWILIO_AUTH_TOKEN,
+            hasClient: !!twilioClient,
+            verifyServiceSid: TWILIO_VERIFY_SERVICE_SID,
+          });
+
           await twilioSendVerifySms(user.phone);
+          log("TWILIO_SMS_SENT_OK", { phone: user.phone });
           channelsSent.push("phone");
         }
       } catch (e) {
+        log("TWILIO_SEND_FAILED", { message: e?.message, code: e?.code, more: e?.moreInfo });
         channelsFailed.push({ channel: "phone", error: e?.message || "twilio_failed" });
       }
     }
 
+    // Don’t fail the whole request if one channel fails
     const ok = channelsSent.length > 0;
 
     log("RESULT", { ok, channelsAttempted, channelsSent, channelsFailed });
@@ -326,41 +392,107 @@ export async function requestSignupOtp(req, res) {
 
 
 // =========================
-// ✅ OTP VERIFY (email OR phone)
+// ✅ OTP REQUEST: login (single-channel)
 // =========================
-export async function verifyOtp(req, res) {
+export async function requestOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
-  const log = (step, extra = {}) => console.log(`[OTP][VERIFY][${requestId}] ${step}`, extra);
-
   try {
     const body = getBody(req);
 
-    // ✅ Accept ALL possible identifier keys from Flutter
-    const incomingIdentifier =
-      toStr(body.emailOrPhone) || toStr(body.identifier) || toStr(body.email) || toStr(body.phone);
+    const lookup = pickEmailOrPhone(body);
+    const email = lookup.email;
+    const phone = lookup.phone;
+    const flow = toStr(body.flow) || "login"; // signup|login (we mainly use login here)
 
-    const flow = toStr(body.flow) || "signup";
-    const code = otpToString(body.code || body.otp);
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
-    if (!incomingIdentifier) return res.status(400).json({ message: "Email or phone required" });
-    if (!code) return res.status(400).json({ message: "OTP required" });
+    const channel = email ? "email" : "phone";
+    const query = email ? { email } : { phone };
 
-    const isEmail = isEmailIdentifier(incomingIdentifier);
-    const email = isEmail ? normalizeEmail(incomingIdentifier) : undefined;
-    const phone = !isEmail ? normalizePhone(incomingIdentifier) : undefined;
-
-    log("INPUT", { incomingIdentifier, isEmail, email, phone, flow });
-
-    if (phone && !isValidE164(phone)) {
+    if (channel === "phone" && !isValidE164(phone)) {
       return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
-    const query = isEmail ? { email } : { phone };
+    let user = await User.findOne(query);
+
+    if (flow === "login" && !user) {
+      return res.status(404).json({ message: "Account not found. Please sign up." });
+    }
+
+    if (!user) {
+      user = await User.create({
+        ...query,
+        phoneVerified: false,
+        emailVerified: false,
+        lastOtpSent: null,
+        lastOtpChannel: null,
+        profile: { ...(email ? { nickname: email.split("@")[0] } : phone ? { nickname: phone } : {}) },
+        stats: { userIdTag: await createUniqueTag() },
+      });
+    }
+
+    if (isRateLimited(user.lastOtpSent, 60_000)) {
+      return res.status(429).json({ message: "Please wait 60 seconds before requesting another code." });
+    }
+
+    user.lastOtpSent = new Date();
+    user.lastOtpChannel = channel;
+
+    if (channel === "email") {
+      const code = otpToString(generateOtp(6));
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      user.otp = { code, expiresAt };
+      await user.save();
+
+      await sendOtpEmail(email, code);
+
+      return res.json({ ok: true, message: "OTP sent", channel: "email", target: email, flow });
+    }
+
+    // phone -> Twilio Verify
+    user.otp = undefined;
+    await user.save();
+    await twilioSendVerifySms(phone);
+
+    return res.json({ ok: true, message: "OTP sent", channel: "phone", target: phone, flow });
+  } catch (error) {
+    console.error("[OTP][REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+  }
+}
+
+// =========================
+// ✅ OTP VERIFY:
+// - login => token always
+// - signup => token after ANY one channel verifies (either is fine)
+// =========================
+export async function verifyOtp(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
+  try {
+    const body = getBody(req);
+
+    const lookup = pickEmailOrPhone(body);
+    const email = lookup.email;
+    const phone = lookup.phone;
+
+    const flow = toStr(body.flow) || "login"; // signup|login
+    const code = otpToString(body.code || body.otp);
+
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
+    if (!code) return res.status(400).json({ message: "OTP required" });
+
+    const channel = email ? "email" : "phone";
+    const query = email ? { email } : { phone };
+
+    if (channel === "phone" && !isValidE164(phone)) {
+      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    }
+
     const user = await User.findOne(query);
     if (!user) return res.status(404).json({ message: "Account not found" });
 
-    if (isEmail) {
-      if (!user.otp?.code) return res.status(404).json({ message: "OTP not found" });
+    if (channel === "email") {
+      if (!user.otp || !user.otp.code) return res.status(404).json({ message: "OTP not found" });
 
       if (user.otp.expiresAt && user.otp.expiresAt.getTime() < Date.now()) {
         return res.status(400).json({ message: "OTP expired" });
@@ -371,29 +503,35 @@ export async function verifyOtp(req, res) {
 
       user.otp = undefined;
       user.emailVerified = true;
+
+      user.lastOtpSent = null;
+      user.lastOtpChannel = null;
+
+      user.profile = user.profile || {};
+      user.profile.verified = true;
+
+      await user.save();
     } else {
       const ok = await twilioCheckVerifyCode(phone, code);
       if (!ok) return res.status(400).json({ message: "Invalid OTP" });
 
       user.phoneVerified = true;
+
+      user.lastOtpSent = null;
+      user.lastOtpChannel = null;
+
+      user.profile = user.profile || {};
+      user.profile.verified = true;
+
+      await user.save();
     }
 
-    // ✅ verified if either channel verified
-    user.profile = user.profile || {};
-    user.profile.verified = !!(user.emailVerified || user.phoneVerified);
-
-    // reset OTP throttling after success
-    user.lastOtpSent = null;
-    user.lastOtpChannel = null;
-
-    await user.save();
-
+    // ✅ Both login and signup return token once a channel verifies
     const token = sign({ id: user._id });
-
     return res.json({
       ok: true,
       flow,
-      channelVerified: isEmail ? "email" : "phone",
+      channelVerified: channel,
       verified: { email: !!user.emailVerified, phone: !!user.phoneVerified },
       user: safeUser(user),
       token,
@@ -402,4 +540,97 @@ export async function verifyOtp(req, res) {
     console.error("[OTP][VERIFY][ERROR]", { requestId, message: error?.message, stack: error?.stack });
     return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
   }
+}
+
+// =========================
+// forgot/reset password (email only)
+// =========================
+export async function forgotPassword(req, res) {
+  try {
+    const body = getBody(req);
+    const lookup = pickEmailOrPhone(body);
+    const email = lookup.email;
+
+    if (!email) return res.status(400).json({ message: "Password reset requires email for now" });
+
+    const user = await User.findOne({ email });
+    if (!user) return res.json({ message: "If the account exists, an OTP was sent" });
+
+    const code = otpToString(generateOtp(6));
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    user.otp = { code, expiresAt };
+    await user.save();
+
+    await sendOtpEmail(email, code);
+
+    return res.json({ message: "Reset OTP sent" });
+  } catch (error) {
+    return res.status(500).json({ message: error?.message || "Internal server error" });
+  }
+}
+
+export async function resetPassword(req, res) {
+  try {
+    const body = getBody(req);
+    const email = normalizeEmail(body.email);
+    const otp = otpToString(body.otp || body.code);
+    const newPassword = toStr(body.newPassword || body.password);
+
+    if (!email) return res.status(400).json({ message: "Email required" });
+    if (!otp || !newPassword) return res.status(400).json({ message: "otp and newPassword required" });
+
+    const user = await User.findOne({ email }).select("+passwordHash +password");
+    if (!user || !user.otp || !user.otp.code) return res.status(400).json({ message: "OTP not found" });
+
+    if (user.otp.expiresAt && user.otp.expiresAt.getTime() < Date.now()) {
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    const expected = otpToString(user.otp.code);
+    if (expected !== otp) return res.status(400).json({ message: "Invalid OTP" });
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    setPasswordOnUser(user, hash);
+
+    user.otp = undefined;
+    await user.save();
+
+    return res.json({ message: "Password reset" });
+  } catch (error) {
+    return res.status(500).json({ message: error?.message || "Internal server error" });
+  }
+}
+
+// ✅ IMPORTANT: keep this export so auth.route.js never crashes
+export async function clerkLogin(req, res) {
+  return res.status(501).json({ message: "clerkLogin not implemented" });
+}
+
+// ✅ Backward-compatible exports for old routes (so imports won’t crash)
+export async function phoneRegisterRequestOtp(req, res) {
+  req.body = { ...(req.body || {}), phone: req.body?.phone || req.body?.phoneNumber, flow: "signup" };
+  return requestOtp(req, res);
+}
+export async function phoneRegisterVerifyOtp(req, res) {
+  req.body = {
+    ...(req.body || {}),
+    phone: req.body?.phone || req.body?.phoneNumber,
+    otp: req.body?.otp || req.body?.code,
+    flow: "signup",
+  };
+  return verifyOtp(req, res);
+}
+export async function phoneLoginRequestOtp(req, res) {
+  req.body = { ...(req.body || {}), phone: req.body?.phone || req.body?.phoneNumber, flow: "login" };
+  return requestOtp(req, res);
+}
+export async function phoneLoginVerifyOtp(req, res) {
+  req.body = {
+    ...(req.body || {}),
+    phone: req.body?.phone || req.body?.phoneNumber,
+    otp: req.body?.otp || req.body?.code,
+    flow: "login",
+  };
+  return verifyOtp(req, res);
 }
