@@ -16,7 +16,7 @@ const transporter = nodemailer.createTransport({
 
 export function generateOtp(len = 4) {
   let otp = "";
-  for (let i = 0; i < len; i++) otp += Math.floor(Math.random() * 10);
+  for (let i = 0; i < len; i += 1) otp += Math.floor(Math.random() * 10);
   return otp;
 }
 
@@ -34,9 +34,7 @@ async function ensureTransporterReady() {
     _verified = true;
     return true;
   } catch (e) {
-    const err = new Error(
-      `SMTP verify failed: ${e?.message || "Unable to connect/authenticate"}`
-    );
+    const err = new Error(`SMTP verify failed: ${e?.message || "Unable to connect/authenticate"}`);
     err.code = "SMTP_VERIFY_FAILED";
     throw err;
   }
@@ -67,8 +65,8 @@ export async function sendOtpEmail(email, otp) {
 }
 
 /**
- * SMS not implemented yet — we throw a NOT_SUPPORTED error
- * so controllers can return a clean 400 instead of 500.
+ * Legacy stub (do not use for OTP).
+ * Phone OTP must be handled by Twilio Verify in controllers.
  */
 export async function sendOtpSms(phone, otp) {
   const p = String(phone || "").trim();
@@ -79,8 +77,9 @@ export async function sendOtpSms(phone, otp) {
   }
 
   const err = new Error(
-    "SMS OTP is not implemented. Please use email OTP or integrate an SMS provider (Twilio, etc.)."
+    "SMS OTP is handled by Twilio Verify. Do not use sendOtpSms(). Use /otp/request for phone which triggers Twilio Verify."
   );
-  err.code = "SMS_NOT_IMPLEMENTED";
+  err.code = "SMS_DEPRECATED_USE_TWILIO_VERIFY";
+  err.statusCode = 400;
   throw err;
 }

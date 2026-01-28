@@ -12,8 +12,31 @@ const ClubSchema = new mongoose.Schema({
   // ======================
   // AUTH (Club Organizer)
   // ======================
-  email: { type: String, lowercase: true, trim: true, index: true, sparse: true },
-  phone: { type: String, trim: true, index: true, sparse: true },
+  email: {
+    type: String,
+    lowercase: true,
+    trim: true,
+    index: true,
+    sparse: true,
+  },
+  phone: {
+    type: String,
+    trim: true,
+    index: true,
+    sparse: true,
+  },
+
+  // ✅ Verification flags for both channels
+  emailVerified: { type: Boolean, default: false, index: true },
+  phoneVerified: { type: Boolean, default: false, index: true },
+
+  // ✅ OTP throttle / channel tracking (email + phone)
+  lastOtpSent: { type: Date, default: null },
+  lastOtpChannel: {
+    type: String,
+    enum: ["email", "phone"],
+    default: null,
+  },
 
   // Support both field names (same as User)
   passwordHash: { type: String, select: false },
@@ -21,7 +44,7 @@ const ClubSchema = new mongoose.Schema({
 
   otp: { type: OtpSchema, default: undefined },
 
-  verified: { type: Boolean, default: false }, // OTP verified (auth-level)
+  verified: { type: Boolean, default: false }, // legacy auth-level verified (keep)
   status: {
     type: String,
     enum: ["ACTIVE", "PENDING_VERIFICATION", "PENDING_REVIEW", "SUSPENDED"],
@@ -40,7 +63,6 @@ const ClubSchema = new mongoose.Schema({
   },
 
   // Keep this field as-is (doesn't break existing logic)
-  // If later you want: "owner" should be club itself, we can refactor safely.
   owner: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // legacy organizer link
 
   photos: [{ type: String }],

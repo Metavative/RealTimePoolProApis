@@ -2,8 +2,55 @@ import Club from "../models/club.model.js";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { sign } from "../services/jwtService.js";
-import { generateOtp, sendOtpEmail, sendOtpSms } from "../services/OTPService.js";
+import { generateOtp, sendOtpEmail } from "../services/OTPService.js";
 
+import twilio from "twilio";
+
+// =========================
+// Twilio Verify setup
+// =========================
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID || "";
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+
+function assertTwilioConfigured() {
+  if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
+    const err = new Error("Twilio Verify is not configured (missing TWILIO_* env vars)");
+    err.statusCode = 500;
+    throw err;
+  }
+}
+
+function isValidE164(phone) {
+  return typeof phone === "string" && /^\+\d{8,15}$/.test(phone);
+}
+
+async function twilioSendVerifySms(toPhone) {
+  assertTwilioConfigured();
+  await twilioClient.verify.v2.services(TWILIO_VERIFY_SERVICE_SID).verifications.create({
+    to: toPhone,
+    channel: "sms",
+  });
+}
+
+async function twilioCheckVerifyCode(toPhone, code) {
+  assertTwilioConfigured();
+  const verificationCheck = await twilioClient.verify.v2
+    .services(TWILIO_VERIFY_SERVICE_SID)
+    .verificationChecks.create({
+      to: toPhone,
+      code,
+    });
+
+  return verificationCheck?.status === "approved";
+}
+
+// =========================
+// Helpers
+// =========================
 function toStr(v) {
   if (v === null || v === undefined) return "";
   return String(v).trim();
@@ -21,32 +68,29 @@ function normalizePhone(phone) {
   return v;
 }
 
+function isEmailIdentifier(identifier) {
+  return typeof identifier === "string" && identifier.includes("@");
+}
+
 function otpToString(value) {
   return toStr(value);
 }
 
 function getBody(req) {
-  // Supports both { ... } and { data: { ... } }
   if (req.body?.data && typeof req.body.data === "object") return req.body.data;
   return req.body || {};
 }
 
-/**
- * Supports:
- * - { emailOrPhone: "abc@email.com" } OR { emailOrPhone: "+447..." }
- * - { identifier: "..." }
- * - { email: "..." } or { phone: "..." }
- */
 function pickEmailOrPhone(body) {
   const emailOrPhone = toStr(body.emailOrPhone);
   if (emailOrPhone) {
-    if (emailOrPhone.includes("@")) return { email: normalizeEmail(emailOrPhone) };
+    if (isEmailIdentifier(emailOrPhone)) return { email: normalizeEmail(emailOrPhone) };
     return { phone: normalizePhone(emailOrPhone) };
   }
 
   const identifier = toStr(body.identifier);
   if (identifier) {
-    if (identifier.includes("@")) return { email: normalizeEmail(identifier) };
+    if (isEmailIdentifier(identifier)) return { email: normalizeEmail(identifier) };
     return { phone: normalizePhone(identifier) };
   }
 
@@ -79,12 +123,20 @@ function setPasswordOnClub(club, hash) {
 }
 
 function clubToken(clubId) {
-  // Club-scoped token payload (parallel to player token)
   return sign({ id: clubId, role: "CLUB", typ: "club_access" });
 }
 
+// ✅ Rate limit helper (60s)
+function isRateLimited(lastOtpSent, windowMs = 60_000) {
+  if (!lastOtpSent) return false;
+  const now = Date.now();
+  const last = new Date(lastOtpSent).getTime();
+  if (!Number.isFinite(last)) return false;
+  return now - last < windowMs;
+}
+
 // =============================
-// CLUB SIGNUP
+// CLUB SIGNUP (password)
 // =============================
 export async function clubSignUp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -98,12 +150,8 @@ export async function clubSignUp(req, res) {
     const name = toStr(body.name);
     const address = toStr(body.address);
 
-    if (!email && !phone) {
-      return res.status(400).json({ message: "Email or phone required" });
-    }
-    if (!password) {
-      return res.status(400).json({ message: "Password required" });
-    }
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
+    if (!password) return res.status(400).json({ message: "Password required" });
 
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
 
@@ -111,7 +159,6 @@ export async function clubSignUp(req, res) {
     if (existing) {
       const existingPass = getPasswordFromClub(existing);
 
-      // If club exists but had no local password, "upgrade" it
       if (!existingPass) {
         const hash = await bcrypt.hash(password, 10);
         setPasswordOnClub(existing, hash);
@@ -140,20 +187,17 @@ export async function clubSignUp(req, res) {
       address,
       status: "PENDING_VERIFICATION",
       verified: false,
+      emailVerified: false,
+      phoneVerified: false,
+      lastOtpSent: null,
+      lastOtpChannel: null,
     });
 
     const token = clubToken(club._id);
     return res.json({ club: safeClub(club), token });
   } catch (error) {
-    console.error("[CLUB_AUTH][SIGNUP][ERROR]", {
-      requestId,
-      message: error?.message,
-      stack: error?.stack,
-    });
-
-    if (error && error.code === 11000) {
-      return res.status(409).json({ message: "Club already exists" });
-    }
+    console.error("[CLUB_AUTH][SIGNUP][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    if (error && error.code === 11000) return res.status(409).json({ message: "Club already exists" });
     return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
@@ -167,44 +211,30 @@ export async function clubLogin(req, res) {
     const body = getBody(req);
 
     const password = toStr(body.password);
-    if (!password) {
-      return res.status(400).json({ message: "Password required" });
-    }
+    if (!password) return res.status(400).json({ message: "Password required" });
 
     const lookup = pickEmailOrPhone(body);
-    if (!lookup.email && !lookup.phone) {
-      return res.status(400).json({ message: "Email or phone required" });
-    }
+    if (!lookup.email && !lookup.phone) return res.status(400).json({ message: "Email or phone required" });
 
     const club = await Club.findOne(lookup).select("+passwordHash +password");
-    if (!club) {
-      return res.status(404).json({ message: "Club not found" });
-    }
+    if (!club) return res.status(404).json({ message: "Club not found" });
 
     const stored = getPasswordFromClub(club);
-    if (!stored) {
-      return res.status(400).json({ message: "No local password set" });
-    }
+    if (!stored) return res.status(400).json({ message: "No local password set" });
 
     const ok = await bcrypt.compare(password, stored);
-    if (!ok) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
+    if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
     const token = clubToken(club._id);
     return res.json({ club: safeClub(club), token });
   } catch (error) {
-    console.error("[CLUB_AUTH][LOGIN][ERROR]", {
-      requestId,
-      message: error?.message,
-      stack: error?.stack,
-    });
+    console.error("[CLUB_AUTH][LOGIN][ERROR]", { requestId, message: error?.message, stack: error?.stack });
     return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 }
 
 // =============================
-// CLUB OTP REQUEST
+// ✅ UNIFIED CLUB OTP REQUEST
 // =============================
 export async function clubRequestOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -215,57 +245,67 @@ export async function clubRequestOtp(req, res) {
     const email = lookup.email;
     const phone = lookup.phone;
 
-    if (!email && !phone) {
-      return res.status(400).json({ message: "Email or phone required" });
-    }
+    const flow = toStr(body.flow) || "login";
 
-    const code = otpToString(generateOtp(4));
-    const expiresAt = new Date(Date.now() + 10 * 60 *1000);
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
+    const channel = email ? "email" : "phone";
     const query = email ? { email } : { phone };
 
+    if (channel === "phone" && !isValidE164(phone)) {
+      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    }
+
     let club = await Club.findOne(query);
+
+    if (flow === "login" && !club) {
+      return res.status(404).json({ message: "Club not found. Please sign up." });
+    }
+
     if (!club) {
-      // Create club shell account if it doesn't exist (OTP-first login style)
       club = await Club.create({
         ...query,
-        otp: { code, expiresAt },
         status: "PENDING_VERIFICATION",
         verified: false,
+        emailVerified: false,
+        phoneVerified: false,
+        lastOtpSent: null,
+        lastOtpChannel: null,
       });
-    } else {
+    }
+
+    if (isRateLimited(club.lastOtpSent, 60_000)) {
+      return res.status(429).json({ message: "Please wait 60 seconds before requesting another code." });
+    }
+
+    club.lastOtpSent = new Date();
+    club.lastOtpChannel = channel;
+
+    if (channel === "email") {
+      const code = otpToString(generateOtp(4));
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
       club.otp = { code, expiresAt };
       await club.save();
+
+      await sendOtpEmail(email, code);
+
+      return res.json({ ok: true, message: "OTP sent", channel: "email", target: email });
     }
 
-    console.log("[CLUB_OTP][REQUEST]", {
-      requestId,
-      via: email ? "email" : "phone",
-      to: email || phone,
-      clubId: club?._id?.toString?.(),
-    });
+    club.otp = undefined;
+    await club.save();
 
-    if (email) await sendOtpEmail(email, code);
-    if (phone) await sendOtpSms(phone, code);
+    await twilioSendVerifySms(phone);
 
-    return res.json({ message: "OTP sent" });
+    return res.json({ ok: true, message: "OTP sent", channel: "phone", target: phone });
   } catch (error) {
-    console.error("[CLUB_OTP][REQUEST][ERROR]", {
-      requestId,
-      message: error?.message,
-      stack: error?.stack,
-    });
-
-    if (error && error.code === 11000) {
-      // Duplicate key race: still respond success
-      return res.json({ message: "OTP sent" });
-    }
-    return res.status(500).json({ message: error?.message || "Internal server error" });
+    console.error("[CLUB_OTP][REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
   }
 }
 
 // =============================
-// CLUB OTP VERIFY
+// ✅ UNIFIED CLUB OTP VERIFY
 // =============================
 export async function clubVerifyOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -276,47 +316,61 @@ export async function clubVerifyOtp(req, res) {
     const email = lookup.email;
     const phone = lookup.phone;
 
-    const otp = otpToString(body.otp);
+    const code = otpToString(body.code || body.otp);
 
-    if (!email && !phone) {
-      return res.status(400).json({ message: "Email or phone required" });
-    }
-    if (!otp) {
-      return res.status(400).json({ message: "OTP required" });
-    }
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
+    if (!code) return res.status(400).json({ message: "OTP required" });
 
+    const channel = email ? "email" : "phone";
     const query = email ? { email } : { phone };
+
+    if (channel === "phone" && !isValidE164(phone)) {
+      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    }
+
     const club = await Club.findOne(query);
+    if (!club) return res.status(404).json({ message: "Club not found" });
 
-    if (!club || !club.otp || !club.otp.code) {
-      return res.status(404).json({ message: "OTP not found" });
+    if (channel === "email") {
+      if (!club.otp || !club.otp.code) return res.status(404).json({ message: "OTP not found" });
+
+      if (club.otp.expiresAt && club.otp.expiresAt.getTime() < Date.now()) {
+        return res.status(400).json({ message: "OTP expired" });
+      }
+
+      const expected = otpToString(club.otp.code);
+      if (expected !== code) return res.status(400).json({ message: "Invalid OTP" });
+
+      club.otp = undefined;
+      club.emailVerified = true;
+      club.lastOtpSent = null;
+      club.lastOtpChannel = null;
+
+      club.verified = true;
+      if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
+
+      await club.save();
+
+      const token = clubToken(club._id);
+      return res.json({ club: safeClub(club), token, channel: "email" });
     }
 
-    if (club.otp.expiresAt && club.otp.expiresAt.getTime() < Date.now()) {
-      return res.status(400).json({ message: "OTP expired" });
-    }
+    const ok = await twilioCheckVerifyCode(phone, code);
+    if (!ok) return res.status(400).json({ message: "Invalid OTP" });
 
-    const expected = otpToString(club.otp.code);
-    if (expected !== otp) {
-      return res.status(400).json({ message: "Invalid OTP" });
-    }
+    club.phoneVerified = true;
+    club.lastOtpSent = null;
+    club.lastOtpChannel = null;
 
-    club.otp = undefined;
     club.verified = true;
-
-    // Once verified, allow access (still can be pending review based on docs)
     if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
 
     await club.save();
 
     const token = clubToken(club._id);
-    return res.json({ club: safeClub(club), token });
+    return res.json({ club: safeClub(club), token, channel: "phone" });
   } catch (error) {
-    console.error("[CLUB_OTP][VERIFY][ERROR]", {
-      requestId,
-      message: error?.message,
-      stack: error?.stack,
-    });
-    return res.status(500).json({ message: error?.message || "Internal server error" });
+    console.error("[CLUB_OTP][VERIFY][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
   }
 }
