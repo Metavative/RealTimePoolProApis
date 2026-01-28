@@ -3,22 +3,26 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { sign } from "../services/jwtService.js";
 import { generateOtp, sendOtpEmail } from "../services/OTPService.js";
-
 import twilio from "twilio";
 
-// =========================
-// Twilio Verify setup
-// =========================
+// =======================================
+// Twilio Verify setup (HARD-CODE SERVICE)
+// =======================================
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID || "";
+const TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 function assertTwilioConfigured() {
-  if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
-    const err = new Error("Twilio Verify is not configured (missing TWILIO_* env vars)");
+  if (!twilioClient) {
+    const err = new Error("Twilio is not configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
+    err.statusCode = 500;
+    throw err;
+  }
+  if (!TWILIO_VERIFY_SERVICE_SID) {
+    const err = new Error("Twilio Verify Service SID is missing (hardcoded constant is empty)");
     err.statusCode = 500;
     throw err;
   }
@@ -40,17 +44,11 @@ async function twilioCheckVerifyCode(toPhone, code) {
   assertTwilioConfigured();
   const verificationCheck = await twilioClient.verify.v2
     .services(TWILIO_VERIFY_SERVICE_SID)
-    .verificationChecks.create({
-      to: toPhone,
-      code,
-    });
+    .verificationChecks.create({ to: toPhone, code });
 
   return verificationCheck?.status === "approved";
 }
 
-// =========================
-// Helpers
-// =========================
 function toStr(v) {
   if (v === null || v === undefined) return "";
   return String(v).trim();
@@ -105,11 +103,9 @@ function pickEmailOrPhone(body) {
 function safeClub(club) {
   if (!club) return null;
   const obj = club.toObject ? club.toObject() : club;
-
   delete obj.passwordHash;
   delete obj.password;
   delete obj.otp;
-
   return obj;
 }
 
@@ -126,7 +122,6 @@ function clubToken(clubId) {
   return sign({ id: clubId, role: "CLUB", typ: "club_access" });
 }
 
-// ✅ Rate limit helper (60s)
 function isRateLimited(lastOtpSent, windowMs = 60_000) {
   if (!lastOtpSent) return false;
   const now = Date.now();
@@ -153,28 +148,14 @@ export async function clubSignUp(req, res) {
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!password) return res.status(400).json({ message: "Password required" });
 
+    if (phone && !isValidE164(phone)) {
+      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    }
+
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
 
     const existing = await Club.findOne({ $or: queryOr }).select("+passwordHash +password");
-    if (existing) {
-      const existingPass = getPasswordFromClub(existing);
-
-      if (!existingPass) {
-        const hash = await bcrypt.hash(password, 10);
-        setPasswordOnClub(existing, hash);
-
-        if (name && !existing.name) existing.name = name;
-        if (address && !existing.address) existing.address = address;
-
-        existing.status = existing.status || "PENDING_VERIFICATION";
-        await existing.save();
-
-        const token = clubToken(existing._id);
-        return res.json({ club: safeClub(existing), token, upgraded: true });
-      }
-
-      return res.status(409).json({ message: "Club already exists" });
-    }
+    if (existing) return res.status(409).json({ message: "Club already exists" });
 
     const hash = await bcrypt.hash(password, 10);
 
@@ -252,8 +233,11 @@ export async function clubRequestOtp(req, res) {
     const channel = email ? "email" : "phone";
     const query = email ? { email } : { phone };
 
-    if (channel === "phone" && !isValidE164(phone)) {
-      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    if (channel === "phone") {
+      if (!isValidE164(phone)) {
+        return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+      }
+      assertTwilioConfigured();
     }
 
     let club = await Club.findOne(query);
@@ -284,6 +268,7 @@ export async function clubRequestOtp(req, res) {
     if (channel === "email") {
       const code = otpToString(generateOtp(4));
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
       club.otp = { code, expiresAt };
       await club.save();
 
@@ -292,6 +277,7 @@ export async function clubRequestOtp(req, res) {
       return res.json({ ok: true, message: "OTP sent", channel: "email", target: email });
     }
 
+    // phone -> Twilio Verify
     club.otp = undefined;
     await club.save();
 
@@ -324,8 +310,11 @@ export async function clubVerifyOtp(req, res) {
     const channel = email ? "email" : "phone";
     const query = email ? { email } : { phone };
 
-    if (channel === "phone" && !isValidE164(phone)) {
-      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    if (channel === "phone") {
+      if (!isValidE164(phone)) {
+        return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+      }
+      assertTwilioConfigured();
     }
 
     const club = await Club.findOne(query);
@@ -338,8 +327,7 @@ export async function clubVerifyOtp(req, res) {
         return res.status(400).json({ message: "OTP expired" });
       }
 
-      const expected = otpToString(club.otp.code);
-      if (expected !== code) return res.status(400).json({ message: "Invalid OTP" });
+      if (otpToString(club.otp.code) !== code) return res.status(400).json({ message: "Invalid OTP" });
 
       club.otp = undefined;
       club.emailVerified = true;

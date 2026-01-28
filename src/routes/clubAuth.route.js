@@ -1,11 +1,5 @@
-// src/routes/clubAuth.route.js
 import express from "express";
-import {
-  clubSignUp,
-  clubLogin,
-  clubRequestOtp,
-  clubVerifyOtp,
-} from "../controllers/clubAuthController.js";
+import { clubSignUp, clubLogin, clubRequestOtp, clubVerifyOtp } from "../controllers/clubAuthController.js";
 
 const router = express.Router();
 
@@ -16,6 +10,7 @@ router.post("/signin", clubLogin);
 router.post("/otp/request", clubRequestOtp);
 router.post("/otp/verify", clubVerifyOtp);
 
+// Aliases
 router.post("/otp/send", clubRequestOtp);
 router.post("/otp/resend", clubRequestOtp);
 router.post("/otp/request-otp", clubRequestOtp);

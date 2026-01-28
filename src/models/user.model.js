@@ -57,36 +57,17 @@ const StatsSchema = new mongoose.Schema({
 });
 
 const UserSchema = new mongoose.Schema({
-  // ✅ Allow email OR phone auth (either can be present)
-  email: {
-    type: String,
-    trim: true,
-    lowercase: true,
-    index: true,
-    unique: true,
-    sparse: true,
-  },
-  phone: {
-    type: String,
-    trim: true,
-    index: true,
-    unique: true,
-    sparse: true,
-  },
+  email: { type: String, index: true, unique: true, sparse: true, trim: true, lowercase: true },
+  phone: { type: String, index: true, unique: true, sparse: true, trim: true },
 
-  // ✅ Verification flags for both channels
+  // ✅ Verification flags
   emailVerified: { type: Boolean, default: false, index: true },
   phoneVerified: { type: Boolean, default: false, index: true },
 
-  // ✅ OTP throttle / channel tracking (works for both email + phone)
+  // ✅ OTP telemetry (rate limiting + debugging)
   lastOtpSent: { type: Date, default: null },
-  lastOtpChannel: {
-    type: String,
-    enum: ["email", "phone"],
-    default: null,
-  },
+  lastOtpChannel: { type: String, enum: ["email", "phone", null], default: null },
 
-  // Password-based auth (still optional if you want OTP-only)
   passwordHash: { type: String, select: false },
 
   clerkId: { type: String, index: true, unique: true, sparse: true },
@@ -101,7 +82,7 @@ const UserSchema = new mongoose.Schema({
   friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   createdAt: { type: Date, default: Date.now },
 
-  // ✅ Email OTP store (keep for email-based OTP)
+  // ✅ Email OTP storage (only used for email OTP)
   otp: {
     code: String,
     expiresAt: Date,
@@ -118,7 +99,10 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ location: "2dsphere" });
 
 UserSchema.pre("save", function (next) {
-  // Keep your existing avatar auto-fill logic
+  // Normalize
+  if (this.email) this.email = String(this.email).trim().toLowerCase();
+  if (this.phone) this.phone = String(this.phone).trim();
+
   if (this.profile) {
     if (!this.profile.avatar || this.profile.avatar === "") {
       if (this.profile.nickname && this.profile.nickname.length > 0) {
