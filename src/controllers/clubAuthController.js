@@ -214,8 +214,92 @@ export async function clubLogin(req, res) {
   }
 }
 
+// =======================================================
+// ✅ SIGNUP OTP REQUEST (send to BOTH email + phone)
+// =======================================================
+export async function clubRequestSignupOtp(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
+  try {
+    const body = getBody(req);
+
+    const email =
+      normalizeEmail(body.email) ||
+      (isEmailIdentifier(toStr(body.identifier)) ? normalizeEmail(body.identifier) : undefined);
+
+    const phone =
+      normalizePhone(body.phone) ||
+      (!isEmailIdentifier(toStr(body.identifier)) ? normalizePhone(body.identifier) : undefined);
+
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
+
+    if (phone && !isValidE164(phone)) {
+      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    }
+
+    const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
+
+    let club = await Club.findOne({ $or: queryOr });
+
+    if (!club) {
+      club = await Club.create({
+        ...(email ? { email } : {}),
+        ...(phone ? { phone } : {}),
+        status: "PENDING_VERIFICATION",
+        verified: false,
+        emailVerified: false,
+        phoneVerified: false,
+        lastOtpSent: null,
+        lastOtpChannel: null,
+      });
+    }
+
+    if (isRateLimited(club.lastOtpSent, 60_000)) {
+      return res.status(429).json({ message: "Please wait 60 seconds before requesting another code." });
+    }
+
+    club.lastOtpSent = new Date();
+    club.lastOtpChannel = "multi";
+
+    const channelsSent = [];
+
+    // Email OTP (6-digit, stored in DB)
+    if (club.email) {
+      const code = otpToString(generateOtp(6));
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      club.otp = { code, expiresAt };
+      await club.save();
+
+      await sendOtpEmail(club.email, code);
+      channelsSent.push("email");
+    } else {
+      club.otp = undefined;
+      await club.save();
+    }
+
+    // Phone OTP via Twilio Verify
+    if (club.phone) {
+      if (!isValidE164(club.phone)) {
+        return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+      }
+      await twilioSendVerifySms(club.phone);
+      channelsSent.push("phone");
+    }
+
+    return res.json({
+      ok: true,
+      message: "Signup OTP sent",
+      flow: "signup",
+      target: { ...(club.email ? { email: club.email } : {}), ...(club.phone ? { phone: club.phone } : {}) },
+      channelsSent,
+    });
+  } catch (error) {
+    console.error("[CLUB_OTP][SIGNUP_REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+  }
+}
+
 // =============================
-// ✅ UNIFIED CLUB OTP REQUEST
+// ✅ OTP REQUEST: login (single-channel)
 // =============================
 export async function clubRequestOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -266,7 +350,7 @@ export async function clubRequestOtp(req, res) {
     club.lastOtpChannel = channel;
 
     if (channel === "email") {
-      const code = otpToString(generateOtp(4));
+      const code = otpToString(generateOtp(6));
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
       club.otp = { code, expiresAt };
@@ -274,7 +358,7 @@ export async function clubRequestOtp(req, res) {
 
       await sendOtpEmail(email, code);
 
-      return res.json({ ok: true, message: "OTP sent", channel: "email", target: email });
+      return res.json({ ok: true, message: "OTP sent", channel: "email", target: email, flow });
     }
 
     // phone -> Twilio Verify
@@ -283,7 +367,7 @@ export async function clubRequestOtp(req, res) {
 
     await twilioSendVerifySms(phone);
 
-    return res.json({ ok: true, message: "OTP sent", channel: "phone", target: phone });
+    return res.json({ ok: true, message: "OTP sent", channel: "phone", target: phone, flow });
   } catch (error) {
     console.error("[CLUB_OTP][REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
     return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
@@ -291,7 +375,9 @@ export async function clubRequestOtp(req, res) {
 }
 
 // =============================
-// ✅ UNIFIED CLUB OTP VERIFY
+// ✅ OTP VERIFY:
+// - login => token always
+// - signup => token after ANY one channel verifies (either is fine)
 // =============================
 export async function clubVerifyOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -302,6 +388,7 @@ export async function clubVerifyOtp(req, res) {
     const email = lookup.email;
     const phone = lookup.phone;
 
+    const flow = toStr(body.flow) || "login";
     const code = otpToString(body.code || body.otp);
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
@@ -331,32 +418,39 @@ export async function clubVerifyOtp(req, res) {
 
       club.otp = undefined;
       club.emailVerified = true;
+
       club.lastOtpSent = null;
       club.lastOtpChannel = null;
 
-      club.verified = true;
-      if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
+      await club.save();
+    } else {
+      const ok = await twilioCheckVerifyCode(phone, code);
+      if (!ok) return res.status(400).json({ message: "Invalid OTP" });
+
+      club.phoneVerified = true;
+
+      club.lastOtpSent = null;
+      club.lastOtpChannel = null;
 
       await club.save();
-
-      const token = clubToken(club._id);
-      return res.json({ club: safeClub(club), token, channel: "email" });
     }
 
-    const ok = await twilioCheckVerifyCode(phone, code);
-    if (!ok) return res.status(400).json({ message: "Invalid OTP" });
-
-    club.phoneVerified = true;
-    club.lastOtpSent = null;
-    club.lastOtpChannel = null;
-
-    club.verified = true;
-    if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
-
-    await club.save();
+    // ✅ If signup, mark as ACTIVE (either channel is enough)
+    if (flow === "signup") {
+      club.verified = true;
+      if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
+      await club.save();
+    }
 
     const token = clubToken(club._id);
-    return res.json({ club: safeClub(club), token, channel: "phone" });
+    return res.json({
+      ok: true,
+      flow,
+      channelVerified: channel,
+      verified: { email: !!club.emailVerified, phone: !!club.phoneVerified },
+      club: safeClub(club),
+      token,
+    });
   } catch (error) {
     console.error("[CLUB_OTP][VERIFY][ERROR]", { requestId, message: error?.message, stack: error?.stack });
     return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });

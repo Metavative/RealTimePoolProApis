@@ -5,6 +5,10 @@ const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = (process.env.SMTP_USER || "").trim();
 const SMTP_PASS = (process.env.SMTP_PASS || "").trim();
 
+// If true, we will NOT send email; we will log OTP to server console.
+// Useful for local dev and when SMTP is flaky.
+const EMAIL_DISABLED = String(process.env.EMAIL_DISABLED || "").trim().toLowerCase() === "true";
+
 let _verified = false;
 
 const transporter = nodemailer.createTransport({
@@ -14,14 +18,23 @@ const transporter = nodemailer.createTransport({
   auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
 });
 
-export function generateOtp(len = 4) {
+export function generateOtp(len = 6) {
+  const n = Number(len);
+  const digits = Number.isFinite(n) && n > 0 ? Math.floor(n) : 6;
+
+  // Always return exactly `digits` numbers (0-9), preserving leading zeros.
   let otp = "";
-  for (let i = 0; i < len; i += 1) otp += Math.floor(Math.random() * 10);
+  for (let i = 0; i < digits; i += 1) otp += Math.floor(Math.random() * 10);
   return otp;
 }
 
 async function ensureTransporterReady() {
   if (_verified) return true;
+
+  if (EMAIL_DISABLED) {
+    // no need to verify SMTP
+    return true;
+  }
 
   if (!SMTP_USER || !SMTP_PASS) {
     const err = new Error("SMTP credentials missing (SMTP_USER or SMTP_PASS)");
@@ -49,6 +62,12 @@ export async function sendOtpEmail(email, otp) {
   }
 
   await ensureTransporterReady();
+
+  if (EMAIL_DISABLED) {
+    // eslint-disable-next-line no-console
+    console.log("[EMAIL_DISABLED] OTP for", to, "=>", String(otp));
+    return { disabled: true };
+  }
 
   try {
     return await transporter.sendMail({

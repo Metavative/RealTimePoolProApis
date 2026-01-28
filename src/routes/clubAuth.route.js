@@ -1,5 +1,15 @@
 import express from "express";
-import { clubSignUp, clubLogin, clubRequestOtp, clubVerifyOtp } from "../controllers/clubAuthController.js";
+import {
+  clubSignUp,
+  clubLogin,
+
+  // login (single-channel OTP)
+  clubRequestOtp,
+  clubVerifyOtp,
+
+  // signup (multi-channel OTP)
+  clubRequestSignupOtp,
+} from "../controllers/clubAuthController.js";
 
 const router = express.Router();
 
@@ -7,6 +17,10 @@ router.post("/signup", clubSignUp);
 router.post("/login", clubLogin);
 router.post("/signin", clubLogin);
 
+// ✅ Signup OTP (send to BOTH email + phone if available)
+router.post("/otp/request-signup", clubRequestSignupOtp);
+
+// ✅ Canonical OTP endpoints (login single-channel)
 router.post("/otp/request", clubRequestOtp);
 router.post("/otp/verify", clubVerifyOtp);
 
