@@ -27,7 +27,7 @@ function emitToUser(io, presence, userId, event, payload) {
   }
 }
 
-// ---------- searchFriends (UPDATED) ----------
+// ---------- searchFriends (UPDATED: supports club callers + query key variants + flutter-friendly shape) ----------
 export async function searchFriends(req, res) {
   try {
     // ✅ Accept multiple query keys used by different clients
@@ -41,8 +41,8 @@ export async function searchFriends(req, res) {
 
     if (!q) return res.json([]);
 
-    // ✅ Works for both user + club callers (authAny sets req.userId)
-    const me = new mongoose.Types.ObjectId(req.userId);
+    // ✅ Works for both user + club callers (authAny sets req.userId for users, and req.clubId for clubs)
+    const me = req.userId ? new mongoose.Types.ObjectId(req.userId) : null;
     const regex = new RegExp(q, "i");
 
     // ✅ Allow configurable limit with safe clamp
@@ -51,15 +51,22 @@ export async function searchFriends(req, res) {
       ? Math.max(1, Math.min(limitRaw, 50))
       : 25;
 
-    const users = await User.find({
-      _id: { $ne: me },
+    // ✅ Build query without requiring userId
+    const query = {
       $or: [
         { "profile.nickname": regex },
         { email: regex },
         { phone: regex },
         { "stats.userIdTag": regex },
       ],
-    })
+    };
+
+    // Exclude caller only when caller is a real User
+    if (me) {
+      query._id = { $ne: me };
+    }
+
+    const users = await User.find(query)
       .select(
         "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag email phone"
       )
