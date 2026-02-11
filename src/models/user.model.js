@@ -56,9 +56,35 @@ const StatsSchema = new mongoose.Schema({
   disputeHistoryCount: { type: Number, default: 0 },
 });
 
+const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
+const RESERVED_USERNAMES = new Set([
+  "admin",
+  "support",
+  "help",
+  "system",
+  "moderator",
+  "mod",
+  "player",
+  "null",
+  "undefined",
+  "root",
+]);
+
 const UserSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true, trim: true, lowercase: true },
   phone: { type: String, index: true, unique: true, sparse: true, trim: true },
+
+  // ✅ Public username handle (required at signup by controller)
+  username: { type: String, trim: true, default: null },
+  usernameLower: {
+    type: String,
+    trim: true,
+    lowercase: true,
+    default: null,
+    index: true,
+    unique: true,
+    sparse: true,
+  },
 
   // ✅ Verification flags
   emailVerified: { type: Boolean, default: false, index: true },
@@ -66,7 +92,7 @@ const UserSchema = new mongoose.Schema({
 
   // ✅ OTP telemetry (rate limiting + debugging)
   lastOtpSent: { type: Date, default: null },
-  lastOtpChannel: { type: String, enum: ["email", "phone", null], default: null },
+  lastOtpChannel: { type: String, enum: ["email", "phone", "multi", null], default: null },
 
   passwordHash: { type: String, select: false },
 
@@ -103,6 +129,26 @@ UserSchema.pre("save", function (next) {
   if (this.email) this.email = String(this.email).trim().toLowerCase();
   if (this.phone) this.phone = String(this.phone).trim();
 
+  // Normalize usernameLower and validate
+  if (this.username) {
+    const raw = String(this.username).trim();
+
+    if (!USERNAME_REGEX.test(raw)) {
+      return next(new Error("Invalid username. Use 3-20 characters: letters, numbers, underscore."));
+    }
+
+    const lower = raw.toLowerCase();
+    if (RESERVED_USERNAMES.has(lower)) {
+      return next(new Error("This username is reserved. Please choose another."));
+    }
+
+    this.username = raw;
+    this.usernameLower = lower;
+  } else {
+    this.usernameLower = null;
+  }
+
+  // Profile avatar fallback
   if (this.profile) {
     if (!this.profile.avatar || this.profile.avatar === "") {
       if (this.profile.nickname && this.profile.nickname.length > 0) {

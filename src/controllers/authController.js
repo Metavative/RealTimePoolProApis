@@ -146,6 +146,47 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
   return now - last < windowMs;
 }
 
+// Username validation (mirrors model constraints)
+const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
+const RESERVED_USERNAMES = new Set([
+  "admin",
+  "support",
+  "help",
+  "system",
+  "moderator",
+  "mod",
+  "player",
+  "null",
+  "undefined",
+  "root",
+]);
+
+function normalizeUsername(username) {
+  const raw = toStr(username);
+  if (!raw) return { raw: "", lower: "" };
+  return { raw, lower: raw.toLowerCase() };
+}
+
+function validateUsernameOrThrow(username) {
+  const { raw, lower } = normalizeUsername(username);
+  if (!raw) {
+    const err = new Error("Username required");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!USERNAME_REGEX.test(raw)) {
+    const err = new Error("Invalid username. Use 3-20 characters: letters, numbers, underscore.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (RESERVED_USERNAMES.has(lower)) {
+    const err = new Error("This username is reserved. Please choose another.");
+    err.statusCode = 400;
+    throw err;
+  }
+  return { raw, lower };
+}
+
 // =========================
 // PASSWORD signup/login
 // =========================
@@ -158,6 +199,9 @@ export const signUp = async (req, res) => {
     const phone = normalizePhone(body.phone);
     const password = toStr(body.password);
 
+    // ✅ REQUIRED USERNAME
+    const { raw: username } = validateUsernameOrThrow(body.username);
+
     const role = toStr(body.role) || toStr(body.userType) || "";
     const organizer = body.organizer && typeof body.organizer === "object" ? body.organizer : null;
 
@@ -166,16 +210,29 @@ export const signUp = async (req, res) => {
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!password) return res.status(400).json({ message: "Password required" });
 
+    // Check if username already taken (case-insensitive via usernameLower)
+    const existingUsername = await User.findOne({ usernameLower: username.toLowerCase() }).select("_id username");
+    if (existingUsername) {
+      return res.status(409).json({ message: "Username already taken" });
+    }
+
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
 
     const existing = await User.findOne({ $or: queryOr }).select("+passwordHash +password");
     if (existing) {
       const existingPass = getPasswordFromUser(existing);
 
+      // If user exists and already has a username, it must match
+      if (existing.usernameLower && existing.usernameLower !== username.toLowerCase()) {
+        return res.status(409).json({ message: "Account exists with a different username" });
+      }
+
       // upgrade if password missing
       if (!existingPass) {
         const hash = await bcrypt.hash(password, 10);
         setPasswordOnUser(existing, hash);
+
+        existing.username = existing.username || username;
 
         existing.profile = existing.profile || {};
         if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
@@ -204,8 +261,7 @@ export const signUp = async (req, res) => {
     const user = await User.create({
       email,
       phone,
-      passwordHash: hash,
-      password: hash,
+      username,
       profile: {
         ...(nickname ? { nickname } : {}),
         ...(role ? { role, userType: role } : {}),
@@ -216,13 +272,21 @@ export const signUp = async (req, res) => {
       phoneVerified: false,
       lastOtpSent: null,
       lastOtpChannel: null,
+      passwordHash: hash,
+      password: hash,
     });
 
     const token = sign({ id: user._id });
     return res.json({ user: safeUser(user), token });
   } catch (error) {
     console.error("[AUTH][SIGNUP][ERROR]", { requestId, message: error?.message, stack: error?.stack });
-    if (error && error.code === 11000) return res.status(409).json({ message: "User exists" });
+
+    if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
+
+    if (error && error.code === 11000) {
+      // Could be email/phone/usernameLower collisions
+      return res.status(409).json({ message: "Duplicate value (email/phone/username) already exists" });
+    }
     return res.status(500).json({ message: error?.message || "Internal server error" });
   }
 };
@@ -258,19 +322,18 @@ export async function login(req, res) {
 // =======================================================
 // ✅ SIGNUP OTP REQUEST (send to BOTH email + phone)
 // =======================================================
-// =======================================================
-// ✅ SIGNUP OTP REQUEST (send to BOTH email + phone)
-// =======================================================
 export async function requestSignupOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
 
   const log = (step, extra = {}) => {
-    // eslint-disable-next-line no-console
     console.log(`[OTP][SIGNUP_REQUEST][${requestId}] ${step}`, extra);
   };
 
   try {
     const body = getBody(req);
+
+    // ✅ REQUIRED USERNAME FOR SIGNUP
+    const { raw: username, lower: usernameLower } = validateUsernameOrThrow(body.username);
 
     const email =
       normalizeEmail(body.email) ||
@@ -280,7 +343,7 @@ export async function requestSignupOtp(req, res) {
       normalizePhone(body.phone) ||
       (!isEmailIdentifier(toStr(body.identifier)) ? normalizePhone(body.identifier) : undefined);
 
-    log("INPUT", { email, phone, raw: { email: body.email, phone: body.phone, identifier: body.identifier } });
+    log("INPUT", { username, email, phone, raw: { email: body.email, phone: body.phone, identifier: body.identifier } });
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
@@ -289,8 +352,13 @@ export async function requestSignupOtp(req, res) {
       return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
-    const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
+    // Block if username already taken (even before creating email/phone user)
+    const usernameTaken = await User.findOne({ usernameLower }).select("_id username");
+    if (usernameTaken) {
+      return res.status(409).json({ message: "Username already taken" });
+    }
 
+    const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
     let user = await User.findOne({ $or: queryOr });
 
     // Create if doesn't exist yet
@@ -299,6 +367,7 @@ export async function requestSignupOtp(req, res) {
       user = await User.create({
         ...(email ? { email } : {}),
         ...(phone ? { phone } : {}),
+        username,
         phoneVerified: false,
         emailVerified: false,
         lastOtpSent: null,
@@ -306,6 +375,14 @@ export async function requestSignupOtp(req, res) {
         profile: { ...(email ? { nickname: email.split("@")[0] } : phone ? { nickname: phone } : {}) },
         stats: { userIdTag: await createUniqueTag() },
       });
+    } else {
+      // If user exists, ensure username matches or is set
+      if (user.usernameLower && user.usernameLower !== usernameLower) {
+        return res.status(409).json({ message: "Account exists with a different username" });
+      }
+      if (!user.username) {
+        user.username = username;
+      }
     }
 
     if (isRateLimited(user.lastOtpSent, 60_000)) {
@@ -317,7 +394,7 @@ export async function requestSignupOtp(req, res) {
     user.lastOtpChannel = "multi";
 
     const channelsSent = [];
-    const channelsFailed = []; // { channel, error }
+    const channelsFailed = [];
     const channelsAttempted = [];
 
     // ===== EMAIL OTP (DB stored) =====
@@ -352,7 +429,6 @@ export async function requestSignupOtp(req, res) {
           log("INVALID_PHONE_E164_STORED", { phone: user.phone });
           channelsFailed.push({ channel: "phone", error: "invalid_e164" });
         } else {
-          // IMPORTANT log env config status (don’t print secrets)
           log("TWILIO_CONFIG", {
             hasAccountSid: !!TWILIO_ACCOUNT_SID,
             hasAuthToken: !!TWILIO_AUTH_TOKEN,
@@ -370,15 +446,14 @@ export async function requestSignupOtp(req, res) {
       }
     }
 
-    // Don’t fail the whole request if one channel fails
     const ok = channelsSent.length > 0;
-
     log("RESULT", { ok, channelsAttempted, channelsSent, channelsFailed });
 
     return res.json({
       ok,
       message: ok ? "Signup OTP sent" : "Failed to send OTP",
       flow: "signup",
+      username,
       target: { ...(user.email ? { email: user.email } : {}), ...(user.phone ? { phone: user.phone } : {}) },
       channelsAttempted,
       channelsSent,
@@ -389,7 +464,6 @@ export async function requestSignupOtp(req, res) {
     return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
   }
 }
-
 
 // =========================
 // ✅ OTP REQUEST: login (single-channel)
@@ -402,9 +476,15 @@ export async function requestOtp(req, res) {
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
-    const flow = toStr(body.flow) || "login"; // signup|login (we mainly use login here)
+    const flow = toStr(body.flow) || "login"; // signup|login
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
+
+    // Safety: if someone uses this endpoint for signup, require username
+    let requestedUsername = null;
+    if (flow === "signup") {
+      requestedUsername = validateUsernameOrThrow(body.username).raw;
+    }
 
     const channel = email ? "email" : "phone";
     const query = email ? { email } : { phone };
@@ -422,6 +502,7 @@ export async function requestOtp(req, res) {
     if (!user) {
       user = await User.create({
         ...query,
+        ...(requestedUsername ? { username: requestedUsername } : {}),
         phoneVerified: false,
         emailVerified: false,
         lastOtpSent: null,
@@ -462,9 +543,7 @@ export async function requestOtp(req, res) {
 }
 
 // =========================
-// ✅ OTP VERIFY:
-// - login => token always
-// - signup => token after ANY one channel verifies (either is fine)
+// ✅ OTP VERIFY
 // =========================
 export async function verifyOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -526,7 +605,6 @@ export async function verifyOtp(req, res) {
       await user.save();
     }
 
-    // ✅ Both login and signup return token once a channel verifies
     const token = sign({ id: user._id });
     return res.json({
       ok: true,
