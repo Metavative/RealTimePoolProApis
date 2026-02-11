@@ -1,5 +1,6 @@
 import express from "express";
 import { authMiddleware as auth } from "../middleware/authMiddleware.js";
+import { authAny } from "../middleware/authAny.middleware.js";
 
 import {
   sendRequest,
@@ -28,6 +29,7 @@ export default function friendRoutes(io, presence) {
   // List friends
   // GET /api/friend/list
   router.get("/list", auth, (req, res) => listFriends(req, res, presence));
+  router.get("/search", authAny, searchFriends);
 
   return router;
 }

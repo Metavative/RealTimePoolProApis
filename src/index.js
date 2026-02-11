@@ -112,6 +112,16 @@ const io = new Server(server, {
 // Presence map for online players
 const presence = new Map();
 
+// Small helper methods so controllers can use presence.isOnline / presence.getSocketIds
+presence.isOnline = (userId) => {
+  return presence.has(String(userId));
+};
+
+presence.getSocketIds = (userId) => {
+  const sid = presence.get(String(userId));
+  return sid ? [sid] : [];
+};
+
 // Friend routes need io/presence
 app.use("/api/friend", friendRoutes(io, presence));
 
@@ -180,6 +190,8 @@ io.on("connection", (socket) => {
     if (!uid) return;
 
     socket.userId = uid;
+    // Join per-user room so friendController emits reach this user
+    socket.join(`user:${uid}`);
     presence.set(uid, socket.id);
 
     try {
