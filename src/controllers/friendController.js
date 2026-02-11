@@ -27,14 +27,29 @@ function emitToUser(io, presence, userId, event, payload) {
   }
 }
 
-// ---------- searchFriends ----------
+// ---------- searchFriends (UPDATED) ----------
 export async function searchFriends(req, res) {
   try {
-    const q = String(req.query.q || "").trim();
+    // ✅ Accept multiple query keys used by different clients
+    const q = String(
+      req.query.q ??
+        req.query.search ??
+        req.query.keyword ??
+        req.query.query ??
+        ""
+    ).trim();
+
     if (!q) return res.json([]);
 
+    // ✅ Works for both user + club callers (authAny sets req.userId)
     const me = new mongoose.Types.ObjectId(req.userId);
     const regex = new RegExp(q, "i");
+
+    // ✅ Allow configurable limit with safe clamp
+    const limitRaw = parseInt(String(req.query.limit ?? "25"), 10);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(limitRaw, 50))
+      : 25;
 
     const users = await User.find({
       _id: { $ne: me },
@@ -46,16 +61,20 @@ export async function searchFriends(req, res) {
       ],
     })
       .select(
-        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag email phone"
       )
-      .limit(20)
+      .limit(limit)
       .lean();
 
+    // ✅ Return a shape that matches Flutter PlayerSearchResult.fromJson
     return res.json(
       users.map((u) => ({
         id: u._id,
-        nickname: u.profile?.nickname || "",
-        avatar: u.profile?.avatar || "",
+        name: u.profile?.nickname || "",
+        username: u.stats?.userIdTag || "",
+        email: u.email || "",
+        phone: u.phone || "",
+        avatarUrl: u.profile?.avatar || "",
         online: !!u.profile?.onlineStatus,
         rank: u.stats?.rank || "Beginner",
         tag: u.stats?.userIdTag || "",
@@ -192,7 +211,8 @@ export async function sendRequest(req, res, io, presence) {
     // Block if already friends
     const [a, b] = sortPair(me, toUserId);
     const existingFriend = await Friendship.findOne({ a, b }).lean();
-    if (existingFriend) return res.status(409).json({ message: "Already friends" });
+    if (existingFriend)
+      return res.status(409).json({ message: "Already friends" });
 
     // Block if ANY pending request exists either direction
     const pendingEitherWay = await FriendRequest.findOne({
@@ -304,7 +324,11 @@ export async function respond(req, res, io, presence) {
 
     // Accept: create friendship (sorted pair, upsert)
     const [a, b] = sortPair(fr.from, fr.to);
-    await Friendship.updateOne({ a, b }, { $setOnInsert: { a, b } }, { upsert: true });
+    await Friendship.updateOne(
+      { a, b },
+      { $setOnInsert: { a, b } },
+      { upsert: true }
+    );
 
     // Optional: reject any other pending requests between the same pair
     await FriendRequest.updateMany(
