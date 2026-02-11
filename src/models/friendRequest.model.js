@@ -26,8 +26,7 @@ const FriendRequestSchema = new Schema(
 );
 
 /**
- * ✅ Only one PENDING request allowed for a pair.
- * Allows re-requesting after rejected/cancelled/accepted (if you ever support it).
+ * Only one PENDING request allowed in the same direction
  */
 FriendRequestSchema.index(
   { from: 1, to: 1, status: 1 },
@@ -37,10 +36,6 @@ FriendRequestSchema.index(
   }
 );
 
-/**
- * (Optional but recommended)
- * If someone searches reverse direction, we can also check it fast
- */
 FriendRequestSchema.index({ to: 1, status: 1 });
 
 export default mongoose.models.FriendRequest ||

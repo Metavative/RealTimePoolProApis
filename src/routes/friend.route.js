@@ -5,54 +5,29 @@ import {
   sendRequest,
   respond,
   searchFriends,
-  createDummyIncomingRequest,
+  listRequests,
+  listFriends,
 } from "../controllers/friendController.js";
 
-/**
- * Friend routes need access to:
- * - io       → to emit socket events
- * - presence → to know who is online
- */
 export default function friendRoutes(io, presence) {
   const router = express.Router();
 
-  /**
-   * Search friends
-   * GET /api/friend/search?q=
-   */
+  // Search users
   router.get("/search", auth, searchFriends);
 
-  /**
-   * Send friend request
-   * POST /api/friend/request
-   * body: { toUserId }
-   */
-  router.post(
-    "/request",
-    auth,
-    (req, res) => sendRequest(req, res, io, presence)
-  );
+  // Send friend request
+  router.post("/request", auth, (req, res) => sendRequest(req, res, io, presence));
 
-  /**
-   * Respond to friend request
-   * POST /api/friend/respond
-   * body: { requestId, accept }
-   */
-  router.post(
-    "/respond",
-    auth,
-    (req, res) => respond(req, res, io, presence)
-  );
+  // Respond to friend request (accept/reject)
+  router.post("/respond", auth, (req, res) => respond(req, res, io, presence));
 
-  /**
-   * Create dummy incoming request (dev/testing only)
-   * POST /api/friend/dummy_incoming
-   */
-  router.post(
-    "/dummy_incoming",
-    auth,
-    createDummyIncomingRequest
-  );
+  // List incoming/outgoing requests
+  // GET /api/friend/requests?type=incoming|outgoing
+  router.get("/requests", auth, (req, res) => listRequests(req, res));
+
+  // List friends
+  // GET /api/friend/list
+  router.get("/list", auth, (req, res) => listFriends(req, res, presence));
 
   return router;
 }

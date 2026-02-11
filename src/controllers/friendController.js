@@ -1,262 +1,343 @@
-import FriendRequest from "../models/friend.model.js";
+import mongoose from "mongoose";
 import User from "../models/user.model.js";
-import crypto from "crypto";
+import FriendRequest from "../models/friendRequest.model.js";
+import Friendship from "../models/friendship.model.js";
 
-/**
- * SEND FRIEND REQUEST
- */
-export async function sendRequest(req, res, io, presence) {
-  try {
-    const from = req.userId;
-    const { to } = req.body;
+// ---------- helpers ----------
+function toObjectId(id) {
+  return typeof id === "string" ? new mongoose.Types.ObjectId(id) : id;
+}
 
-    if (!to) {
-      return res.status(400).json({ message: "Recipient (to) is required" });
-    }
+function sortPair(a, b) {
+  const as = String(a);
+  const bs = String(b);
+  return as < bs ? [a, b] : [b, a];
+}
 
-    if (String(from) === String(to)) {
-      return res.status(400).json({ message: "You cannot send a request to yourself" });
-    }
+function emitToUser(io, presence, userId, event, payload) {
+  const room = `user:${userId}`;
 
-    const sender = await User.findById(from).select("friends");
-    if (!sender) {
-      return res.status(404).json({ message: "Sender not found" });
-    }
+  // Preferred: user room
+  if (io) io.to(room).emit(event, payload);
 
-    if (sender.friends?.some((id) => String(id) === String(to))) {
-      return res.status(400).json({ message: "Already friends" });
-    }
-
-    const existing = await FriendRequest.findOne({
-      from,
-      to,
-      status: "pending",
-    }).select("_id");
-
-    if (existing) {
-      return res.status(400).json({ message: "Friend request already pending" });
-    }
-
-    const fr = await FriendRequest.create({
-      from,
-      to,
-      status: "pending",
-    });
-
-    // 🔔 Notify receiver if online
-    const toSocket = presence.get(String(to));
-    if (toSocket) {
-      io.to(toSocket).emit("friend:request:new", {
-        requestId: fr._id,
-        from,
-      });
-    }
-
-    return res.json({ success: true, fr });
-  } catch (error) {
-    console.error("sendRequest error:", error);
-    return res.status(500).json({
-      message: error?.message || "Internal server error",
-    });
+  // Optional: direct sockets if presence supports it
+  if (presence?.getSocketIds) {
+    const sockets = presence.getSocketIds(String(userId)) || [];
+    for (const sid of sockets) io.to(sid).emit(event, payload);
   }
 }
 
-/**
- * RESPOND TO FRIEND REQUEST
- */
-export async function respond(req, res, io, presence) {
-  try {
-    const userId = req.userId;
-    const { requestId, accept } = req.body;
-
-    if (!requestId) {
-      return res.status(400).json({ message: "requestId required" });
-    }
-
-    const fr = await FriendRequest.findById(requestId);
-    if (!fr) {
-      return res.status(404).json({ message: "Request not found" });
-    }
-
-    // Only receiver can respond
-    if (String(fr.to) !== String(userId)) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
-
-    fr.status = accept ? "accepted" : "rejected";
-    await fr.save();
-
-    if (accept) {
-      await User.findByIdAndUpdate(fr.from, {
-        $addToSet: { friends: fr.to },
-      });
-
-      await User.findByIdAndUpdate(fr.to, {
-        $addToSet: { friends: fr.from },
-      });
-    }
-
-    // 🔔 Notify both users if online
-    const fromSocket = presence.get(String(fr.from));
-    const toSocket = presence.get(String(fr.to));
-
-    if (fromSocket) {
-      io.to(fromSocket).emit("friend:request:updated", fr);
-    }
-
-    if (toSocket) {
-      io.to(toSocket).emit("friend:request:updated", fr);
-    }
-
-    return res.json({ success: true, fr });
-  } catch (error) {
-    console.error("respond error:", error);
-    return res.status(500).json({
-      message: error?.message || "Internal server error",
-    });
-  }
-}
-
-/**
- * SEARCH FRIENDS
- */
+// ---------- searchFriends ----------
 export async function searchFriends(req, res) {
   try {
-    const userId = req.userId;
-    const query = (req.query.query || "").trim();
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.json([]);
 
-    const currentUser = await User.findById(userId)
-      .populate("friends", "_id")
+    const me = new mongoose.Types.ObjectId(req.userId);
+    const regex = new RegExp(q, "i");
+
+    const users = await User.find({
+      _id: { $ne: me },
+      $or: [
+        { "profile.nickname": regex },
+        { email: regex },
+        { phone: regex },
+        { "stats.userIdTag": regex },
+      ],
+    })
+      .select(
+        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+      )
+      .limit(20)
       .lean();
 
-    if (!currentUser) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const friendIds = (currentUser.friends || []).map((f) =>
-      String(f._id)
+    return res.json(
+      users.map((u) => ({
+        id: u._id,
+        nickname: u.profile?.nickname || "",
+        avatar: u.profile?.avatar || "",
+        online: !!u.profile?.onlineStatus,
+        rank: u.stats?.rank || "Beginner",
+        tag: u.stats?.userIdTag || "",
+      }))
     );
+  } catch (err) {
+    console.error("searchFriends error:", err);
+    return res.status(500).json({ message: "Failed to search users" });
+  }
+}
 
-    const filter = query
-      ? {
-          $or: [
-            { "profile.nickname": { $regex: query, $options: "i" } },
-            { "stats.userIdTag": { $regex: query, $options: "i" } },
-          ],
-        }
-      : {};
+// ---------- listRequests ----------
+export async function listRequests(req, res) {
+  try {
+    const me = toObjectId(req.userId);
+    const type = String(req.query.type || "incoming").toLowerCase();
 
-    const users = await User.find(filter)
-      .select(
-        "profile.nickname profile.avatar profile.onlineStatus stats.userIdTag"
+    const query =
+      type === "outgoing"
+        ? { from: me, status: "pending" }
+        : { to: me, status: "pending" };
+
+    const requests = await FriendRequest.find(query)
+      .sort({ createdAt: -1 })
+      .populate(
+        "from",
+        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+      )
+      .populate(
+        "to",
+        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
-    const requests = await FriendRequest.find({
-      $or: [{ from: userId }, { to: userId }],
-      status: "pending",
-    }).lean();
-
-    const result = users
-      .filter((u) => String(u._id) !== String(userId))
-      .map((u) => {
-        const uid = String(u._id);
-
-        let status = "none";
-        let requestId = null;
-
-        if (friendIds.includes(uid)) {
-          status = "friend";
-        } else {
-          const sentByMe = requests.find(
-            (r) =>
-              String(r.from) === String(userId) &&
-              String(r.to) === uid
-          );
-
-          const sentToMe = requests.find(
-            (r) =>
-              String(r.to) === String(userId) &&
-              String(r.from) === uid
-          );
-
-          if (sentByMe) {
-            status = "pending";
-            requestId = String(sentByMe._id);
-          } else if (sentToMe) {
-            status = "incoming";
-            requestId = String(sentToMe._id);
-          }
-        }
+    return res.json(
+      requests.map((r) => {
+        const from = r.from && typeof r.from === "object" ? r.from : null;
+        const to = r.to && typeof r.to === "object" ? r.to : null;
 
         return {
-          id: uid,
-          nickname: u.profile?.nickname || "Unknown",
-          avatar: u.profile?.avatar || "",
-          userIdTag: u.stats?.userIdTag || "",
-          onlineStatus: Boolean(u.profile?.onlineStatus),
-          status,
-          requestId,
+          requestId: r._id,
+          status: r.status,
+          createdAt: r.createdAt,
+          from: from
+            ? {
+                id: from._id,
+                nickname: from.profile?.nickname || "",
+                avatar: from.profile?.avatar || "",
+                online: !!from.profile?.onlineStatus,
+                rank: from.stats?.rank || "Beginner",
+                tag: from.stats?.userIdTag || "",
+              }
+            : { id: r.from },
+          to: to
+            ? {
+                id: to._id,
+                nickname: to.profile?.nickname || "",
+                avatar: to.profile?.avatar || "",
+                online: !!to.profile?.onlineStatus,
+                rank: to.stats?.rank || "Beginner",
+                tag: to.stats?.userIdTag || "",
+              }
+            : { id: r.to },
         };
-      });
-
-    return res.json({ success: true, data: result });
-  } catch (error) {
-    console.error("searchFriends error:", error);
-    return res.status(500).json({
-      message: error?.message || "Internal server error",
-    });
+      })
+    );
+  } catch (err) {
+    console.error("listRequests error:", err);
+    return res.status(500).json({ message: "Failed to load friend requests" });
   }
 }
 
-/**
- * DUMMY INCOMING REQUEST (DEV ONLY)
- */
-export async function createDummyIncomingRequest(req, res) {
+// ---------- listFriends ----------
+export async function listFriends(req, res, presence) {
   try {
-    const userId = req.userId;
+    const me = toObjectId(req.userId);
 
-    let dummyUser = await User.findOne({
-      email: "dummy@poolpro.dev",
-    }).select("_id");
+    const rows = await Friendship.find({
+      $or: [{ a: me }, { b: me }],
+    })
+      .sort({ updatedAt: -1 })
+      .lean();
 
-    if (!dummyUser) {
-      const tag = `player_${crypto.randomBytes(3).toString("hex")}`;
-      dummyUser = await User.create({
-        email: "dummy@poolpro.dev",
-        profile: {
-          nickname: "DummyPlayer",
-          avatar: "",
-          onlineStatus: true,
-        },
-        stats: { userIdTag: tag },
-      });
+    const friendIds = rows.map((f) => (String(f.a) === String(me) ? f.b : f.a));
+
+    const friends = await User.find({ _id: { $in: friendIds } })
+      .select(
+        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+      )
+      .lean();
+
+    const byId = new Map(friends.map((u) => [String(u._id), u]));
+
+    return res.json(
+      friendIds
+        .map((id) => byId.get(String(id)))
+        .filter(Boolean)
+        .map((u) => ({
+          id: u._id,
+          nickname: u.profile?.nickname || "",
+          avatar: u.profile?.avatar || "",
+          online: presence?.isOnline
+            ? !!presence.isOnline(String(u._id))
+            : !!u.profile?.onlineStatus,
+          rank: u.stats?.rank || "Beginner",
+          tag: u.stats?.userIdTag || "",
+        }))
+    );
+  } catch (err) {
+    console.error("listFriends error:", err);
+    return res.status(500).json({ message: "Failed to load friends" });
+  }
+}
+
+// ---------- sendRequest ----------
+export async function sendRequest(req, res, io, presence) {
+  try {
+    const me = toObjectId(req.userId);
+    const toUserIdRaw = req.body?.toUserId;
+
+    if (!toUserIdRaw)
+      return res.status(400).json({ message: "toUserId is required" });
+
+    const toUserId = toObjectId(toUserIdRaw);
+
+    if (String(me) === String(toUserId)) {
+      return res.status(400).json({ message: "You cannot add yourself" });
     }
 
-    const exists = await FriendRequest.findOne({
-      from: dummyUser._id,
-      to: userId,
+    // Ensure target exists
+    const target = await User.findById(toUserId).select("_id").lean();
+    if (!target) return res.status(404).json({ message: "User not found" });
+
+    // Block if already friends
+    const [a, b] = sortPair(me, toUserId);
+    const existingFriend = await Friendship.findOne({ a, b }).lean();
+    if (existingFriend) return res.status(409).json({ message: "Already friends" });
+
+    // Block if ANY pending request exists either direction
+    const pendingEitherWay = await FriendRequest.findOne({
+      status: "pending",
+      $or: [
+        { from: me, to: toUserId },
+        { from: toUserId, to: me },
+      ],
+    }).lean();
+
+    if (pendingEitherWay) {
+      return res.status(409).json({ message: "Friend request already pending" });
+    }
+
+    // Create request
+    const request = await FriendRequest.create({
+      from: me,
+      to: toUserId,
       status: "pending",
     });
 
-    if (exists) {
-      return res.json({
-        success: true,
-        message: "Dummy request already exists",
-      });
+    // Emit realtime
+    emitToUser(io, presence, toUserId, "friend:request_received", {
+      requestId: request._id,
+      fromUserId: me,
+      toUserId,
+      status: request.status,
+      createdAt: request.createdAt,
+    });
+
+    emitToUser(io, presence, me, "friend:request_sent", {
+      requestId: request._id,
+      fromUserId: me,
+      toUserId,
+      status: request.status,
+      createdAt: request.createdAt,
+    });
+
+    return res.json({
+      ok: true,
+      requestId: request._id,
+      status: request.status,
+      createdAt: request.createdAt,
+    });
+  } catch (err) {
+    // Handle unique partial index error cleanly
+    if (err?.code === 11000) {
+      return res.status(409).json({ message: "Friend request already pending" });
+    }
+    console.error("sendRequest error:", err);
+    return res.status(500).json({ message: "Failed to send friend request" });
+  }
+}
+
+// ---------- respond (UPDATED: concurrency-safe + no duplicate emits) ----------
+export async function respond(req, res, io, presence) {
+  try {
+    const me = toObjectId(req.userId);
+    const requestId = req.body?.requestId;
+    const accept = !!req.body?.accept;
+
+    if (!requestId)
+      return res.status(400).json({ message: "requestId is required" });
+
+    const fr = await FriendRequest.findById(requestId).lean();
+    if (!fr) return res.status(404).json({ message: "Request not found" });
+
+    // Only receiver can respond
+    if (String(fr.to) !== String(me)) {
+      return res.status(403).json({ message: "Not allowed" });
     }
 
-    const fr = await FriendRequest.create({
-      from: dummyUser._id,
-      to: userId,
-      status: "pending",
+    // Idempotency: if already processed, just return ok
+    if (fr.status !== "pending") {
+      return res.json({ ok: true, status: fr.status });
+    }
+
+    const nextStatus = accept ? "accepted" : "rejected";
+
+    // Concurrency-safe state transition
+    const upd = await FriendRequest.updateOne(
+      { _id: fr._id, status: "pending" },
+      { $set: { status: nextStatus } }
+    );
+
+    // If another request already processed it, don't emit again
+    if (upd.matchedCount === 0) {
+      const latest = await FriendRequest.findById(fr._id)
+        .select("status")
+        .lean();
+      return res.json({ ok: true, status: latest?.status || fr.status });
+    }
+
+    if (!accept) {
+      emitToUser(io, presence, fr.from, "friend:request_rejected", {
+        requestId: fr._id,
+        fromUserId: fr.from,
+        toUserId: fr.to,
+      });
+
+      emitToUser(io, presence, fr.to, "friend:request_rejected", {
+        requestId: fr._id,
+        fromUserId: fr.from,
+        toUserId: fr.to,
+      });
+
+      return res.json({ ok: true, status: "rejected" });
+    }
+
+    // Accept: create friendship (sorted pair, upsert)
+    const [a, b] = sortPair(fr.from, fr.to);
+    await Friendship.updateOne({ a, b }, { $setOnInsert: { a, b } }, { upsert: true });
+
+    // Optional: reject any other pending requests between the same pair
+    await FriendRequest.updateMany(
+      {
+        status: "pending",
+        $or: [
+          { from: fr.to, to: fr.from },
+          { from: fr.from, to: fr.to },
+        ],
+        _id: { $ne: fr._id },
+      },
+      { $set: { status: "rejected" } }
+    );
+
+    // Emit
+    emitToUser(io, presence, fr.from, "friend:request_accepted", {
+      requestId: fr._id,
+      fromUserId: fr.from,
+      toUserId: fr.to,
     });
 
-    return res.json({ success: true, fr });
-  } catch (error) {
-    console.error("createDummyIncomingRequest error:", error);
-    return res.status(500).json({
-      message: "Failed to create dummy request",
+    emitToUser(io, presence, fr.to, "friend:request_accepted", {
+      requestId: fr._id,
+      fromUserId: fr.from,
+      toUserId: fr.to,
     });
+
+    emitToUser(io, presence, fr.from, "friend:list_updated", {});
+    emitToUser(io, presence, fr.to, "friend:list_updated", {});
+
+    return res.json({ ok: true, status: "accepted" });
+  } catch (err) {
+    console.error("respond error:", err);
+    return res.status(500).json({ message: "Failed to respond to request" });
   }
 }
