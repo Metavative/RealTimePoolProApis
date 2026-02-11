@@ -13,23 +13,20 @@ import {
 export default function friendRoutes(io, presence) {
   const router = express.Router();
 
-  // Search users
-  router.get("/search", auth, searchFriends);
+  // ✅ Search users (allow both club + user tokens)
+  router.get("/search", authAny, searchFriends);
 
-  // Send friend request
+  // Send friend request (keep user auth only if that's your rule)
   router.post("/request", auth, (req, res) => sendRequest(req, res, io, presence));
 
   // Respond to friend request (accept/reject)
   router.post("/respond", auth, (req, res) => respond(req, res, io, presence));
 
   // List incoming/outgoing requests
-  // GET /api/friend/requests?type=incoming|outgoing
   router.get("/requests", auth, (req, res) => listRequests(req, res));
 
   // List friends
-  // GET /api/friend/list
   router.get("/list", auth, (req, res) => listFriends(req, res, presence));
-  router.get("/search", authAny, searchFriends);
 
   return router;
 }
