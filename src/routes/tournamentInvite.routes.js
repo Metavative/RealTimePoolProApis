@@ -11,13 +11,15 @@ import {
 export default function tournamentInviteRoutes(io, presence) {
   const router = express.Router();
 
-  // Organizer sends invite (club token)
+  // Organizer (club token) sends invite
   router.post("/tournaments/:tournamentId/invites", authAny, (req, res) =>
     sendTournamentInvite(req, res, io, presence)
   );
 
   // Player inbox (user token)
-  router.get("/tournament-invites/inbox", authAny, listMyInvites);
+  router.get("/tournament-invites/inbox", authAny, (req, res) =>
+    listMyInvites(req, res)
+  );
 
   // Player respond (user token)
   router.post("/tournament-invites/:inviteId/respond", authAny, (req, res) =>
