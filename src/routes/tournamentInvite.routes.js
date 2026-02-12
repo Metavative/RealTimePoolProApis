@@ -1,5 +1,5 @@
 import express from "express";
-import { authMiddleware as auth } from "../middleware/authMiddleware.js";
+import { authAny } from "../middleware/authAny.middleware.js";
 
 import {
   sendTournamentInvite,
@@ -11,21 +11,21 @@ import {
 export default function tournamentInviteRoutes(io, presence) {
   const router = express.Router();
 
-  // Organizer sends invite (by username)
-  router.post("/tournaments/:tournamentId/invites", auth, (req, res) =>
+  // Organizer sends invite (club token)
+  router.post("/tournaments/:tournamentId/invites", authAny, (req, res) =>
     sendTournamentInvite(req, res, io, presence)
   );
 
-  // Player inbox
-  router.get("/tournament-invites/inbox", auth, listMyInvites);
+  // Player inbox (user token)
+  router.get("/tournament-invites/inbox", authAny, listMyInvites);
 
-  // Player respond
-  router.post("/tournament-invites/:inviteId/respond", auth, (req, res) =>
+  // Player respond (user token)
+  router.post("/tournament-invites/:inviteId/respond", authAny, (req, res) =>
     respondToInvite(req, res, io, presence)
   );
 
-  // Organizer cancel
-  router.post("/tournament-invites/:inviteId/cancel", auth, (req, res) =>
+  // Organizer cancel (club token)
+  router.post("/tournament-invites/:inviteId/cancel", authAny, (req, res) =>
     cancelInvite(req, res, io, presence)
   );
 
