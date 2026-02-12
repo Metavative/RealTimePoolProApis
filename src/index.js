@@ -27,17 +27,16 @@ import zegoRoutes from "./routes/zego.route.js";
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 import tournamentRoutes from "./routes/tournament.route.js";
 import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
-import router from "./routes/auth.route.js";
 
 dotenv.config();
 
 // ---- Global crash logging (so Railway ALWAYS shows something) ----
 process.on("unhandledRejection", (reason) => {
-  console.error("🔥 UNHANDLED REJECTION:", reason);
+  console.error("❌ UNHANDLED REJECTION:", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("🔥 UNCAUGHT EXCEPTION:", err);
+  console.error("❌ UNCAUGHT EXCEPTION:", err);
 });
 
 const app = express();
@@ -77,9 +76,9 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Routes
+// Routes (do NOT require io)
 app.use("/api/auth", authRoutes);
-app.use("/api/auth/club", clubAuthRoutes); // ✅ NEW (parallel auth)
+app.use("/api/auth/club", clubAuthRoutes);
 
 app.use("/api/user", userRoutes);
 app.use("/api/match", matchRoutes);
@@ -87,7 +86,7 @@ app.use("/api/club", clubRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/zego", zegoRoutes);
 app.use("/api/tournaments", tournamentRoutes);
-router.use("/api", tournamentInviteRoutes(io, presence));
+
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   console.log("✅ Health check endpoint hit");
@@ -102,7 +101,7 @@ app.get("/api/health", (req, res) => {
 const server = Http.createServer(app);
 
 server.on("error", (err) => {
-  console.error("🔥 HTTP SERVER ERROR:", err);
+  console.error("❌ HTTP SERVER ERROR:", err);
 });
 
 const io = new Server(server, {
@@ -125,8 +124,9 @@ presence.getSocketIds = (userId) => {
   return sid ? [sid] : [];
 };
 
-// Friend routes need io/presence
+// ✅ Routes that need io/presence MUST be mounted after io + presence exist
 app.use("/api/friend", friendRoutes(io, presence));
+app.use("/api", tournamentInviteRoutes(io, presence));
 
 // User status endpoint
 app.get("/api/user/status/:id", (req, res) => {
@@ -184,7 +184,7 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
 
 // Socket.io connection handler
 io.on("connection", (socket) => {
-  console.log(`🔌 Socket connected: ${socket.id}`);
+  console.log(`� Socket connected: ${socket.id}`);
 
   registerMatchHandlers(io, socket, presence);
 
@@ -193,8 +193,10 @@ io.on("connection", (socket) => {
     if (!uid) return;
 
     socket.userId = uid;
-    // Join per-user room so friendController emits reach this user
+
+    // Join per-user room so server can emit to this user if you use rooms elsewhere
     socket.join(`user:${uid}`);
+
     presence.set(uid, socket.id);
 
     try {
@@ -252,6 +254,7 @@ io.on("connection", (socket) => {
     }
 
     const { userId, lat, lng } = payload;
+
     try {
       await User.findByIdAndUpdate(userId, {
         location: { type: "Point", coordinates: [lng, lat] },
@@ -278,7 +281,7 @@ io.on("connection", (socket) => {
           lastSeen: new Date(),
         });
         await emitOnlinePlayers();
-        console.log(`👤 User offline: ${uid}`);
+        console.log(`� User offline: ${uid}`);
       } catch (err) {
         console.error("Error updating user status on disconnect:", err);
       }
@@ -290,12 +293,11 @@ io.on("connection", (socket) => {
 
 // ✅ Error handling middleware MUST be after routes
 app.use((err, req, res, next) => {
-  console.error("🔥 EXPRESS ERROR:");
+  console.error("❌ EXPRESS ERROR:");
   console.error("Route:", req.method, req.originalUrl);
   console.error("Message:", err?.message);
   console.error("Stack:", err?.stack);
 
-  // Log body safely (avoid huge dumps)
   try {
     console.error("Body:", JSON.stringify(req.body || {}).slice(0, 2000));
   } catch (_) {}
@@ -312,7 +314,7 @@ const PORT = process.env.PORT || 4000;
 // Start server
 (async () => {
   try {
-    console.log("🚀 Booting server...");
+    console.log("� Booting server...");
     await connectDb();
     console.log("✅ DB connected");
 
@@ -323,7 +325,7 @@ const PORT = process.env.PORT || 4000;
       console.log(`Server running on port ${PORT}`.bgBrightGreen.black.bold);
     });
   } catch (err) {
-    console.error("🔥 Failed to start server:", err);
+    console.error("❌ Failed to start server:", err);
     process.exit(1);
   }
 })();
