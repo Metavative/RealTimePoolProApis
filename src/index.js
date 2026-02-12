@@ -26,6 +26,8 @@ import zegoRoutes from "./routes/zego.route.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 import tournamentRoutes from "./routes/tournament.route.js";
+import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
+import router from "./routes/auth.route.js";
 
 dotenv.config();
 
@@ -85,6 +87,7 @@ app.use("/api/club", clubRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/zego", zegoRoutes);
 app.use("/api/tournaments", tournamentRoutes);
+router.use("/api", tournamentInviteRoutes(io, presence));
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   console.log("✅ Health check endpoint hit");
