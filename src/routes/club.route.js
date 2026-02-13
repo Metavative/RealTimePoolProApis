@@ -1,3 +1,4 @@
+// src/routes/club.route.js
 import express from "express";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { clubAuthMiddleware } from "../middleware/clubAuthMiddleware.js"; // ✅ NEW
@@ -25,6 +26,11 @@ const upload = multer({
 router.post("/", authMiddleware, clubCtrl.createClub);
 router.get("/nearby", authMiddleware, clubCtrl.listNearby);
 router.post("/booking", authMiddleware, clubCtrl.createBooking);
+
+// ✅ NEW: Link club owner (Organizer user) to this club
+// Requires CLUB token
+// body: { ownerUserId: "<User _id>" }
+router.post("/owner/link", clubAuthMiddleware, clubCtrl.linkClubOwner);
 
 // ✅ STEP 3: Organizer verification document upload
 // Now requires CLUB token

@@ -17,7 +17,8 @@ export async function clubAuthMiddleware(req, res, next) {
     const token = parts[1];
     const payload = verify(token);
 
-    if (!payload || !payload.id) {
+    const clubId = payload?.id || payload?._id || payload?.clubId;
+    if (!clubId) {
       return res.status(401).json({ message: "Invalid token payload" });
     }
 
@@ -32,7 +33,7 @@ export async function clubAuthMiddleware(req, res, next) {
       return res.status(403).json({ message: "Club token required" });
     }
 
-    const club = await Club.findById(payload.id).select({
+    const club = await Club.findById(clubId).select({
       passwordHash: 0,
       password: 0,
       otp: 0,
@@ -42,8 +43,11 @@ export async function clubAuthMiddleware(req, res, next) {
       return res.status(401).json({ message: "Club not found" });
     }
 
-    req.clubId = club._id;
+    req.clubId = club._id.toString();
     req.club = club;
+
+    // ✅ important for controllers that use requireClub()
+    req.authType = "club";
 
     return next();
   } catch (e) {

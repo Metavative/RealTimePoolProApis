@@ -27,6 +27,7 @@ import zegoRoutes from "./routes/zego.route.js";
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 import tournamentRoutes from "./routes/tournament.route.js";
 import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
+import clubOwnerRoutes from "./routes/clubOwner.route.js";
 
 dotenv.config();
 
@@ -126,6 +127,7 @@ presence.getSocketIds = (userId) => {
 
 // ✅ Routes that need io/presence MUST be mounted after io + presence exist
 app.use("/api/friend", friendRoutes(io, presence));
+app.use("/api/club", clubOwnerRoutes());
 app.use("/api", tournamentInviteRoutes(io, presence));
 
 // User status endpoint

@@ -26,11 +26,9 @@ function emitToUser(io, presence, userId, event, payload) {
     for (const sid of sockets) io.to(sid).emit(event, payload);
   }
 }
-
 // ---------- searchFriends (UPDATED: supports club callers + query key variants + flutter-friendly shape) ----------
 export async function searchFriends(req, res) {
   try {
-    // ✅ Accept multiple query keys used by different clients
     const q = String(
       req.query.q ??
         req.query.search ??
@@ -41,50 +39,56 @@ export async function searchFriends(req, res) {
 
     if (!q) return res.json([]);
 
-    // ✅ Works for both user + club callers (authAny sets req.userId for users, and req.clubId for clubs)
     const me = req.userId ? new mongoose.Types.ObjectId(req.userId) : null;
     const regex = new RegExp(q, "i");
 
-    // ✅ Allow configurable limit with safe clamp
     const limitRaw = parseInt(String(req.query.limit ?? "25"), 10);
     const limit = Number.isFinite(limitRaw)
       ? Math.max(1, Math.min(limitRaw, 50))
       : 25;
 
-    // ✅ Build query without requiring userId
     const query = {
       $or: [
+        { username: regex },                 // ✅ real username
+        { usernameLower: regex },            // ✅ real usernameLower
         { "profile.nickname": regex },
         { email: regex },
         { phone: regex },
-        { "stats.userIdTag": regex },
+        { "stats.userIdTag": regex },        // ✅ searchable tag, but NOT username
       ],
     };
 
-    // Exclude caller only when caller is a real User
-    if (me) {
-      query._id = { $ne: me };
-    }
+    if (me) query._id = { $ne: me };
 
     const users = await User.find(query)
       .select(
-        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag email phone"
+        [
+          "_id",
+          "username",
+          "usernameLower",
+          "email",
+          "phone",
+          "profile.nickname",
+          "profile.avatar",
+          "profile.onlineStatus",
+          "stats.rank",
+          "stats.userIdTag",
+        ].join(" ")
       )
       .limit(limit)
       .lean();
 
-    // ✅ Return a shape that matches Flutter PlayerSearchResult.fromJson
     return res.json(
       users.map((u) => ({
-        id: u._id,
-        name: u.profile?.nickname || "",
-        username: u.stats?.userIdTag || "",
+        id: String(u._id),
+        name: u.profile?.nickname || u.username || "",
+        username: u.username || "",                // ✅ FIXED
         email: u.email || "",
         phone: u.phone || "",
         avatarUrl: u.profile?.avatar || "",
         online: !!u.profile?.onlineStatus,
         rank: u.stats?.rank || "Beginner",
-        tag: u.stats?.userIdTag || "",
+        tag: u.stats?.userIdTag || "",             // ✅ keep tag
       }))
     );
   } catch (err) {
@@ -92,6 +96,7 @@ export async function searchFriends(req, res) {
     return res.status(500).json({ message: "Failed to search users" });
   }
 }
+
 
 // ---------- listRequests ----------
 export async function listRequests(req, res) {

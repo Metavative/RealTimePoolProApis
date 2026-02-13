@@ -20,8 +20,10 @@ export async function authAny(req, res, next) {
     req.clubId = null;
     req.authType = null;
 
+    // CLUB token
     if (decoded.typ === "club_access" || decoded.role === "CLUB") {
-      const club = await Club.findById(id);
+      // Select owner explicitly (safe if you later add projections)
+      const club = await Club.findById(id).select("owner email phone name status verified");
       if (!club) return res.status(401).json({ message: "Club not found" });
 
       req.club = club;
@@ -31,6 +33,7 @@ export async function authAny(req, res, next) {
       return next();
     }
 
+    // USER token
     const user = await User.findById(id);
     if (!user) return res.status(401).json({ message: "User not found" });
 
@@ -40,6 +43,9 @@ export async function authAny(req, res, next) {
 
     return next();
   } catch (e) {
-    return res.status(401).json({ message: "Unauthorized" });
+    return res.status(401).json({
+      message: "Unauthorized",
+      error: e?.message ? String(e.message) : undefined,
+    });
   }
 }

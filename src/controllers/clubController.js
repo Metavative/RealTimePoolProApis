@@ -1,5 +1,12 @@
+import mongoose from "mongoose";
 import Club from "../models/club.model.js";
+import User from "../models/user.model.js";
 import Booking from "../models/booking.modal.js";
+
+function toStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
 
 export async function createClub(req, res) {
   try {
@@ -132,5 +139,42 @@ const venueAddress = String(req.body.venue_address || req.body.venueAddress || "
     });
   } catch (error) {
     return res.status(500).json({ message: error.message });
+  }
+}
+
+export async function linkClubOwner(req, res) {
+  try {
+    // clubAuthMiddleware must set req.club / req.clubId
+    const club = req.club;
+    if (!club) return res.status(401).json({ message: "Club not found in auth context" });
+
+    const ownerUserIdRaw = toStr(req.body?.ownerUserId || req.body?.ownerId || req.body?.userId);
+    if (!ownerUserIdRaw) {
+      return res.status(400).json({ message: "ownerUserId is required" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(ownerUserIdRaw)) {
+      return res.status(400).json({ message: "ownerUserId must be a valid ObjectId" });
+    }
+
+    const ownerUser = await User.findById(ownerUserIdRaw).select("_id").lean();
+    if (!ownerUser) {
+      return res.status(404).json({ message: "Owner user not found" });
+    }
+
+    // Set and save
+    club.owner = ownerUser._id;
+    await club.save();
+
+    return res.status(200).json({
+      message: "Club owner linked",
+      data: {
+        clubId: club._id,
+        owner: club.owner,
+      },
+    });
+  } catch (e) {
+    console.error("linkClubOwner error:", e);
+    return res.status(500).json({ message: e?.message || "Failed to link club owner" });
   }
 }

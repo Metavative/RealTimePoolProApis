@@ -1,4 +1,6 @@
+// src/controllers/clubAuthController.js
 import Club from "../models/club.model.js";
+import User from "../models/user.model.js"; // ✅ NEW (to link Club.owner)
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { sign } from "../services/jwtService.js";
@@ -13,11 +15,15 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
 
 const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
 
 function assertTwilioConfigured() {
   if (!twilioClient) {
-    const err = new Error("Twilio is not configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
+    const err = new Error(
+      "Twilio is not configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)"
+    );
     err.statusCode = 500;
     throw err;
   }
@@ -34,10 +40,12 @@ function isValidE164(phone) {
 
 async function twilioSendVerifySms(toPhone) {
   assertTwilioConfigured();
-  await twilioClient.verify.v2.services(TWILIO_VERIFY_SERVICE_SID).verifications.create({
-    to: toPhone,
-    channel: "sms",
-  });
+  await twilioClient.verify.v2
+    .services(TWILIO_VERIFY_SERVICE_SID)
+    .verifications.create({
+      to: toPhone,
+      channel: "sms",
+    });
 }
 
 async function twilioCheckVerifyCode(toPhone, code) {
@@ -100,6 +108,28 @@ function pickEmailOrPhone(body) {
   return {};
 }
 
+// ✅ NEW: allow linking a Club to a real organizer User
+function pickOwnerUserId(body) {
+  // accept multiple field names
+  const v =
+    toStr(body.ownerUserId) ||
+    toStr(body.ownerId) ||
+    toStr(body.userId) ||
+    toStr(body.organizerUserId);
+  return v || undefined;
+}
+
+async function resolveOwnerUserIdOrThrow(ownerUserId) {
+  if (!ownerUserId) return undefined;
+  const u = await User.findById(ownerUserId).select("_id").lean();
+  if (!u) {
+    const err = new Error("Invalid ownerUserId (User not found)");
+    err.statusCode = 400;
+    throw err;
+  }
+  return u._id;
+}
+
 function safeClub(club) {
   if (!club) return null;
   const obj = club.toObject ? club.toObject() : club;
@@ -145,11 +175,17 @@ export async function clubSignUp(req, res) {
     const name = toStr(body.name);
     const address = toStr(body.address);
 
+    // ✅ NEW: optional owner link at signup
+    const ownerUserIdRaw = pickOwnerUserId(body);
+    const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
+
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!password) return res.status(400).json({ message: "Password required" });
 
     if (phone && !isValidE164(phone)) {
-      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+      return res
+        .status(400)
+        .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
@@ -166,6 +202,10 @@ export async function clubSignUp(req, res) {
       password: hash,
       name,
       address,
+
+      // ✅ NEW
+      ...(ownerUserId ? { owner: ownerUserId } : {}),
+
       status: "PENDING_VERIFICATION",
       verified: false,
       emailVerified: false,
@@ -177,9 +217,13 @@ export async function clubSignUp(req, res) {
     const token = clubToken(club._id);
     return res.json({ club: safeClub(club), token });
   } catch (error) {
-    console.error("[CLUB_AUTH][SIGNUP][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    console.error("[CLUB_AUTH][SIGNUP][ERROR]", {
+      requestId,
+      message: error?.message,
+      stack: error?.stack,
+    });
     if (error && error.code === 11000) return res.status(409).json({ message: "Club already exists" });
-    return res.status(500).json({ message: error?.message || "Internal server error" });
+    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
   }
 }
 
@@ -206,11 +250,21 @@ export async function clubLogin(req, res) {
     const ok = await bcrypt.compare(password, stored);
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
+    // ✅ NEW: allow linking owner on login if missing
+    if (!club.owner) {
+      const ownerUserIdRaw = pickOwnerUserId(body);
+      if (ownerUserIdRaw) {
+        const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
+        club.owner = ownerUserId;
+        await club.save();
+      }
+    }
+
     const token = clubToken(club._id);
     return res.json({ club: safeClub(club), token });
   } catch (error) {
     console.error("[CLUB_AUTH][LOGIN][ERROR]", { requestId, message: error?.message, stack: error?.stack });
-    return res.status(500).json({ message: error?.message || "Internal server error" });
+    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
   }
 }
 
@@ -230,10 +284,16 @@ export async function clubRequestSignupOtp(req, res) {
       normalizePhone(body.phone) ||
       (!isEmailIdentifier(toStr(body.identifier)) ? normalizePhone(body.identifier) : undefined);
 
+    // ✅ NEW: optional owner link for OTP-created clubs
+    const ownerUserIdRaw = pickOwnerUserId(body);
+    const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
+
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
     if (phone && !isValidE164(phone)) {
-      return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+      return res
+        .status(400)
+        .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
@@ -244,6 +304,10 @@ export async function clubRequestSignupOtp(req, res) {
       club = await Club.create({
         ...(email ? { email } : {}),
         ...(phone ? { phone } : {}),
+
+        // ✅ NEW
+        ...(ownerUserId ? { owner: ownerUserId } : {}),
+
         status: "PENDING_VERIFICATION",
         verified: false,
         emailVerified: false,
@@ -251,6 +315,12 @@ export async function clubRequestSignupOtp(req, res) {
         lastOtpSent: null,
         lastOtpChannel: null,
       });
+    } else {
+      // ✅ NEW: if club exists but owner missing, allow linking here too
+      if (!club.owner && ownerUserId) {
+        club.owner = ownerUserId;
+        await club.save();
+      }
     }
 
     if (isRateLimited(club.lastOtpSent, 60_000)) {
@@ -312,6 +382,10 @@ export async function clubRequestOtp(req, res) {
 
     const flow = toStr(body.flow) || "login";
 
+    // ✅ NEW: optional owner link
+    const ownerUserIdRaw = pickOwnerUserId(body);
+    const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
+
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
     const channel = email ? "email" : "phone";
@@ -333,6 +407,10 @@ export async function clubRequestOtp(req, res) {
     if (!club) {
       club = await Club.create({
         ...query,
+
+        // ✅ NEW
+        ...(ownerUserId ? { owner: ownerUserId } : {}),
+
         status: "PENDING_VERIFICATION",
         verified: false,
         emailVerified: false,
@@ -340,6 +418,12 @@ export async function clubRequestOtp(req, res) {
         lastOtpSent: null,
         lastOtpChannel: null,
       });
+    } else {
+      // ✅ NEW: link owner if missing
+      if (!club.owner && ownerUserId) {
+        club.owner = ownerUserId;
+        await club.save();
+      }
     }
 
     if (isRateLimited(club.lastOtpSent, 60_000)) {
@@ -391,6 +475,10 @@ export async function clubVerifyOtp(req, res) {
     const flow = toStr(body.flow) || "login";
     const code = otpToString(body.code || body.otp);
 
+    // ✅ NEW: optional owner link even at verify step
+    const ownerUserIdRaw = pickOwnerUserId(body);
+    const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
+
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!code) return res.status(400).json({ message: "OTP required" });
 
@@ -406,6 +494,11 @@ export async function clubVerifyOtp(req, res) {
 
     const club = await Club.findOne(query);
     if (!club) return res.status(404).json({ message: "Club not found" });
+
+    // ✅ NEW: link owner if missing
+    if (!club.owner && ownerUserId) {
+      club.owner = ownerUserId;
+    }
 
     if (channel === "email") {
       if (!club.otp || !club.otp.code) return res.status(404).json({ message: "OTP not found" });
@@ -439,6 +532,12 @@ export async function clubVerifyOtp(req, res) {
     if (flow === "signup") {
       club.verified = true;
       if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
+      await club.save();
+    }
+
+    // ✅ Ensure owner link is persisted if we set it above
+    if (ownerUserId && !club.owner) {
+      club.owner = ownerUserId;
       await club.save();
     }
 
