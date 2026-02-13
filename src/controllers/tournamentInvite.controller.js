@@ -40,10 +40,10 @@ function emitToUser(io, presence, userId, event, payload) {
     const uid = String(userId || "");
     if (!uid) return;
 
-    // Your server does: socket.join(`user:${uid}`)
+    // preferred: per-user room
     io?.to?.(`user:${uid}`)?.emit?.(event, payload);
 
-    // fallback (your presence helper returns socketIds array)
+    // fallback: direct socket ids (presence helper)
     const sids = presence?.getSocketIds?.(uid) || [];
     for (const sid of sids) io?.to?.(sid)?.emit?.(event, payload);
   } catch (_) {}
@@ -63,50 +63,62 @@ export async function sendTournamentInvite(req, res, io, presence) {
     const participantKey = String(req.body.participantKey || "").trim();
     const message = String(req.body.message || "").trim();
 
-    if (!tournamentId) return res.status(400).json({ message: "tournamentId is required" });
-    if (!username) return res.status(400).json({ message: "username is required" });
-    if (!participantKey) return res.status(400).json({ message: "participantKey is required" });
+    if (!tournamentId)
+      return res.status(400).json({ message: "tournamentId is required" });
+    if (!username)
+      return res.status(400).json({ message: "username is required" });
+    if (!participantKey)
+      return res.status(400).json({ message: "participantKey is required" });
 
-    // organizerId is the CLUB OWNER user id
-    const organizerId = req.club?.owner ? String(req.club.owner) : "";
-    if (!organizerId) {
-      return res.status(400).json({
-        message: "Club owner is missing. Set Club.owner to the organizer User id.",
-      });
-    }
+    // ✅ FIX: organizerId is the CLUB id (NOT Club.owner)
+    const organizerId = String(req.clubId);
 
     const tournament = await Tournament.findById(tournamentId);
-    if (!tournament) return res.status(404).json({ message: "Tournament not found" });
+    if (!tournament)
+      return res.status(404).json({ message: "Tournament not found" });
 
     // Ensure tournament belongs to this club
     if (tournament.clubId && String(tournament.clubId) !== String(req.clubId)) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
 
-    // Find user by usernameLower, username (case-insensitive), or profile.nickname (case-insensitive)
-    const un = username.trim().toLowerCase();
-    const toUser = await User.findOne({
-      $or: [
-        { usernameLower: un },
-        { username: new RegExp(`^${escapeRegExp(username)}$`, "i") },
-        { "profile.nickname": new RegExp(`^${escapeRegExp(username)}$`, "i") },
-      ],
-    });
+    // Find user (case-insensitive username match)
+    const rx = new RegExp(`^${escapeRegExp(username)}$`, "i");
+    const toUser = await User.findOne({ username: rx });
     if (!toUser) return res.status(404).json({ message: "User not found" });
 
-    // One invite per tournament per user (your unique index enforces this)
+    // One invite per tournament per user (your unique index should enforce too)
     const existing = await TournamentInvite.findOne({
       tournamentId,
       toUserId: toUser._id,
     });
 
+    // If invite exists and is declined/cancelled/expired, we allow re-invite by replacing status -> pending
     if (existing) {
-      return res.status(200).json({ message: "Invite already exists", data: existing });
+      const st = String(existing.status || "pending").toLowerCase();
+
+      if (st === "pending" || st === "accepted") {
+        return res
+          .status(200)
+          .json({ message: "Invite already exists", data: existing });
+      }
+
+      existing.status = "pending";
+      existing.message = message || existing.message;
+      existing.participantKey = participantKey || existing.participantKey;
+      await existing.save();
+
+      emitToUser(io, presence, toUser._id, "tournament_invite:new", {
+        inviteId: existing._id,
+        tournamentId,
+      });
+
+      return res.status(200).json({ message: "Invite re-sent", data: existing });
     }
 
     const invite = await TournamentInvite.create({
       tournamentId,
-      organizerId, // ✅ real User id from club.owner
+      organizerId, // ✅ club id
       toUserId: toUser._id,
       toUsername: toUser.username,
       participantKey,
@@ -114,6 +126,7 @@ export async function sendTournamentInvite(req, res, io, presence) {
       message,
     });
 
+    // realtime notify player
     emitToUser(io, presence, toUser._id, "tournament_invite:new", {
       inviteId: invite._id,
       tournamentId,
@@ -121,7 +134,9 @@ export async function sendTournamentInvite(req, res, io, presence) {
 
     return res.status(201).json({ message: "Invite sent", data: invite });
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to send invite" });
+    return res
+      .status(500)
+      .json({ message: e?.message || "Failed to send invite" });
   }
 }
 
@@ -138,7 +153,10 @@ export async function listTournamentInvites(req, res) {
       return res.status(400).json({ message: "tournamentId is required" });
     }
 
-    const tournament = await Tournament.findById(tournamentId).select("clubId").lean();
+    const tournament = await Tournament.findById(tournamentId)
+      .select("clubId")
+      .lean();
+
     if (!tournament) {
       return res.status(404).json({ message: "Tournament not found" });
     }
@@ -164,7 +182,9 @@ export async function listTournamentInvites(req, res) {
 
     return res.status(200).json({ data });
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to list invites" });
+    return res
+      .status(500)
+      .json({ message: e?.message || "Failed to list invites" });
   }
 }
 
@@ -183,7 +203,9 @@ export async function listMyInvites(req, res) {
 
     return res.status(200).json({ data: invites });
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to load invites" });
+    return res
+      .status(500)
+      .json({ message: e?.message || "Failed to load invites" });
   }
 }
 
@@ -199,7 +221,8 @@ export async function respondToInvite(req, res, io, presence) {
     const { inviteId } = req.params;
     const action = String(req.body.action || "").trim().toLowerCase();
 
-    if (!inviteId) return res.status(400).json({ message: "inviteId is required" });
+    if (!inviteId)
+      return res.status(400).json({ message: "inviteId is required" });
     if (!["accept", "decline"].includes(action)) {
       return res.status(400).json({ message: "action must be accept or decline" });
     }
@@ -237,6 +260,7 @@ export async function respondToInvite(req, res, io, presence) {
       );
     }
 
+    // realtime notify player (and you can refresh organizer side via list endpoint)
     emitToUser(io, presence, req.userId, "tournament_invite:updated", {
       inviteId: invite._id,
       tournamentId: invite.tournamentId,
@@ -258,25 +282,24 @@ export async function cancelInvite(req, res, io, presence) {
     if (!requireClub(req, res)) return;
 
     const { inviteId } = req.params;
-    if (!inviteId) return res.status(400).json({ message: "inviteId is required" });
+    if (!inviteId)
+      return res.status(400).json({ message: "inviteId is required" });
 
-    const organizerId = req.club?.owner ? String(req.club.owner) : "";
-    if (!organizerId) {
-      return res.status(400).json({
-        message: "Club owner is missing. Set Club.owner to the organizer User id.",
-      });
-    }
+    // ✅ FIX: organizerId is the CLUB id (NOT Club.owner)
+    const organizerId = String(req.clubId);
 
     const invite = await TournamentInvite.findById(inviteId);
     if (!invite) return res.status(404).json({ message: "Invite not found" });
 
-    // ✅ Must be the same organizer (club owner user)
+    // ✅ Must be the same club that created it
     if (String(invite.organizerId) !== organizerId) {
       return res.status(403).json({ message: "Not your invite" });
     }
 
     if (invite.status !== "pending") {
-      return res.status(400).json({ message: "Only pending invites can be cancelled" });
+      return res
+        .status(400)
+        .json({ message: "Only pending invites can be cancelled" });
     }
 
     invite.status = "cancelled";
