@@ -120,6 +120,49 @@ export async function sendTournamentInvite(req, res, io, presence) {
 }
 
 /**
+ * GET /api/tournaments/:tournamentId/invites
+ * club-only (organizer lists all invites for a tournament)
+ */
+export async function listTournamentInvites(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { tournamentId } = req.params;
+    if (!tournamentId) {
+      return res.status(400).json({ message: "tournamentId is required" });
+    }
+
+    const tournament = await Tournament.findById(tournamentId).select("clubId").lean();
+    if (!tournament) {
+      return res.status(404).json({ message: "Tournament not found" });
+    }
+
+    // Ensure tournament belongs to this club
+    if (tournament.clubId && String(tournament.clubId) !== String(req.clubId)) {
+      return res.status(403).json({ message: "Not allowed for this tournament" });
+    }
+
+    const invites = await TournamentInvite.find({ tournamentId })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const data = invites.map((inv) => ({
+      _id: inv._id,
+      tournamentId: inv.tournamentId,
+      username: inv.toUsername,
+      participantKey: inv.participantKey,
+      status: inv.status,
+      createdAt: inv.createdAt,
+      respondedAt: inv.status === "pending" ? null : inv.updatedAt,
+    }));
+
+    return res.status(200).json({ data });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to list invites" });
+  }
+}
+
+/**
  * GET /api/tournament-invites/inbox
  * user-only
  */

@@ -3,6 +3,7 @@ import { authAny } from "../middleware/authAny.middleware.js";
 
 import {
   sendTournamentInvite,
+  listTournamentInvites,
   listMyInvites,
   respondToInvite,
   cancelInvite,
@@ -14,6 +15,11 @@ export default function tournamentInviteRoutes(io, presence) {
   // Organizer (club token) sends invite
   router.post("/tournaments/:tournamentId/invites", authAny, (req, res) =>
     sendTournamentInvite(req, res, io, presence)
+  );
+
+  // Organizer (club token) lists invites for a tournament
+  router.get("/tournaments/:tournamentId/invites", authAny, (req, res) =>
+    listTournamentInvites(req, res)
   );
 
   // Player inbox (user token)
