@@ -83,9 +83,15 @@ export async function sendTournamentInvite(req, res, io, presence) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
 
-    // Find user (case-insensitive)
-    const rx = new RegExp(`^${escapeRegExp(username)}$`, "i");
-    const toUser = await User.findOne({ username: rx });
+    // Find user by usernameLower, username (case-insensitive), or profile.nickname (case-insensitive)
+    const un = username.trim().toLowerCase();
+    const toUser = await User.findOne({
+      $or: [
+        { usernameLower: un },
+        { username: new RegExp(`^${escapeRegExp(username)}$`, "i") },
+        { "profile.nickname": new RegExp(`^${escapeRegExp(username)}$`, "i") },
+      ],
+    });
     if (!toUser) return res.status(404).json({ message: "User not found" });
 
     // One invite per tournament per user (your unique index enforces this)
