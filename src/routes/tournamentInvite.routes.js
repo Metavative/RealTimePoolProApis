@@ -7,6 +7,7 @@ import {
   listMyInvites,
   respondToInvite,
   cancelInvite,
+  joinTournamentOpen, // ✅ NEW
 } from "../controllers/tournamentInvite.controller.js";
 
 export default function tournamentInviteRoutes(io, presence) {
@@ -20,6 +21,11 @@ export default function tournamentInviteRoutes(io, presence) {
   // Organizer (club token) lists invites for a tournament
   router.get("/tournaments/:tournamentId/invites", authAny, (req, res) =>
     listTournamentInvites(req, res)
+  );
+
+  // ✅ NEW: Player join (user token) when accessMode === OPEN
+  router.post("/tournaments/:tournamentId/join", authAny, (req, res) =>
+    joinTournamentOpen(req, res)
   );
 
   // Player inbox (user token)

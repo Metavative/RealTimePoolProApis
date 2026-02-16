@@ -14,6 +14,46 @@ function notReady(res, t, issues) {
   });
 }
 
+/**
+ * ✅ Step 2 enforcement:
+ * Block ANY entrants mutation once:
+ * - tournament started (ACTIVE)
+ * - entries closed
+ * - format finalised
+ */
+function assertEntriesMutable(res, t) {
+  if (!t) return false;
+
+  if (t.status === "ACTIVE") {
+    res.status(403).json({
+      ok: false,
+      code: "TOURNAMENT_STARTED",
+      message: "Tournament already started",
+    });
+    return false;
+  }
+
+  if (t.entriesStatus === "CLOSED") {
+    res.status(409).json({
+      ok: false,
+      code: "ENTRIES_CLOSED",
+      message: "Entries are closed for this tournament",
+    });
+    return false;
+  }
+
+  if (t.formatStatus === "FINALISED") {
+    res.status(409).json({
+      ok: false,
+      code: "FORMAT_FINALISED",
+      message: "Tournament format is finalised. Entrants are locked.",
+    });
+    return false;
+  }
+
+  return true;
+}
+
 export async function create(req, res) {
   try {
     const clubId = req.clubId;
@@ -167,6 +207,36 @@ export async function closeEntries(req, res) {
   }
 }
 
+// ✅ NEW: Open entries (your Flutter already calls openEntries())
+export async function openEntries(req, res) {
+  try {
+    const clubId = req.clubId;
+    const t = await Tournament.findOne({ _id: req.params.id, clubId });
+    if (!t)
+      return res.status(404).json({ ok: false, message: "Tournament not found" });
+
+    if (t.status === "ACTIVE") {
+      return res.status(403).json({ ok: false, message: "Tournament already started" });
+    }
+
+    // If finalised, keep locked (safer)
+    if (t.formatStatus === "FINALISED") {
+      return res.status(409).json({
+        ok: false,
+        code: "FORMAT_FINALISED",
+        message: "Tournament format is finalised. Reopen not allowed.",
+      });
+    }
+
+    t.entriesStatus = "OPEN";
+    await t.save();
+
+    return res.json({ ok: true, data: t });
+  } catch (e) {
+    return res.status(400).json({ ok: false, message: e.message });
+  }
+}
+
 // -------------------------
 // STEP 3: FINALISE FORMAT
 // -------------------------
@@ -227,10 +297,8 @@ export async function setEntrants(req, res) {
     if (!t)
       return res.status(404).json({ ok: false, message: "Tournament not found" });
 
-    // Organizer must be able to sync entrants until tournament starts
-    if (t.status === "ACTIVE") {
-      return res.status(403).json({ ok: false, message: "Tournament already started" });
-    }
+    // ✅ HARD LOCK: cannot mutate entrants once closed/finalised/active
+    if (!assertEntriesMutable(res, t)) return;
 
     const body = req.body || {};
 

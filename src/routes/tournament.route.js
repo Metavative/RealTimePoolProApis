@@ -12,6 +12,7 @@ router.patch("/:id/settings", clubAuthMiddleware, c.patchSettings);
 
 // ✅ NEW Step endpoints
 router.post("/:id/entries/close", clubAuthMiddleware, c.closeEntries);
+router.post("/:id/entries/open", clubAuthMiddleware, c.openEntries); // ✅ added
 router.post("/:id/finalise", clubAuthMiddleware, c.finaliseFormat);
 
 // Entrants (users) -> computes rating + seed

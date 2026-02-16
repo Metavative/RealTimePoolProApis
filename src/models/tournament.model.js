@@ -33,6 +33,7 @@ const TournamentMatchSchema = new mongoose.Schema(
 
     teamAId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     teamBId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+
     // participantKey strings (for uid:/un:/nm: or BYE)
     teamA: { type: String, trim: true, default: "" },
     teamB: { type: String, trim: true, default: "" },
