@@ -216,6 +216,10 @@ export async function finaliseFormat(req, res) {
 }
 
 // --- Entrants ---
+// Accepts either:
+//   { entrants: [ {participantKey,name,username,userId,isLocal,...} ] }
+// OR legacy:
+//   { entrantIds: ["...","..."] }
 export async function setEntrants(req, res) {
   try {
     const clubId = req.clubId;
@@ -223,16 +227,29 @@ export async function setEntrants(req, res) {
     if (!t)
       return res.status(404).json({ ok: false, message: "Tournament not found" });
 
-    if (t.entriesStatus === "CLOSED" || t.formatStatus === "FINALISED") {
-      return res.status(403).json({ ok: false, message: "Entrants are locked" });
+    // Organizer must be able to sync entrants until tournament starts
+    if (t.status === "ACTIVE") {
+      return res.status(403).json({ ok: false, message: "Tournament already started" });
     }
 
-    const ids = req.body?.entrantIds;
-    if (!Array.isArray(ids))
-      return res.status(400).json({ ok: false, message: "entrantIds must be an array" });
+    const body = req.body || {};
 
-    const updated = await svc.setEntrants(t._id, ids);
-    return res.json({ ok: true, data: updated });
+    // NEW: full entrants objects (supports local + app users)
+    if (Array.isArray(body.entrants)) {
+      const updated = await svc.setEntrantsObjects(t._id, body.entrants);
+      return res.json({ ok: true, data: updated });
+    }
+
+    // Legacy: entrantIds
+    if (Array.isArray(body.entrantIds)) {
+      const updated = await svc.setEntrantsByIds(t._id, body.entrantIds);
+      return res.json({ ok: true, data: updated });
+    }
+
+    return res.status(400).json({
+      ok: false,
+      message: "Provide either `entrants` (array) or `entrantIds` (array)",
+    });
   } catch (e) {
     return res.status(400).json({ ok: false, message: e.message });
   }
@@ -256,6 +273,31 @@ export async function generateGroups(req, res) {
       groupCount: groupCount ?? t.groupCount,
       groupSize: groupSize ?? t.groupSize,
       randomize: randomize ?? false,
+    });
+
+    return res.json({ ok: true, data: updated });
+  } catch (e) {
+    return res.status(400).json({ ok: false, message: e.message });
+  }
+}
+
+// --- Generate matches for any format ---
+export async function generateMatches(req, res) {
+  try {
+    const clubId = req.clubId;
+    const t = await Tournament.findOne({ _id: req.params.id, clubId });
+    if (!t)
+      return res.status(404).json({ ok: false, message: "Tournament not found" });
+
+    if (t.status === "ACTIVE") {
+      return res.status(403).json({ ok: false, message: "Tournament already started" });
+    }
+
+    const defaultVenue = String(req.body?.defaultVenue || "").trim();
+
+    const updated = await svc.generateMatchesForFormat(t._id, {
+      format: t.format,
+      defaultVenue,
     });
 
     return res.json({ ok: true, data: updated });

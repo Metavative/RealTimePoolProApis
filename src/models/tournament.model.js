@@ -5,6 +5,12 @@ const TournamentEntrantSchema = new mongoose.Schema(
     entrantId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     name: { type: String, trim: true, default: "" },
 
+    // participantKey (stable key: uid:/un:/nm:)
+    participantKey: { type: String, trim: true, default: "" },
+    username: { type: String, trim: true, default: "" },
+    userId: { type: String, trim: true, default: "" },
+    isLocal: { type: Boolean, default: false },
+
     // computed strength score for seeding
     rating: { type: Number, default: 0 },
     seed: { type: Number, default: 0 },
@@ -27,6 +33,9 @@ const TournamentMatchSchema = new mongoose.Schema(
 
     teamAId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     teamBId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    // participantKey strings (for uid:/un:/nm: or BYE)
+    teamA: { type: String, trim: true, default: "" },
+    teamB: { type: String, trim: true, default: "" },
 
     teamAName: { type: String, trim: true, default: "" },
     teamBName: { type: String, trim: true, default: "" },

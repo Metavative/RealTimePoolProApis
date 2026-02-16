@@ -23,6 +23,9 @@ router.post("/:id/groups/generate", clubAuthMiddleware, c.generateGroups);
 // Group matches
 router.post("/:id/matches/generate-group", clubAuthMiddleware, c.generateGroupMatches);
 
+// Generate matches for any format
+router.post("/:id/matches/generate", clubAuthMiddleware, c.generateMatches);
+
 // Playoffs (auto-progress BYEs)
 router.post("/:id/playoffs/generate", clubAuthMiddleware, c.generatePlayoffs);
 

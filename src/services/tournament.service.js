@@ -192,6 +192,72 @@ function autoProgressFromRound(t, startRound) {
 // ------------------------------
 // Entrants & Seeding
 // ------------------------------
+
+function normEntrant(e = {}) {
+  const participantKey = String(e.participantKey || "").trim();
+  const name = String(e.name || "").trim();
+  const username = String(e.username || "").trim();
+  const userId = String(e.userId || "").trim();
+  const isLocal = !!e.isLocal;
+
+  if (!participantKey) return null;
+
+  return {
+    participantKey,
+    name,
+    username,
+    userId,
+    isLocal,
+  };
+}
+
+export async function setEntrantsObjects(tournamentId, entrants = []) {
+  const t = await Tournament.findById(tournamentId);
+  if (!t) throw new Error("Tournament not found");
+
+  const clean = [];
+  const seen = new Set();
+
+  for (const raw of entrants) {
+    const en = normEntrant(raw);
+    if (!en) continue;
+    if (seen.has(en.participantKey)) continue;
+    seen.add(en.participantKey);
+    clean.push(en);
+  }
+
+  t.entrants = clean;
+  await t.save();
+  return t;
+}
+
+export async function setEntrantsByIds(tournamentId, entrantIds = []) {
+  const t = await Tournament.findById(tournamentId);
+  if (!t) throw new Error("Tournament not found");
+
+  const clean = [];
+  const seen = new Set();
+
+  for (const id of entrantIds) {
+    const userId = String(id || "").trim();
+    if (!userId) continue;
+    const participantKey = `uid:${userId}`;
+    if (seen.has(participantKey)) continue;
+    seen.add(participantKey);
+    clean.push({
+      participantKey,
+      userId,
+      name: "",
+      username: "",
+      isLocal: false,
+    });
+  }
+
+  t.entrants = clean;
+  await t.save();
+  return t;
+}
+
 export async function setEntrants(tournamentId, entrantIds) {
   const ids = (entrantIds || [])
     .map((x) => String(x || "").trim())
@@ -609,6 +675,122 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     recomputeChampion(t);
   }
 
+  await t.save();
+  return t;
+}
+
+// ------------------------------
+// Generate matches for any format
+// ------------------------------
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function generateRoundRobin(keys, defaultVenue = "") {
+  const out = [];
+  let counter = 1;
+  for (let i = 0; i < keys.length; i++) {
+    for (let j = i + 1; j < keys.length; j++) {
+      out.push({
+        id: `rr_${counter++}`,
+        teamA: keys[i],
+        teamB: keys[j],
+        teamAId: null,
+        teamBId: null,
+        teamAName: "",
+        teamBName: "",
+        venue: defaultVenue,
+        dateTime: null,
+        scoreA: 0,
+        scoreB: 0,
+        status: "scheduled",
+      });
+    }
+  }
+  return out;
+}
+
+function generateKnockoutRound1(keys, defaultVenue = "", prefix = "ko") {
+  const out = [];
+  const shuffled = shuffle(keys);
+  let counter = 1;
+
+  for (let i = 0; i < shuffled.length; i += 2) {
+    const a = shuffled[i];
+    const b = i + 1 < shuffled.length ? shuffled[i + 1] : "BYE";
+    out.push({
+      id: `${prefix}_${counter++}`,
+      teamA: a,
+      teamB: b,
+      teamAId: null,
+      teamBId: null,
+      teamAName: "",
+      teamBName: b === "BYE" ? "BYE" : "",
+      venue: defaultVenue,
+      dateTime: null,
+      scoreA: 0,
+      scoreB: 0,
+      status: "scheduled",
+    });
+  }
+  return out;
+}
+
+function generateDoubleElim(keys, defaultVenue = "") {
+  return generateKnockoutRound1(keys, defaultVenue, "de_w1");
+}
+
+export async function generateMatchesForFormat(tournamentId, { format, defaultVenue }) {
+  const t = await Tournament.findById(tournamentId);
+  if (!t) throw new Error("Tournament not found");
+
+  const entrants = Array.isArray(t.entrants) ? t.entrants : [];
+  const keys = entrants
+    .map((e) => {
+      const pk = e.participantKey || (e.entrantId ? `uid:${e.entrantId}` : "");
+      return String(pk || "").trim();
+    })
+    .filter(Boolean);
+
+  if (keys.length < 2) throw new Error("Add at least 2 players");
+
+  const nameByKey = new Map(
+    entrants.map((e) => {
+      const pk = e.participantKey || (e.entrantId ? `uid:${e.entrantId}` : "");
+      return [pk, (e.name || "Player").trim() || "Player"];
+    })
+  );
+
+  const f = String(format || t.format || "").trim();
+
+  let rawMatches = [];
+
+  if (f === "group_stage") {
+    rawMatches = generateRoundRobin(keys, defaultVenue);
+  } else if (f === "round_robin") {
+    rawMatches = generateRoundRobin(keys, defaultVenue);
+  } else if (f === "knockout") {
+    rawMatches = generateKnockoutRound1(keys, defaultVenue, "ko");
+  } else if (f === "double_elim" || f === "double_elimination") {
+    rawMatches = generateDoubleElim(keys, defaultVenue);
+  } else {
+    rawMatches = generateRoundRobin(keys, defaultVenue);
+  }
+
+  // fill teamAName/teamBName from entrants for schema compatibility
+  const matches = rawMatches.map((m) => ({
+    ...m,
+    teamAName: m.teamB === "BYE" ? nameByKey.get(m.teamA) || "Player" : nameByKey.get(m.teamA) || "Player",
+    teamBName: m.teamB === "BYE" ? "BYE" : nameByKey.get(m.teamB) || "Player",
+  }));
+
+  t.matches = matches;
   await t.save();
   return t;
 }
