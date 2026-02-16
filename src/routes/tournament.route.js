@@ -5,8 +5,10 @@ import * as c from "../controllers/tournamentController.js";
 const router = express.Router();
 
 router.post("/", clubAuthMiddleware, c.create);
+router.get("/my", clubAuthMiddleware, c.listMine);
 router.get("/:id", clubAuthMiddleware, c.getOne);
 router.patch("/:id", clubAuthMiddleware, c.patch);
+router.patch("/:id/settings", clubAuthMiddleware, c.patchSettings);
 
 // Entrants (users) -> computes rating + seed
 router.post("/:id/entrants", clubAuthMiddleware, c.setEntrants);

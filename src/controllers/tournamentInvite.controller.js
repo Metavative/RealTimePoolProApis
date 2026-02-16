@@ -82,6 +82,12 @@ export async function sendTournamentInvite(req, res, io, presence) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
 
+    if (tournament.entriesStatus === "CLOSED") {
+      return res
+        .status(403)
+        .json({ message: "Entries are closed for this tournament" });
+    }
+
     // Find user (case-insensitive username match)
     const rx = new RegExp(`^${escapeRegExp(username)}$`, "i");
     const toUser = await User.findOne({ username: rx });
@@ -236,6 +242,18 @@ export async function respondToInvite(req, res, io, presence) {
 
     if (invite.status !== "pending") {
       return res.status(400).json({ message: "Invite already handled" });
+    }
+
+    const tournament = await Tournament.findById(invite.tournamentId).select(
+      "entriesStatus"
+    );
+    if (!tournament) {
+      return res.status(404).json({ message: "Tournament not found" });
+    }
+    if (tournament.entriesStatus === "CLOSED") {
+      return res
+        .status(403)
+        .json({ message: "Entries are closed for this tournament" });
     }
 
     invite.status = action === "accept" ? "accepted" : "declined";

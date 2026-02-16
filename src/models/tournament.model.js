@@ -48,6 +48,26 @@ const TournamentSchema = new mongoose.Schema(
 
     title: { type: String, trim: true, default: "" },
 
+    accessMode: {
+      type: String,
+      enum: ["OPEN", "INVITE_ONLY"],
+      default: "INVITE_ONLY",
+    },
+
+    entriesStatus: {
+      type: String,
+      enum: ["OPEN", "CLOSED"],
+      default: "OPEN",
+    },
+
+    formatStatus: {
+      type: String,
+      enum: ["DRAFT", "FINALISED"],
+      default: "DRAFT",
+    },
+
+    formatConfig: { type: Object, default: {} },
+
     format: {
       type: String,
       enum: ["round_robin", "knockout", "double_elim", "group_stage"],
