@@ -1,6 +1,7 @@
 import Tournament from "../models/tournament.model.js";
 import TournamentInvite from "../models/tournamentInvite.model.js";
 import User from "../models/user.model.js";
+import * as svc from "../services/tournament.service.js";
 
 // -------------------------
 // helpers
@@ -40,10 +41,8 @@ function emitToUser(io, presence, userId, event, payload) {
     const uid = String(userId || "");
     if (!uid) return;
 
-    // preferred: per-user room
     io?.to?.(`user:${uid}`)?.emit?.(event, payload);
 
-    // fallback: direct socket ids (presence helper)
     const sids = presence?.getSocketIds?.(uid) || [];
     for (const sid of sids) io?.to?.(sid)?.emit?.(event, payload);
   } catch (_) {}
@@ -51,7 +50,7 @@ function emitToUser(io, presence, userId, event, payload) {
 
 /**
  * POST /api/tournaments/:tournamentId/invites
- * club-only (authAny must set req.club + req.clubId)
+ * club-only
  * body: { username, participantKey, message? }
  */
 export async function sendTournamentInvite(req, res, io, presence) {
@@ -70,22 +69,25 @@ export async function sendTournamentInvite(req, res, io, presence) {
     if (!participantKey)
       return res.status(400).json({ message: "participantKey is required" });
 
-    // ✅ FIX: organizerId is the CLUB id (NOT Club.owner)
     const organizerId = String(req.clubId);
 
-    const tournament = await Tournament.findById(tournamentId);
+    const tournament = await Tournament.findById(tournamentId).select(
+      "clubId entriesStatus status accessMode"
+    );
+
     if (!tournament)
       return res.status(404).json({ message: "Tournament not found" });
 
-    // Ensure tournament belongs to this club
     if (tournament.clubId && String(tournament.clubId) !== String(req.clubId)) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
 
+    if (tournament.status === "ACTIVE") {
+      return res.status(403).json({ message: "Tournament already started" });
+    }
+
     if (tournament.entriesStatus === "CLOSED") {
-      return res
-        .status(403)
-        .json({ message: "Entries are closed for this tournament" });
+      return res.status(403).json({ message: "Entries are closed for this tournament" });
     }
 
     // Find user (case-insensitive username match)
@@ -93,20 +95,16 @@ export async function sendTournamentInvite(req, res, io, presence) {
     const toUser = await User.findOne({ username: rx });
     if (!toUser) return res.status(404).json({ message: "User not found" });
 
-    // One invite per tournament per user (your unique index should enforce too)
     const existing = await TournamentInvite.findOne({
       tournamentId,
       toUserId: toUser._id,
     });
 
-    // If invite exists and is declined/cancelled/expired, we allow re-invite by replacing status -> pending
     if (existing) {
       const st = String(existing.status || "pending").toLowerCase();
 
       if (st === "pending" || st === "accepted") {
-        return res
-          .status(200)
-          .json({ message: "Invite already exists", data: existing });
+        return res.status(200).json({ message: "Invite already exists", data: existing });
       }
 
       existing.status = "pending";
@@ -124,7 +122,7 @@ export async function sendTournamentInvite(req, res, io, presence) {
 
     const invite = await TournamentInvite.create({
       tournamentId,
-      organizerId, // ✅ club id
+      organizerId,
       toUserId: toUser._id,
       toUsername: toUser.username,
       participantKey,
@@ -132,7 +130,6 @@ export async function sendTournamentInvite(req, res, io, presence) {
       message,
     });
 
-    // realtime notify player
     emitToUser(io, presence, toUser._id, "tournament_invite:new", {
       inviteId: invite._id,
       tournamentId,
@@ -140,15 +137,13 @@ export async function sendTournamentInvite(req, res, io, presence) {
 
     return res.status(201).json({ message: "Invite sent", data: invite });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: e?.message || "Failed to send invite" });
+    return res.status(500).json({ message: e?.message || "Failed to send invite" });
   }
 }
 
 /**
  * GET /api/tournaments/:tournamentId/invites
- * club-only (organizer lists all invites for a tournament)
+ * club-only
  */
 export async function listTournamentInvites(req, res) {
   try {
@@ -159,15 +154,9 @@ export async function listTournamentInvites(req, res) {
       return res.status(400).json({ message: "tournamentId is required" });
     }
 
-    const tournament = await Tournament.findById(tournamentId)
-      .select("clubId")
-      .lean();
+    const tournament = await Tournament.findById(tournamentId).select("clubId").lean();
+    if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
-    if (!tournament) {
-      return res.status(404).json({ message: "Tournament not found" });
-    }
-
-    // Ensure tournament belongs to this club
     if (tournament.clubId && String(tournament.clubId) !== String(req.clubId)) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
@@ -188,9 +177,7 @@ export async function listTournamentInvites(req, res) {
 
     return res.status(200).json({ data });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: e?.message || "Failed to list invites" });
+    return res.status(500).json({ message: e?.message || "Failed to list invites" });
   }
 }
 
@@ -209,9 +196,7 @@ export async function listMyInvites(req, res) {
 
     return res.status(200).json({ data: invites });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: e?.message || "Failed to load invites" });
+    return res.status(500).json({ message: e?.message || "Failed to load invites" });
   }
 }
 
@@ -227,8 +212,7 @@ export async function respondToInvite(req, res, io, presence) {
     const { inviteId } = req.params;
     const action = String(req.body.action || "").trim().toLowerCase();
 
-    if (!inviteId)
-      return res.status(400).json({ message: "inviteId is required" });
+    if (!inviteId) return res.status(400).json({ message: "inviteId is required" });
     if (!["accept", "decline"].includes(action)) {
       return res.status(400).json({ message: "action must be accept or decline" });
     }
@@ -245,15 +229,21 @@ export async function respondToInvite(req, res, io, presence) {
     }
 
     const tournament = await Tournament.findById(invite.tournamentId).select(
-      "entriesStatus"
+      "entriesStatus formatStatus status"
     );
-    if (!tournament) {
-      return res.status(404).json({ message: "Tournament not found" });
+
+    if (!tournament) return res.status(404).json({ message: "Tournament not found" });
+
+    if (tournament.status === "ACTIVE") {
+      return res.status(403).json({ message: "Tournament already started" });
     }
+
     if (tournament.entriesStatus === "CLOSED") {
-      return res
-        .status(403)
-        .json({ message: "Entries are closed for this tournament" });
+      return res.status(403).json({ message: "Entries are closed for this tournament" });
+    }
+
+    if (tournament.formatStatus === "FINALISED") {
+      return res.status(403).json({ message: "Tournament format is finalised. Entrants are locked." });
     }
 
     invite.status = action === "accept" ? "accepted" : "declined";
@@ -262,7 +252,7 @@ export async function respondToInvite(req, res, io, presence) {
     if (invite.status === "accepted") {
       const displayName = bestUserDisplayName(req.user);
 
-      // Tournament uses entrants[] (not participants)
+      // Add entrant if not already present
       await Tournament.updateOne(
         { _id: invite.tournamentId, "entrants.entrantId": { $ne: req.userId } },
         {
@@ -276,9 +266,15 @@ export async function respondToInvite(req, res, io, presence) {
           },
         }
       );
+
+      // ✅ Re-seed entrants for fairness (and reset derived items) while entries are still open
+      const fresh = await Tournament.findById(invite.tournamentId).select("entrants");
+      const ids = (fresh?.entrants || []).map((e) => String(e.entrantId));
+      if (ids.length >= 2) {
+        await svc.setEntrants(invite.tournamentId, ids);
+      }
     }
 
-    // realtime notify player (and you can refresh organizer side via list endpoint)
     emitToUser(io, presence, req.userId, "tournament_invite:updated", {
       inviteId: invite._id,
       tournamentId: invite.tournamentId,
@@ -300,24 +296,19 @@ export async function cancelInvite(req, res, io, presence) {
     if (!requireClub(req, res)) return;
 
     const { inviteId } = req.params;
-    if (!inviteId)
-      return res.status(400).json({ message: "inviteId is required" });
+    if (!inviteId) return res.status(400).json({ message: "inviteId is required" });
 
-    // ✅ FIX: organizerId is the CLUB id (NOT Club.owner)
     const organizerId = String(req.clubId);
 
     const invite = await TournamentInvite.findById(inviteId);
     if (!invite) return res.status(404).json({ message: "Invite not found" });
 
-    // ✅ Must be the same club that created it
     if (String(invite.organizerId) !== organizerId) {
       return res.status(403).json({ message: "Not your invite" });
     }
 
     if (invite.status !== "pending") {
-      return res
-        .status(400)
-        .json({ message: "Only pending invites can be cancelled" });
+      return res.status(400).json({ message: "Only pending invites can be cancelled" });
     }
 
     invite.status = "cancelled";
