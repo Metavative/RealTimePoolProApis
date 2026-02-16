@@ -68,6 +68,14 @@ const TournamentSchema = new mongoose.Schema(
 
     formatConfig: { type: Object, default: {} },
 
+    status: {
+      type: String,
+      enum: ["DRAFT", "ACTIVE", "COMPLETED"],
+      default: "DRAFT",
+    },
+
+    startedAt: { type: Date },
+
     format: {
       type: String,
       enum: ["round_robin", "knockout", "double_elim", "group_stage"],

@@ -183,3 +183,62 @@ export async function upsertMatch(req, res) {
     return res.status(400).json({ ok: false, message: e.message });
   }
 }
+
+export async function startTournament(req, res) {
+  try {
+    const clubId = req.clubId;
+    const t = await Tournament.findOne({ _id: req.params.id, clubId });
+    if (!t) return res.status(404).json({ ok: false, message: "Tournament not found" });
+
+    // idempotent
+    if (t.status === "ACTIVE") {
+      return res.json({ ok: true, data: t, alreadyStarted: true });
+    }
+    if (t.status === "COMPLETED") {
+      return res.status(400).json({ ok: false, message: "Tournament is already completed" });
+    }
+
+    // READY CHECK (minimal, format-aware)
+    const issues = [];
+
+    if (!String(t.title || "").trim()) issues.push("Add a tournament title");
+
+    const entrants = Array.isArray(t.entrants) ? t.entrants : [];
+    if (!Array.isArray(t.entrants) || entrants.length < 2) {
+      issues.push("Add at least 2 players");
+    }
+
+    if (t.entriesStatus !== "CLOSED") issues.push("Close entries");
+    if (t.formatStatus !== "FINALISED") issues.push("Finalise the format");
+
+    const groupsOk = Array.isArray(t.groups) && t.groups.length > 0;
+    const matchesOk = Array.isArray(t.matches) && t.matches.length > 0;
+
+    if (t.format === "group_stage") {
+      if (!groupsOk) issues.push("Generate groups");
+      if (!matchesOk) issues.push("Generate matches");
+    } else {
+      // knockout / round_robin / others
+      if (!matchesOk) issues.push("Generate matches");
+    }
+
+    if (issues.length) {
+      return res.status(409).json({
+        ok: false,
+        code: "TOURNAMENT_NOT_READY",
+        message: "Tournament is not ready to start",
+        issues,
+        data: t,
+      });
+    }
+
+    // START
+    t.status = "ACTIVE";
+    t.startedAt = new Date();
+    await t.save();
+
+    return res.json({ ok: true, data: t });
+  } catch (e) {
+    return res.status(400).json({ ok: false, message: e.message });
+  }
+}

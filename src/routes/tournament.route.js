@@ -25,4 +25,7 @@ router.post("/:id/playoffs/generate", clubAuthMiddleware, c.generatePlayoffs);
 // Update match result (auto-progress + champion)
 router.patch("/:id/matches", clubAuthMiddleware, c.upsertMatch);
 
+// Start tournament
+router.post("/:id/start", clubAuthMiddleware, c.startTournament);
+
 export default router;
