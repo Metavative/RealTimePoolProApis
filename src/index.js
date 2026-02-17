@@ -1,3 +1,4 @@
+// src/index.js
 import express from "express";
 import cookieParser from "cookie-parser";
 import cors from "cors";
@@ -25,7 +26,13 @@ import bookingRoutes from "./routes/booking.route.js";
 import zegoRoutes from "./routes/zego.route.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
+
+// ✅ NOTE: route filename must match actual file name
+// You shared a routes file as tournament.route.js (singular) in this server file,
+// but earlier you shared tournament.routes.js (plural) in the backend.
+// Make sure the filename in /routes matches this import.
 import tournamentRoutes from "./routes/tournament.route.js";
+
 import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
 import clubOwnerRoutes from "./routes/clubOwner.route.js";
 
@@ -86,6 +93,8 @@ app.use("/api/match", matchRoutes);
 app.use("/api/club", clubRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/zego", zegoRoutes);
+
+// ✅ Tournament routes (club-auth)
 app.use("/api/tournaments", tournamentRoutes);
 
 // Health check endpoint
@@ -186,7 +195,7 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
 
 // Socket.io connection handler
 io.on("connection", (socket) => {
-  console.log(`� Socket connected: ${socket.id}`);
+  console.log(`✅ Socket connected: ${socket.id}`);
 
   registerMatchHandlers(io, socket, presence);
 
@@ -283,7 +292,7 @@ io.on("connection", (socket) => {
           lastSeen: new Date(),
         });
         await emitOnlinePlayers();
-        console.log(`� User offline: ${uid}`);
+        console.log(`✅ User offline: ${uid}`);
       } catch (err) {
         console.error("Error updating user status on disconnect:", err);
       }
@@ -316,7 +325,7 @@ const PORT = process.env.PORT || 4000;
 // Start server
 (async () => {
   try {
-    console.log("� Booting server...");
+    console.log("🚀 Booting server...");
     await connectDb();
     console.log("✅ DB connected");
 
