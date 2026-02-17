@@ -10,27 +10,28 @@ router.get("/:id", clubAuthMiddleware, c.getOne);
 router.patch("/:id", clubAuthMiddleware, c.patch);
 router.patch("/:id/settings", clubAuthMiddleware, c.patchSettings);
 
-// ✅ NEW Step endpoints
+// Step endpoints
 router.post("/:id/entries/close", clubAuthMiddleware, c.closeEntries);
-router.post("/:id/entries/open", clubAuthMiddleware, c.openEntries); // ✅ added
+router.post("/:id/entries/open", clubAuthMiddleware, c.openEntries);
+
 router.post("/:id/finalise", clubAuthMiddleware, c.finaliseFormat);
 
-// Entrants (users) -> computes rating + seed
+// Entrants
 router.post("/:id/entrants", clubAuthMiddleware, c.setEntrants);
 
-// Seeded balanced groups
+// Groups
 router.post("/:id/groups/generate", clubAuthMiddleware, c.generateGroups);
 
 // Group matches
 router.post("/:id/matches/generate-group", clubAuthMiddleware, c.generateGroupMatches);
 
-// Generate matches for any format
+// Generate matches for any format (✅ now persists and supports double_elim)
 router.post("/:id/matches/generate", clubAuthMiddleware, c.generateMatches);
 
-// Playoffs (auto-progress BYEs)
+// Playoffs
 router.post("/:id/playoffs/generate", clubAuthMiddleware, c.generatePlayoffs);
 
-// Update match result (auto-progress + champion)
+// Update match
 router.patch("/:id/matches", clubAuthMiddleware, c.upsertMatch);
 
 // Start tournament
