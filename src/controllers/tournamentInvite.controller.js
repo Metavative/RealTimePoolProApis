@@ -92,7 +92,6 @@ export async function sendTournamentInvite(req, res, io, presence) {
         .json({ message: "Entries are closed for this tournament" });
     }
 
-    // ✅ NEW: if format finalised, entrants locked (no more invites)
     if (tournament.formatStatus === "FINALISED") {
       return res
         .status(403)
@@ -199,7 +198,6 @@ export async function listTournamentInvites(req, res) {
 }
 
 /**
- * ✅ NEW
  * POST /api/tournaments/:tournamentId/join
  * user-only
  * Allows join ONLY when accessMode === OPEN
@@ -221,7 +219,6 @@ export async function joinTournamentOpen(req, res) {
       return res.status(404).json({ message: "Tournament not found" });
     }
 
-    // hard locks
     if (tournament.status === "ACTIVE") {
       return res.status(403).json({ message: "Tournament already started" });
     }
@@ -239,12 +236,10 @@ export async function joinTournamentOpen(req, res) {
     }
 
     const mode = String(tournament.accessMode || "INVITE_ONLY").toUpperCase().trim();
-
     if (mode !== "OPEN") {
       return res.status(403).json({ message: "This tournament is invite-only" });
     }
 
-    // already joined?
     const already = Array.isArray(tournament.entrants)
       ? tournament.entrants.some((e) => String(e.entrantId) === String(req.userId))
       : false;
@@ -254,8 +249,6 @@ export async function joinTournamentOpen(req, res) {
     }
 
     const displayName = bestUserDisplayName(req.user);
-
-    // stable participantKey for in-app users
     const pk = `uid:${String(req.userId)}`;
 
     await Tournament.updateOne(
@@ -265,12 +258,10 @@ export async function joinTournamentOpen(req, res) {
           entrants: {
             entrantId: req.userId,
             name: displayName,
-
             participantKey: pk,
             username: req.user?.username || "",
             userId: String(req.userId || ""),
             isLocal: false,
-
             rating: 0,
             seed: 0,
           },
@@ -278,7 +269,6 @@ export async function joinTournamentOpen(req, res) {
       }
     );
 
-    // optional reseed fairness (same behavior as invite accept)
     const fresh = await Tournament.findById(tournamentId).select("entrants");
     const ids = (fresh?.entrants || []).map((e) => String(e.entrantId));
     if (ids.length >= 2) {
@@ -368,7 +358,6 @@ export async function respondToInvite(req, res, io, presence) {
     if (invite.status === "accepted") {
       const displayName = bestUserDisplayName(req.user);
 
-      // ✅ Add entrant if not already present (now with stable participantKey fields)
       await Tournament.updateOne(
         { _id: invite.tournamentId, "entrants.entrantId": { $ne: req.userId } },
         {
@@ -376,12 +365,10 @@ export async function respondToInvite(req, res, io, presence) {
             entrants: {
               entrantId: req.userId,
               name: displayName,
-
               participantKey: invite.participantKey,
               username: req.user?.username || "",
               userId: String(req.userId || ""),
               isLocal: false,
-
               rating: 0,
               seed: 0,
             },
@@ -389,7 +376,6 @@ export async function respondToInvite(req, res, io, presence) {
         }
       );
 
-      // ✅ Re-seed entrants for fairness (and reset derived items) while entries are still open
       const fresh = await Tournament.findById(invite.tournamentId).select("entrants");
       const ids = (fresh?.entrants || []).map((e) => String(e.entrantId));
       if (ids.length >= 2) {
@@ -431,6 +417,27 @@ export async function cancelInvite(req, res, io, presence) {
 
     if (invite.status !== "pending") {
       return res.status(400).json({ message: "Only pending invites can be cancelled" });
+    }
+
+    // ✅ NEW: respect roster locks
+    const tournament = await Tournament.findById(invite.tournamentId).select(
+      "entriesStatus formatStatus status"
+    );
+
+    if (!tournament) return res.status(404).json({ message: "Tournament not found" });
+
+    if (tournament.status === "ACTIVE") {
+      return res.status(403).json({ message: "Tournament already started" });
+    }
+
+    if (tournament.entriesStatus === "CLOSED") {
+      return res.status(403).json({ message: "Entries are closed for this tournament" });
+    }
+
+    if (tournament.formatStatus === "FINALISED") {
+      return res.status(403).json({
+        message: "Tournament format is finalised. Entrants are locked.",
+      });
     }
 
     invite.status = "cancelled";
