@@ -72,6 +72,10 @@ const TournamentSchema = new mongoose.Schema(
       default: "OPEN",
     },
 
+    // ✅ NEW: close metadata (club closes entries)
+    closedAt: { type: Date, default: null },
+    closedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Club", default: null },
+
     formatStatus: {
       type: String,
       enum: ["DRAFT", "FINALISED"],

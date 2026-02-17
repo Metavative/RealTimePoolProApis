@@ -64,8 +64,7 @@ export async function sendTournamentInvite(req, res, io, presence) {
 
     if (!tournamentId)
       return res.status(400).json({ message: "tournamentId is required" });
-    if (!username)
-      return res.status(400).json({ message: "username is required" });
+    if (!username) return res.status(400).json({ message: "username is required" });
     if (!participantKey)
       return res.status(400).json({ message: "participantKey is required" });
 
@@ -75,26 +74,23 @@ export async function sendTournamentInvite(req, res, io, presence) {
       "clubId entriesStatus formatStatus status accessMode"
     );
 
-    if (!tournament)
-      return res.status(404).json({ message: "Tournament not found" });
+    if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
     if (tournament.clubId && String(tournament.clubId) !== String(req.clubId)) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
 
     if (tournament.status === "ACTIVE") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(409).json({ message: "Tournament already started" });
     }
 
     if (tournament.entriesStatus === "CLOSED") {
-      return res
-        .status(403)
-        .json({ message: "Entries are closed for this tournament" });
+      return res.status(409).json({ message: "Entries are closed for this tournament" });
     }
 
     if (tournament.formatStatus === "FINALISED") {
       return res
-        .status(403)
+        .status(409)
         .json({ message: "Tournament format is finalised. Entrants are locked." });
     }
 
@@ -112,9 +108,7 @@ export async function sendTournamentInvite(req, res, io, presence) {
       const st = String(existing.status || "pending").toLowerCase();
 
       if (st === "pending" || st === "accepted") {
-        return res
-          .status(200)
-          .json({ message: "Invite already exists", data: existing });
+        return res.status(200).json({ message: "Invite already exists", data: existing });
       }
 
       existing.status = "pending";
@@ -147,9 +141,7 @@ export async function sendTournamentInvite(req, res, io, presence) {
 
     return res.status(201).json({ message: "Invite sent", data: invite });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: e?.message || "Failed to send invite" });
+    return res.status(500).json({ message: e?.message || "Failed to send invite" });
   }
 }
 
@@ -166,9 +158,7 @@ export async function listTournamentInvites(req, res) {
       return res.status(400).json({ message: "tournamentId is required" });
     }
 
-    const tournament = await Tournament.findById(tournamentId)
-      .select("clubId")
-      .lean();
+    const tournament = await Tournament.findById(tournamentId).select("clubId").lean();
     if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
     if (tournament.clubId && String(tournament.clubId) !== String(req.clubId)) {
@@ -191,9 +181,7 @@ export async function listTournamentInvites(req, res) {
 
     return res.status(200).json({ data });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: e?.message || "Failed to list invites" });
+    return res.status(500).json({ message: e?.message || "Failed to list invites" });
   }
 }
 
@@ -220,18 +208,16 @@ export async function joinTournamentOpen(req, res) {
     }
 
     if (tournament.status === "ACTIVE") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(409).json({ message: "Tournament already started" });
     }
 
     if (tournament.entriesStatus === "CLOSED") {
-      return res
-        .status(403)
-        .json({ message: "Entries are closed for this tournament" });
+      return res.status(409).json({ message: "Entries are closed for this tournament" });
     }
 
     if (tournament.formatStatus === "FINALISED") {
       return res
-        .status(403)
+        .status(409)
         .json({ message: "Tournament format is finalised. Entrants are locked." });
     }
 
@@ -296,9 +282,7 @@ export async function listMyInvites(req, res) {
 
     return res.status(200).json({ data: invites });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: e?.message || "Failed to load invites" });
+    return res.status(500).json({ message: e?.message || "Failed to load invites" });
   }
 }
 
@@ -337,18 +321,16 @@ export async function respondToInvite(req, res, io, presence) {
     if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
     if (tournament.status === "ACTIVE") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(409).json({ message: "Tournament already started" });
     }
 
     if (tournament.entriesStatus === "CLOSED") {
-      return res
-        .status(403)
-        .json({ message: "Entries are closed for this tournament" });
+      return res.status(409).json({ message: "Entries are closed for this tournament" });
     }
 
     if (tournament.formatStatus === "FINALISED") {
       return res
-        .status(403)
+        .status(409)
         .json({ message: "Tournament format is finalised. Entrants are locked." });
     }
 
@@ -419,7 +401,7 @@ export async function cancelInvite(req, res, io, presence) {
       return res.status(400).json({ message: "Only pending invites can be cancelled" });
     }
 
-    // ✅ NEW: respect roster locks
+    // ✅ respect roster locks
     const tournament = await Tournament.findById(invite.tournamentId).select(
       "entriesStatus formatStatus status"
     );
@@ -427,17 +409,17 @@ export async function cancelInvite(req, res, io, presence) {
     if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
     if (tournament.status === "ACTIVE") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(409).json({ message: "Tournament already started" });
     }
 
     if (tournament.entriesStatus === "CLOSED") {
-      return res.status(403).json({ message: "Entries are closed for this tournament" });
+      return res.status(409).json({ message: "Entries are closed for this tournament" });
     }
 
     if (tournament.formatStatus === "FINALISED") {
-      return res.status(403).json({
-        message: "Tournament format is finalised. Entrants are locked.",
-      });
+      return res
+        .status(409)
+        .json({ message: "Tournament format is finalised. Entrants are locked." });
     }
 
     invite.status = "cancelled";

@@ -34,6 +34,39 @@ function isActiveStatus(status) {
   return s === "ACTIVE" || s === "LIVE";
 }
 
+function isCompletedStatus(status) {
+  return normUpper(status, "DRAFT") === "COMPLETED";
+}
+
+function isEntriesClosed(t) {
+  return normUpper(t?.entriesStatus, "OPEN") === "CLOSED";
+}
+
+function isFormatFinalised(t) {
+  return normUpper(t?.formatStatus, "DRAFT") === "FINALISED";
+}
+
+function isLockedForRoster(t) {
+  // Roster/entrants/invites must be locked if any of these apply
+  if (!t) return false;
+  if (isActiveStatus(t.status) || isCompletedStatus(t.status)) return true;
+  if (isEntriesClosed(t)) return true;
+  if (isFormatFinalised(t)) return true;
+  return false;
+}
+
+function rosterLockMessage(t) {
+  if (isActiveStatus(t.status) || isCompletedStatus(t.status)) return "Tournament already started";
+  if (isFormatFinalised(t)) return "Tournament format is finalised. Entrants are locked.";
+  if (isEntriesClosed(t)) return "Entries are closed for this tournament";
+  return "Tournament is locked";
+}
+
+function lockStatusCode() {
+  // Use 409 Conflict for state-based lockouts
+  return 409;
+}
+
 // -------------------------
 // Match generation helpers (schema-aligned)
 // -------------------------
@@ -198,7 +231,6 @@ function groupStageMatchesFromGroups(t, venue, entrantIndex) {
 
 async function persistMatches(tournamentDoc, matches) {
   tournamentDoc.matches = Array.isArray(matches) ? matches : [];
-  // keep schema fields clean
   tournamentDoc.markModified("matches");
   await tournamentDoc.save();
   return await Tournament.findById(tournamentDoc._id);
@@ -240,6 +272,7 @@ export async function create(req, res) {
       topNPerGroup: Number.isFinite(topNPerGroup) ? topNPerGroup : undefined,
       groupRandomize: groupRandomize ?? false,
       playoffDefaultVenue,
+      // closedAt/closedBy default null in schema
     });
 
     return res.status(201).json({ message: "Tournament created", data: t });
@@ -300,7 +333,7 @@ export async function patch(req, res) {
 
     const status = normUpper(t.status, "DRAFT");
     if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
 
     if (req.body.title != null) t.title = String(req.body.title || "").trim();
@@ -326,7 +359,7 @@ export async function patchSettings(req, res) {
       req,
       res,
       id,
-      "clubId status accessMode entriesStatus formatStatus format groupCount topNPerGroup groupRandomize playoffDefaultVenue formatConfig"
+      "clubId status accessMode entriesStatus formatStatus format groupCount topNPerGroup groupRandomize playoffDefaultVenue formatConfig closedAt closedBy"
     );
     if (!tournament) return;
 
@@ -336,11 +369,11 @@ export async function patchSettings(req, res) {
 
     const isActive = isActiveStatus(status);
     const isCompleted = status === "COMPLETED";
-    const isEntriesClosed = entriesStatus === "CLOSED";
-    const isFormatFinalised = formatStatus === "FINALISED";
+    const entriesClosed = entriesStatus === "CLOSED";
+    const formatFinalised = formatStatus === "FINALISED";
 
     if (isActive || isCompleted) {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
 
     // accessMode
@@ -349,29 +382,31 @@ export async function patchSettings(req, res) {
       if (!["OPEN", "INVITE_ONLY"].includes(next)) {
         return res.status(400).json({ message: "Invalid accessMode" });
       }
-      if (isEntriesClosed || isFormatFinalised) {
-        return res.status(403).json({
-          message: isFormatFinalised
-            ? "Format is finalised. Access mode locked."
-            : "Entries are closed. Access mode locked.",
+      if (entriesClosed || formatFinalised) {
+        return res.status(lockStatusCode()).json({
+          message: formatFinalised
+            ? "Tournament format is finalised. Settings locked."
+            : "Entries are closed for this tournament",
         });
       }
       tournament.accessMode = next;
     }
 
-    // entriesStatus (ALLOW ONLY OPEN HERE)
+    // entriesStatus (ALLOW ONLY OPEN HERE; close via endpoint)
     if (req.body.entriesStatus != null) {
       const next = normUpper(req.body.entriesStatus, "");
       if (!["OPEN", "CLOSED"].includes(next)) {
         return res.status(400).json({ message: "Invalid entriesStatus" });
       }
       if (next === "OPEN") {
-        if (isFormatFinalised) {
+        if (formatFinalised) {
           return res
-            .status(403)
-            .json({ message: "Format is finalised. Re-open entries not allowed." });
+            .status(lockStatusCode())
+            .json({ message: "Tournament format is finalised. Entrants are locked." });
         }
         tournament.entriesStatus = "OPEN";
+        tournament.closedAt = null;
+        tournament.closedBy = null;
       } else {
         return res.status(400).json({
           message: "Use /entries/close endpoint to close entries",
@@ -386,11 +421,11 @@ export async function patchSettings(req, res) {
       req.body.playoffDefaultVenue != null ||
       req.body.formatConfig != null;
 
-    if ((isEntriesClosed || isFormatFinalised) && hasFormatSettingsChange) {
-      return res.status(403).json({
-        message: isFormatFinalised
-          ? "Format is finalised. Settings locked."
-          : "Entries are closed. Settings locked.",
+    if ((entriesClosed || formatFinalised) && hasFormatSettingsChange) {
+      return res.status(lockStatusCode()).json({
+        message: formatFinalised
+          ? "Tournament format is finalised. Settings locked."
+          : "Entries are closed for this tournament",
       });
     }
 
@@ -442,7 +477,7 @@ export async function closeEntries(req, res) {
       req,
       res,
       id,
-      "clubId status entriesStatus formatStatus"
+      "clubId status entriesStatus formatStatus closedAt closedBy"
     );
     if (!tournament) return;
 
@@ -451,10 +486,22 @@ export async function closeEntries(req, res) {
     const isCompleted = status === "COMPLETED";
 
     if (isActive || isCompleted) {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+    }
+
+    if (isFormatFinalised(tournament)) {
+      // Still allow closing if finalised? Usually already locked, but safe:
+      // return 200 as no-op, or 409. We'll return 200 and ensure entriesStatus is CLOSED.
+    }
+
+    if (normUpper(tournament.entriesStatus, "OPEN") === "CLOSED") {
+      return res.status(200).json({ message: "Entries already closed", data: tournament });
     }
 
     tournament.entriesStatus = "CLOSED";
+    tournament.closedAt = new Date();
+    tournament.closedBy = req.clubId;
+
     await tournament.save();
 
     return res.status(200).json({ message: "Entries closed", data: tournament });
@@ -476,28 +523,32 @@ export async function openEntries(req, res) {
       req,
       res,
       id,
-      "clubId status entriesStatus formatStatus"
+      "clubId status entriesStatus formatStatus closedAt closedBy"
     );
     if (!tournament) return;
 
     const status = normUpper(tournament.status, "DRAFT");
-    const formatStatus = normUpper(tournament.formatStatus, "DRAFT");
-
     const isActive = isActiveStatus(status);
     const isCompleted = status === "COMPLETED";
-    const isFormatFinalised = formatStatus === "FINALISED";
 
     if (isActive || isCompleted) {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
 
-    if (isFormatFinalised) {
+    if (isFormatFinalised(tournament)) {
       return res
-        .status(403)
-        .json({ message: "Format is finalised. Re-open entries not allowed." });
+        .status(lockStatusCode())
+        .json({ message: "Tournament format is finalised. Entrants are locked." });
+    }
+
+    if (normUpper(tournament.entriesStatus, "OPEN") === "OPEN") {
+      return res.status(200).json({ message: "Entries already open", data: tournament });
     }
 
     tournament.entriesStatus = "OPEN";
+    tournament.closedAt = null;
+    tournament.closedBy = null;
+
     await tournament.save();
 
     return res.status(200).json({ message: "Entries opened", data: tournament });
@@ -515,13 +566,23 @@ export async function finaliseFormat(req, res) {
 
     const { id } = req.params;
 
-    const t = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
+    const t = await loadOwnedTournament(
+      req,
+      res,
+      id,
+      "clubId status entriesStatus formatStatus"
+    );
     if (!t) return;
 
     const status = normUpper(t.status, "DRAFT");
     if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
+
+    // If you want to force close entries when finalising (recommended), uncomment:
+    // t.entriesStatus = "CLOSED";
+    // t.closedAt = t.closedAt || new Date();
+    // t.closedBy = t.closedBy || req.clubId;
 
     t.formatStatus = "FINALISED";
     await t.save();
@@ -541,6 +602,19 @@ export async function setEntrants(req, res) {
 
     const { id } = req.params;
 
+    // ✅ Enforce roster locks here (critical)
+    const lockCheck = await loadOwnedTournament(
+      req,
+      res,
+      id,
+      "clubId status entriesStatus formatStatus"
+    );
+    if (!lockCheck) return;
+
+    if (isLockedForRoster(lockCheck)) {
+      return res.status(lockStatusCode()).json({ message: rosterLockMessage(lockCheck) });
+    }
+
     const entrants = req.body?.entrants;
     const entrantIds = req.body?.entrantIds;
 
@@ -551,7 +625,9 @@ export async function setEntrants(req, res) {
 
     const ids = Array.isArray(entrantIds) ? entrantIds : entrants;
     if (!Array.isArray(ids) || ids.length < 2) {
-      return res.status(400).json({ message: "Provide entrants (objects) or entrantIds (min 2)" });
+      return res
+        .status(400)
+        .json({ message: "Provide entrants (objects) or entrantIds (min 2)" });
     }
 
     const t = await svc.setEntrants(id, ids);
@@ -569,6 +645,14 @@ export async function generateGroups(req, res) {
     if (!requireClub(req, res)) return;
 
     const { id } = req.params;
+
+    // If format/entries are locked, don't allow regenerating groups
+    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
+    if (!t0) return;
+
+    if (isLockedForRoster(t0)) {
+      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t0) });
+    }
 
     const groupCount =
       req.body?.groupCount != null ? parseInt(req.body.groupCount, 10) : undefined;
@@ -591,6 +675,14 @@ export async function generateGroupMatches(req, res) {
     if (!requireClub(req, res)) return;
 
     const { id } = req.params;
+
+    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
+    if (!t0) return;
+
+    if (isLockedForRoster(t0)) {
+      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t0) });
+    }
+
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
 
     const t = await svc.generateGroupMatches(id, { defaultVenue });
@@ -603,7 +695,6 @@ export async function generateGroupMatches(req, res) {
 // -------------------------
 // POST /api/tournaments/:id/matches/generate
 // ✅ FIX: Controller guarantees persistence + supports double_elim.
-// This is the backend change that stops matches disappearing.
 // -------------------------
 export async function generateMatches(req, res) {
   try {
@@ -611,12 +702,12 @@ export async function generateMatches(req, res) {
 
     const { id } = req.params;
 
-    const t = await loadOwnedTournament(req, res, id);
+    const t = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus entrants groups format matches");
     if (!t) return;
 
-    const status = normUpper(t.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(403).json({ message: "Tournament already started" });
+    // Generating matches is a "format action"—lock it when entries closed or finalised
+    if (isLockedForRoster(t)) {
+      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t) });
     }
 
     const format = String(req.body?.format || t.format || "").trim();
@@ -628,7 +719,9 @@ export async function generateMatches(req, res) {
 
     const keys = pickParticipantKeysFromTournament(t);
     if (keys.length < 2) {
-      return res.status(400).json({ message: "Need at least 2 entrants before generating matches" });
+      return res
+        .status(400)
+        .json({ message: "Need at least 2 entrants before generating matches" });
     }
 
     const entrantIndex = buildEntrantIndex(t);
@@ -662,6 +755,14 @@ export async function generatePlayoffs(req, res) {
     if (!requireClub(req, res)) return;
 
     const { id } = req.params;
+
+    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
+    if (!t0) return;
+
+    if (isLockedForRoster(t0)) {
+      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t0) });
+    }
+
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
 
     const t = await svc.generatePlayoffs(id, { defaultVenue });
@@ -678,6 +779,8 @@ export async function upsertMatch(req, res) {
   try {
     if (!requireClub(req, res)) return;
 
+    // Editing a match after start is allowed in your flow (score entry).
+    // So we do NOT block on status here.
     const { id } = req.params;
     const t = await svc.upsertMatch(id, req.body);
     return res.status(200).json({ message: "Match updated", data: t });
@@ -695,13 +798,24 @@ export async function startTournament(req, res) {
 
     const { id } = req.params;
 
-    const t = await loadOwnedTournament(req, res, id, "clubId status startedAt");
+    const t = await loadOwnedTournament(
+      req,
+      res,
+      id,
+      "clubId status startedAt entriesStatus formatStatus"
+    );
     if (!t) return;
 
     const status = normUpper(t.status, "DRAFT");
     if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(403).json({ message: "Tournament already started" });
+      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
+
+    // Recommended: must have entries closed OR format finalised before start
+    // If you want to enforce it, uncomment below:
+    // if (!isEntriesClosed(t) && !isFormatFinalised(t)) {
+    //   return res.status(400).json({ message: "Close entries or finalise format before starting" });
+    // }
 
     t.status = "ACTIVE";
     t.startedAt = new Date();
