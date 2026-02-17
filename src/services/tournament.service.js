@@ -2,6 +2,9 @@ import Tournament from "../models/tournament.model.js";
 import User from "../models/user.model.js";
 import { computeUserRating } from "./seedRating.service.js";
 
+// ------------------------------
+// small helpers
+// ------------------------------
 function groupIdFromIndex(idx) {
   const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   if (idx < 26) return letters[idx];
@@ -19,13 +22,20 @@ function isPlayoffMatchId(id) {
 }
 
 function playoffRoundOf(id) {
-  // po_r<round>_<n>
   const parts = String(id || "").split("_"); // po, r1, 1
   if (parts.length < 3) return null;
-  const r = parts[1]; // r1
+  const r = parts[1];
   if (!r || !r.startsWith("r")) return null;
   const n = parseInt(r.substring(1), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+function pkToUserObjectId(participantKey) {
+  const s = String(participantKey || "").trim();
+  if (!s.startsWith("uid:")) return null;
+  const id = s.substring(4).trim();
+  // Let mongoose validate at save time; still return string for ObjectId casting
+  return id || null;
 }
 
 function playoffWinner(match) {
@@ -147,7 +157,6 @@ function autoProgressFromRound(t, startRound) {
       return;
     }
 
-    // Create next round
     const out = [];
     let counter = 1;
 
@@ -155,6 +164,8 @@ function autoProgressFromRound(t, startRound) {
       if (i + 1 >= winners.length) {
         out.push({
           id: `po_r${nextRound}_${counter}`,
+          teamA: "", // not needed for playoffs (names drive)
+          teamB: "",
           teamAId: null,
           teamBId: null,
           teamAName: winners[i],
@@ -171,6 +182,8 @@ function autoProgressFromRound(t, startRound) {
 
       out.push({
         id: `po_r${nextRound}_${counter}`,
+        teamA: "",
+        teamB: "",
         teamAId: null,
         teamBId: null,
         teamAName: winners[i],
@@ -190,24 +203,28 @@ function autoProgressFromRound(t, startRound) {
 }
 
 // ------------------------------
-// Entrants & Seeding
+// Entrants (participantKey-based)
 // ------------------------------
-
 function normEntrant(e = {}) {
   const participantKey = String(e.participantKey || "").trim();
+  if (!participantKey) return null;
+
   const name = String(e.name || "").trim();
   const username = String(e.username || "").trim();
   const userId = String(e.userId || "").trim();
   const isLocal = !!e.isLocal;
 
-  if (!participantKey) return null;
+  const entrantId = pkToUserObjectId(participantKey);
 
   return {
     participantKey,
+    entrantId: entrantId || undefined,
     name,
     username,
     userId,
     isLocal,
+    rating: 0,
+    seed: 0,
   };
 }
 
@@ -226,89 +243,42 @@ export async function setEntrantsObjects(tournamentId, entrants = []) {
     clean.push(en);
   }
 
-  t.entrants = clean;
-  await t.save();
-  return t;
-}
-
-export async function setEntrantsByIds(tournamentId, entrantIds = []) {
-  const t = await Tournament.findById(tournamentId);
-  if (!t) throw new Error("Tournament not found");
-
-  const clean = [];
-  const seen = new Set();
-
-  for (const id of entrantIds) {
-    const userId = String(id || "").trim();
-    if (!userId) continue;
-    const participantKey = `uid:${userId}`;
-    if (seen.has(participantKey)) continue;
-    seen.add(participantKey);
-    clean.push({
-      participantKey,
-      userId,
-      name: "",
-      username: "",
-      isLocal: false,
-    });
-  }
-
-  t.entrants = clean;
-  await t.save();
-  return t;
-}
-
-export async function setEntrants(tournamentId, entrantIds) {
-  const ids = (entrantIds || [])
-    .map((x) => String(x || "").trim())
+  // optional: compute rating only for uid entrants
+  const uidIds = clean
+    .map((e) => (e.participantKey || "").startsWith("uid:") ? e.participantKey.substring(4) : "")
     .filter(Boolean);
 
-  if (ids.length < 2) {
-    throw new Error("Need at least 2 entrants");
+  if (uidIds.length) {
+    const users = await User.find({ _id: { $in: uidIds } })
+      .select("profile.nickname stats.score stats.rank stats.totalWinnings stats.bestWinStreak stats.userIdTag")
+      .lean();
+
+    const byId = new Map(users.map((u) => [String(u._id), u]));
+
+    for (const e of clean) {
+      if (!e.participantKey.startsWith("uid:")) continue;
+      const id = e.participantKey.substring(4);
+      const u = byId.get(String(id));
+      if (!e.name) {
+        e.name =
+          (u?.profile?.nickname && String(u.profile.nickname).trim()) ||
+          (u?.stats?.userIdTag && String(u.stats.userIdTag).trim()) ||
+          e.name ||
+          "Player";
+      }
+      e.rating = computeUserRating(u);
+    }
   }
 
-  const users = await User.find({ _id: { $in: ids } })
-    .select("profile.nickname stats.score stats.rank stats.totalWinnings stats.bestWinStreak stats.userIdTag")
-    .lean();
-
-  // Keep original order if provided, but fill missing safe
-  const byId = new Map(users.map((u) => [String(u._id), u]));
-
-  const entrants = ids.map((id) => {
-    const u = byId.get(id);
-    const name =
-      (u?.profile?.nickname && String(u.profile.nickname).trim()) ||
-      (u?.stats?.userIdTag && String(u.stats.userIdTag).trim()) ||
-      "Player";
-
-    const rating = computeUserRating(u);
-
-    return {
-      entrantId: id,
-      name,
-      rating,
-      seed: 0,
-    };
-  });
-
-  // Seed strongest -> weakest
-  const seeded = entrants
-    .slice()
-    .sort((a, b) => (b.rating || 0) - (a.rating || 0));
-
-  for (let i = 0; i < seeded.length; i++) {
-    seeded[i].seed = i + 1;
-  }
-
-  const t = await Tournament.findById(tournamentId);
-  if (!t) throw new Error("Tournament not found");
+  // seed strongest->weakest (rating)
+  const seeded = clean.slice().sort((a, b) => (b.rating || 0) - (a.rating || 0));
+  for (let i = 0; i < seeded.length; i++) seeded[i].seed = i + 1;
 
   t.entrants = seeded;
 
-  // Reset derived items
+  // reset derived items
   t.groups = [];
   t.matches = [];
-  t.playoffDefaultVenue = "";
   t.championName = "";
 
   await t.save();
@@ -316,7 +286,8 @@ export async function setEntrants(tournamentId, entrantIds) {
 }
 
 // ------------------------------
-// Balanced Groups (Snake seeding)
+// Balanced Groups (snake seeding)
+// members are participantKeys
 // ------------------------------
 export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize, randomize }) {
   const t = await Tournament.findById(tournamentId);
@@ -327,10 +298,9 @@ export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize
   }
 
   const list = t.entrants.slice();
-
-  let count;
   const n = list.length;
 
+  let count;
   if (groupSize && Number(groupSize) > 0) {
     const sz = Math.max(1, Number(groupSize));
     count = Math.ceil(n / sz);
@@ -339,12 +309,9 @@ export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize
     count = Math.min(count, n);
   }
 
-  // seeded strongest -> weakest
+  // seeded strongest -> weakest via seed
   const seeded = list.slice().sort((a, b) => (a.seed || 9999) - (b.seed || 9999));
 
-  // Optional randomize: ONLY random within same seed bands? (simple version: shuffle all)
-  // For BEST UX, keep randomize=false to keep fairness.
-  // We'll implement: if randomize true -> shuffle but keep seed numbers stable.
   if (randomize) {
     seeded.sort(() => Math.random() - 0.5);
   }
@@ -355,20 +322,18 @@ export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize
     groups.push({ id, name: `Group ${id}`, members: [] });
   }
 
-  // Snake seeding distribution
-  // Forward then reverse every row
   let forward = true;
   let idx = 0;
 
   while (idx < seeded.length) {
     if (forward) {
       for (let g = 0; g < groups.length && idx < seeded.length; g++) {
-        groups[g].members.push(seeded[idx].entrantId);
+        groups[g].members.push(String(seeded[idx].participantKey));
         idx++;
       }
     } else {
       for (let g = groups.length - 1; g >= 0 && idx < seeded.length; g--) {
-        groups[g].members.push(seeded[idx].entrantId);
+        groups[g].members.push(String(seeded[idx].participantKey));
         idx++;
       }
     }
@@ -381,7 +346,6 @@ export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize
 
   t.groups = groups;
   t.matches = [];
-  t.playoffDefaultVenue = "";
   t.championName = "";
 
   await t.save();
@@ -390,6 +354,7 @@ export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize
 
 // ------------------------------
 // Group matches generation
+// teamA/teamB are participantKeys
 // ------------------------------
 export async function generateGroupMatches(tournamentId, { defaultVenue }) {
   const t = await Tournament.findById(tournamentId);
@@ -398,25 +363,33 @@ export async function generateGroupMatches(tournamentId, { defaultVenue }) {
   if (t.format !== "group_stage") throw new Error("Tournament is not group_stage");
   if (!t.groups || t.groups.length === 0) throw new Error("Groups not generated");
 
-  // remove old matches (both group & playoffs) for regenerate behavior
   t.matches = [];
-  t.playoffDefaultVenue = "";
   t.championName = "";
 
   const matches = [];
 
+  // nameByKey from entrants
+  const nameByKey = new Map(
+    (t.entrants || []).map((e) => [String(e.participantKey), String(e.name || "Player")])
+  );
+
   for (const g of t.groups) {
-    const members = (g.members || []).map((x) => String(x));
+    const members = (g.members || []).map((x) => String(x)).filter(Boolean);
     let counter = 1;
 
     for (let i = 0; i < members.length; i++) {
       for (let j = i + 1; j < members.length; j++) {
+        const teamA = members[i];
+        const teamB = members[j];
+
         matches.push({
           id: `g_${g.id}_${counter}`,
-          teamAId: members[i],
-          teamBId: members[j],
-          teamAName: "",
-          teamBName: "",
+          teamA,
+          teamB,
+          teamAId: pkToUserObjectId(teamA),
+          teamBId: pkToUserObjectId(teamB),
+          teamAName: nameByKey.get(teamA) || "Player",
+          teamBName: nameByKey.get(teamB) || "Player",
           venue: defaultVenue || "",
           dateTime: null,
           scoreA: 0,
@@ -428,33 +401,29 @@ export async function generateGroupMatches(tournamentId, { defaultVenue }) {
     }
   }
 
-  // Fill names from entrants
-  const nameById = new Map((t.entrants || []).map((e) => [String(e.entrantId), e.name]));
-  for (const m of matches) {
-    m.teamAName = nameById.get(String(m.teamAId)) || "Player";
-    m.teamBName = nameById.get(String(m.teamBId)) || "Player";
-  }
-
   t.matches = matches;
   await t.save();
   return t;
 }
 
 // ------------------------------
-// Standings + Playoffs generation
+// Standings for group_stage
+// uses match.teamA/teamB participantKeys
 // ------------------------------
 function computeGroupStandings(t) {
-  // returns map gid -> row[]
   const byGroup = new Map();
+
+  const nameByKey = new Map(
+    (t.entrants || []).map((e) => [String(e.participantKey), String(e.name || "Player")])
+  );
 
   for (const g of t.groups || []) {
     const rows = new Map();
-    for (const memberId of g.members || []) {
-      const id = String(memberId);
-      const entrant = (t.entrants || []).find((e) => String(e.entrantId) === id);
-      rows.set(id, {
-        id,
-        name: entrant?.name || "Player",
+    for (const pk of g.members || []) {
+      const key = String(pk);
+      rows.set(key, {
+        key,
+        name: nameByKey.get(key) || "Player",
         played: 0,
         won: 0,
         drawn: 0,
@@ -479,8 +448,8 @@ function computeGroupStandings(t) {
     const groupRows = byGroup.get(gid);
     if (!groupRows) continue;
 
-    const a = groupRows.get(String(m.teamAId));
-    const b = groupRows.get(String(m.teamBId));
+    const a = groupRows.get(String(m.teamA));
+    const b = groupRows.get(String(m.teamB));
     if (!a || !b) continue;
 
     a.played++;
@@ -530,6 +499,9 @@ function computeGroupStandings(t) {
   return out;
 }
 
+// ------------------------------
+// Playoffs generation (names driven)
+// ------------------------------
 export async function generatePlayoffs(tournamentId, { defaultVenue }) {
   const t = await Tournament.findById(tournamentId);
   if (!t) throw new Error("Tournament not found");
@@ -539,11 +511,9 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
 
   t.playoffDefaultVenue = String(defaultVenue || "").trim();
 
-  // If no group matches exist, generate them first (best UX)
   const hasGroupMatches = (t.matches || []).some((m) => isGroupMatchId(m.id));
   if (!hasGroupMatches) {
     await generateGroupMatches(tournamentId, { defaultVenue });
-    // reload after save
     const fresh = await Tournament.findById(tournamentId);
     if (!fresh) throw new Error("Tournament not found after group match generation");
     t.groups = fresh.groups;
@@ -551,7 +521,6 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
     t.entrants = fresh.entrants;
   }
 
-  // Remove old playoffs
   removePlayoffs(t);
 
   const standings = computeGroupStandings(t);
@@ -569,8 +538,10 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
     return t;
   }
 
-  // Interleave A1,B1,C1,A2,B2...
-  const maxN = Object.values(qualifiersByGroup).reduce((m, list) => Math.max(m, list.length), 0);
+  const maxN = Object.values(qualifiersByGroup).reduce(
+    (m, list) => Math.max(m, list.length),
+    0
+  );
 
   const ordered = [];
   for (let r = 0; r < maxN; r++) {
@@ -588,6 +559,8 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
   while (i < j) {
     out.push({
       id: `po_r1_${counter}`,
+      teamA: "",
+      teamB: "",
       teamAId: null,
       teamBId: null,
       teamAName: ordered[i],
@@ -606,6 +579,8 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
   if (i === j) {
     out.push({
       id: `po_r1_${counter}`,
+      teamA: "",
+      teamB: "",
       teamAId: null,
       teamBId: null,
       teamAName: ordered[i],
@@ -620,14 +595,13 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
 
   t.matches = [...(t.matches || []), ...out];
 
-  // Auto-progress based on BYEs (best UX)
   autoProgressFromRound(t, 1);
   await t.save();
   return t;
 }
 
 // ------------------------------
-// Match update -> auto-progress + champion
+// Match update (auto-progress + champion)
 // ------------------------------
 export async function upsertMatch(tournamentId, matchUpdate) {
   const t = await Tournament.findById(tournamentId);
@@ -641,18 +615,22 @@ export async function upsertMatch(tournamentId, matchUpdate) {
 
   const m = t.matches[idx];
 
-  // Basic patch fields
+  if (matchUpdate.teamA !== undefined) m.teamA = String(matchUpdate.teamA || "");
+  if (matchUpdate.teamB !== undefined) m.teamB = String(matchUpdate.teamB || "");
   if (matchUpdate.teamAName !== undefined) m.teamAName = String(matchUpdate.teamAName || "");
   if (matchUpdate.teamBName !== undefined) m.teamBName = String(matchUpdate.teamBName || "");
   if (matchUpdate.venue !== undefined) m.venue = String(matchUpdate.venue || "");
-  if (matchUpdate.dateTime !== undefined) m.dateTime = matchUpdate.dateTime ? new Date(matchUpdate.dateTime) : null;
+  if (matchUpdate.dateTime !== undefined)
+    m.dateTime = matchUpdate.dateTime ? new Date(matchUpdate.dateTime) : null;
 
   if (matchUpdate.scoreA !== undefined) m.scoreA = Number(matchUpdate.scoreA || 0);
   if (matchUpdate.scoreB !== undefined) m.scoreB = Number(matchUpdate.scoreB || 0);
-
   if (matchUpdate.status !== undefined) m.status = String(matchUpdate.status || "scheduled");
 
-  // Validate playoff can’t draw (unless BYE involved)
+  // keep ids consistent if teamA/teamB are uid:
+  m.teamAId = pkToUserObjectId(m.teamA);
+  m.teamBId = pkToUserObjectId(m.teamB);
+
   if (isPlayoffMatchId(m.id) && m.status === "played") {
     const aBye = String(m.teamAName || "").trim().toUpperCase() === "BYE";
     const bBye = String(m.teamBName || "").trim().toUpperCase() === "BYE";
@@ -661,12 +639,10 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     }
   }
 
-  // IMPORTANT: if playoff match edited, clear future rounds and auto-progress
   if (isPlayoffMatchId(m.id)) {
     const r = playoffRoundOf(m.id);
     if (r != null) {
       clearPlayoffRoundsAfter(t, r);
-      // keep rounds up to r (including this match), then progress forward
       autoProgressFromRound(t, r);
     } else {
       recomputeChampion(t);
@@ -680,9 +656,8 @@ export async function upsertMatch(tournamentId, matchUpdate) {
 }
 
 // ------------------------------
-// Generate matches for any format
+// Generate matches for any format (participantKey-based)
 // ------------------------------
-
 function shuffle(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -701,8 +676,8 @@ function generateRoundRobin(keys, defaultVenue = "") {
         id: `rr_${counter++}`,
         teamA: keys[i],
         teamB: keys[j],
-        teamAId: null,
-        teamBId: null,
+        teamAId: pkToUserObjectId(keys[i]),
+        teamBId: pkToUserObjectId(keys[j]),
         teamAName: "",
         teamBName: "",
         venue: defaultVenue,
@@ -728,8 +703,8 @@ function generateKnockoutRound1(keys, defaultVenue = "", prefix = "ko") {
       id: `${prefix}_${counter++}`,
       teamA: a,
       teamB: b,
-      teamAId: null,
-      teamBId: null,
+      teamAId: pkToUserObjectId(a),
+      teamBId: b === "BYE" ? null : pkToUserObjectId(b),
       teamAName: "",
       teamBName: b === "BYE" ? "BYE" : "",
       venue: defaultVenue,
@@ -752,19 +727,13 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
 
   const entrants = Array.isArray(t.entrants) ? t.entrants : [];
   const keys = entrants
-    .map((e) => {
-      const pk = e.participantKey || (e.entrantId ? `uid:${e.entrantId}` : "");
-      return String(pk || "").trim();
-    })
+    .map((e) => String(e.participantKey || "").trim())
     .filter(Boolean);
 
   if (keys.length < 2) throw new Error("Add at least 2 players");
 
   const nameByKey = new Map(
-    entrants.map((e) => {
-      const pk = e.participantKey || (e.entrantId ? `uid:${e.entrantId}` : "");
-      return [pk, (e.name || "Player").trim() || "Player"];
-    })
+    entrants.map((e) => [String(e.participantKey), String(e.name || "Player").trim() || "Player"])
   );
 
   const f = String(format || t.format || "").trim();
@@ -783,11 +752,10 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
     rawMatches = generateRoundRobin(keys, defaultVenue);
   }
 
-  // fill teamAName/teamBName from entrants for schema compatibility
   const matches = rawMatches.map((m) => ({
     ...m,
-    teamAName: m.teamB === "BYE" ? nameByKey.get(m.teamA) || "Player" : nameByKey.get(m.teamA) || "Player",
-    teamBName: m.teamB === "BYE" ? "BYE" : nameByKey.get(m.teamB) || "Player",
+    teamAName: m.teamAName || nameByKey.get(m.teamA) || "Player",
+    teamBName: m.teamB === "BYE" ? "BYE" : (m.teamBName || nameByKey.get(m.teamB) || "Player"),
   }));
 
   t.matches = matches;

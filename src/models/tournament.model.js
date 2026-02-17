@@ -2,16 +2,15 @@ import mongoose from "mongoose";
 
 const TournamentEntrantSchema = new mongoose.Schema(
   {
-    entrantId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    entrantId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // optional
     name: { type: String, trim: true, default: "" },
 
-    // participantKey (stable key: uid:/un:/nm:)
+    // stable key: uid:<id> | un:<usernameLower> | nm:<nameLower>
     participantKey: { type: String, trim: true, default: "" },
     username: { type: String, trim: true, default: "" },
-    userId: { type: String, trim: true, default: "" },
+    userId: { type: String, trim: true, default: "" }, // string id copy (optional)
     isLocal: { type: Boolean, default: false },
 
-    // computed strength score for seeding
     rating: { type: Number, default: 0 },
     seed: { type: Number, default: 0 },
   },
@@ -22,7 +21,9 @@ const TournamentGroupSchema = new mongoose.Schema(
   {
     id: { type: String, trim: true }, // "A"
     name: { type: String, trim: true }, // "Group A"
-    members: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
+    // ✅ participantKeys (NOT ObjectIds)
+    members: { type: [String], default: [] },
   },
   { _id: false }
 );
@@ -31,10 +32,11 @@ const TournamentMatchSchema = new mongoose.Schema(
   {
     id: { type: String, trim: true }, // g_A_1, po_r1_1 etc.
 
-    teamAId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-    teamBId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    // Optional: set only when teamA/teamB are uid:<mongoId>
+    teamAId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    teamBId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 
-    // participantKey strings (for uid:/un:/nm: or BYE)
+    // ✅ participantKey strings (uid:/un:/nm: or BYE)
     teamA: { type: String, trim: true, default: "" },
     teamB: { type: String, trim: true, default: "" },
 
@@ -98,7 +100,7 @@ const TournamentSchema = new mongoose.Schema(
 
     // Group-stage config
     groupCount: { type: Number, default: 2 },
-    groupSize: { type: Number, default: 0 }, // 0 unused
+    groupSize: { type: Number, default: 0 },
     groupRandomize: { type: Boolean, default: true },
 
     // Qualifiers
@@ -110,14 +112,11 @@ const TournamentSchema = new mongoose.Schema(
     // Matches (group + playoffs)
     matches: { type: [TournamentMatchSchema], default: [] },
 
-    // Used for newly generated playoff rounds
     playoffDefaultVenue: { type: String, trim: true, default: "" },
 
-    // Champion
     championName: { type: String, trim: true, default: "" },
   },
   { timestamps: true }
 );
 
-export default mongoose.models.Tournament ||
-  mongoose.model("Tournament", TournamentSchema);
+export default mongoose.models.Tournament || mongoose.model("Tournament", TournamentSchema);

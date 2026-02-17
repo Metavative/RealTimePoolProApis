@@ -1,4 +1,5 @@
 import Tournament from "../models/tournament.model.js";
+import * as svc from "../services/tournament.service.js";
 
 // -------------------------
 // helpers
@@ -25,8 +26,7 @@ async function loadOwnedTournament(req, res, id, select = "") {
 }
 
 function normUpper(v, fallback) {
-  const s = String(v ?? fallback ?? "").trim().toUpperCase();
-  return s;
+  return String(v ?? fallback ?? "").trim().toUpperCase();
 }
 
 function isActiveStatus(status) {
@@ -35,9 +35,116 @@ function isActiveStatus(status) {
 }
 
 // -------------------------
+// POST /api/tournaments
+// club-only
+// -------------------------
+export async function create(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const title = String(req.body.title || req.body.name || "").trim();
+    const format = String(req.body.format || "group_stage").trim(); // your service supports group_stage/round_robin/knockout/double_elim
+
+    const accessMode = normUpper(req.body.accessMode, "OPEN");
+    const entriesStatus = normUpper(req.body.entriesStatus, "OPEN");
+
+    const groupCount =
+      req.body.groupCount != null ? parseInt(req.body.groupCount, 10) : undefined;
+    const topNPerGroup =
+      req.body.topNPerGroup != null ? parseInt(req.body.topNPerGroup, 10) : undefined;
+
+    const groupRandomize = req.body.groupRandomize != null ? !!req.body.groupRandomize : undefined;
+
+    const playoffDefaultVenue = String(req.body.playoffDefaultVenue || req.body.defaultVenue || "").trim();
+
+    const t = await Tournament.create({
+      clubId: req.clubId,
+      title,
+      format,
+      accessMode,
+      entriesStatus,
+      groupCount: Number.isFinite(groupCount) ? groupCount : undefined,
+      topNPerGroup: Number.isFinite(topNPerGroup) ? topNPerGroup : undefined,
+      groupRandomize: groupRandomize ?? false,
+      playoffDefaultVenue,
+      // status/formatStatus handled by schema defaults
+    });
+
+    return res.status(201).json({ message: "Tournament created", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to create tournament" });
+  }
+}
+
+// -------------------------
+// GET /api/tournaments/my
+// club-only
+// -------------------------
+export async function listMine(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const list = await Tournament.find({ clubId: req.clubId })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    return res.status(200).json({ data: list });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to list tournaments" });
+  }
+}
+
+// -------------------------
+// GET /api/tournaments/:id
+// club-only
+// -------------------------
+export async function getOne(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+    const t = await loadOwnedTournament(req, res, id);
+    if (!t) return;
+
+    return res.status(200).json({ data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to get tournament" });
+  }
+}
+
+// -------------------------
+// PATCH /api/tournaments/:id
+// club-only (basic fields)
+// -------------------------
+export async function patch(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const t = await loadOwnedTournament(req, res, id, "clubId status title format");
+    if (!t) return;
+
+    const status = normUpper(t.status, "DRAFT");
+    if (isActiveStatus(status) || status === "COMPLETED") {
+      return res.status(403).json({ message: "Tournament already started" });
+    }
+
+    if (req.body.title != null) t.title = String(req.body.title || "").trim();
+    if (req.body.format != null) t.format = String(req.body.format || "").trim();
+
+    await t.save();
+    return res.status(200).json({ message: "Tournament updated", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to patch tournament" });
+  }
+}
+
+// -------------------------
 // PATCH /api/tournaments/:id/settings
 // club-only
-// body: { accessMode?, entriesStatus?, groupCount?, topNPerGroup?, groupRandomize?, playoffDefaultVenue?, formatConfig? }
+// (your existing logic; kept and compatible)
 // -------------------------
 export async function patchSettings(req, res) {
   try {
@@ -74,7 +181,6 @@ export async function patchSettings(req, res) {
         return res.status(400).json({ message: "Invalid accessMode" });
       }
 
-      // lock access changes once entries closed / format finalised
       if (isEntriesClosed || isFormatFinalised) {
         return res.status(403).json({
           message: isFormatFinalised
@@ -87,7 +193,6 @@ export async function patchSettings(req, res) {
     }
 
     // ---- entriesStatus (ALLOW ONLY OPEN HERE)
-    // CLOSED should be done via /entries/close endpoint.
     if (req.body.entriesStatus != null) {
       const next = normUpper(req.body.entriesStatus, "");
       if (!["OPEN", "CLOSED"].includes(next)) {
@@ -108,7 +213,6 @@ export async function patchSettings(req, res) {
       }
     }
 
-    // ---- format-related settings are locked once entries closed or format finalised
     const hasFormatSettingsChange =
       req.body.groupCount != null ||
       req.body.topNPerGroup != null ||
@@ -153,7 +257,6 @@ export async function patchSettings(req, res) {
     }
 
     await tournament.save();
-
     return res.status(200).json({ message: "Settings updated", data: tournament });
   } catch (e) {
     return res.status(500).json({ message: e?.message || "Failed to patch settings" });
@@ -162,7 +265,6 @@ export async function patchSettings(req, res) {
 
 // -------------------------
 // POST /api/tournaments/:id/entries/close
-// club-only
 // -------------------------
 export async function closeEntries(req, res) {
   try {
@@ -197,7 +299,6 @@ export async function closeEntries(req, res) {
 
 // -------------------------
 // POST /api/tournaments/:id/entries/open
-// club-only
 // -------------------------
 export async function openEntries(req, res) {
   try {
@@ -236,5 +337,194 @@ export async function openEntries(req, res) {
     return res.status(200).json({ message: "Entries opened", data: tournament });
   } catch (e) {
     return res.status(500).json({ message: e?.message || "Failed to open entries" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/finalise
+// -------------------------
+export async function finaliseFormat(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const t = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
+    if (!t) return;
+
+    const status = normUpper(t.status, "DRAFT");
+    if (isActiveStatus(status) || status === "COMPLETED") {
+      return res.status(403).json({ message: "Tournament already started" });
+    }
+
+    t.formatStatus = "FINALISED";
+    await t.save();
+
+    return res.status(200).json({ message: "Format finalised", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to finalise format" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/entrants
+// Accepts:
+// - { entrants: [ {participantKey,name,username,userId,isLocal} ] }  -> setEntrantsObjects
+// - { entrantIds: [userId...] } or { entrants: [userId...] }         -> setEntrants (seed/rating)
+// -------------------------
+export async function setEntrants(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const entrants = req.body?.entrants;
+    const entrantIds = req.body?.entrantIds;
+
+    // Case A: entrants are objects with participantKey -> store as objects (local + app users)
+    if (Array.isArray(entrants) && entrants.length && typeof entrants[0] === "object") {
+      const t = await svc.setEntrantsObjects(id, entrants);
+      return res.status(200).json({ message: "Entrants saved", data: t });
+    }
+
+    // Case B: entrantIds explicitly provided -> setEntrants seeded/rated (your service expects IDs)
+    const ids = Array.isArray(entrantIds) ? entrantIds : entrants;
+    if (!Array.isArray(ids) || ids.length < 2) {
+      return res.status(400).json({ message: "Provide entrants (objects) or entrantIds (min 2)" });
+    }
+
+    const t = await svc.setEntrants(id, ids);
+    return res.status(200).json({ message: "Entrants saved", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to set entrants" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/groups/generate
+// Uses your service: generateGroupsSeeded(tid, { groupCount, groupSize, randomize })
+// -------------------------
+export async function generateGroups(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const groupCount =
+      req.body?.groupCount != null ? parseInt(req.body.groupCount, 10) : undefined;
+
+    const groupSize =
+      req.body?.groupSize != null ? parseInt(req.body.groupSize, 10) : undefined;
+
+    const randomize = req.body?.randomize != null ? !!req.body.randomize : undefined;
+
+    const t = await svc.generateGroupsSeeded(id, {
+      groupCount,
+      groupSize,
+      randomize,
+    });
+
+    return res.status(200).json({ message: "Groups generated", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to generate groups" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/matches/generate-group
+// Uses your service: generateGroupMatches(tid, { defaultVenue })
+// -------------------------
+export async function generateGroupMatches(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+    const defaultVenue = String(req.body?.defaultVenue || "").trim();
+
+    const t = await svc.generateGroupMatches(id, { defaultVenue });
+    return res.status(200).json({ message: "Group matches generated", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to generate group matches" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/matches/generate
+// Uses your service: generateMatchesForFormat(tid, { format, defaultVenue })
+// -------------------------
+export async function generateMatches(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+    const format = String(req.body?.format || "").trim();
+    const defaultVenue = String(req.body?.defaultVenue || "").trim();
+
+    const t = await svc.generateMatchesForFormat(id, { format, defaultVenue });
+    return res.status(200).json({ message: "Matches generated", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to generate matches" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/playoffs/generate
+// Uses your service: generatePlayoffs(tid, { defaultVenue })
+// -------------------------
+export async function generatePlayoffs(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+    const defaultVenue = String(req.body?.defaultVenue || "").trim();
+
+    const t = await svc.generatePlayoffs(id, { defaultVenue });
+    return res.status(200).json({ message: "Playoffs generated", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to generate playoffs" });
+  }
+}
+
+// -------------------------
+// PATCH /api/tournaments/:id/matches
+// Uses your service: upsertMatch(tid, matchUpdate)
+// -------------------------
+export async function upsertMatch(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+    const t = await svc.upsertMatch(id, req.body);
+    return res.status(200).json({ message: "Match updated", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to update match" });
+  }
+}
+
+// -------------------------
+// POST /api/tournaments/:id/start
+// (your service file doesn't have startTournament, so controller handles it)
+// -------------------------
+export async function startTournament(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const t = await loadOwnedTournament(req, res, id, "clubId status startedAt");
+    if (!t) return;
+
+    const status = normUpper(t.status, "DRAFT");
+    if (isActiveStatus(status) || status === "COMPLETED") {
+      return res.status(403).json({ message: "Tournament already started" });
+    }
+
+    t.status = "ACTIVE";
+    t.startedAt = new Date();
+    await t.save();
+
+    return res.status(200).json({ message: "Tournament started", data: t });
+  } catch (e) {
+    return res.status(500).json({ message: e?.message || "Failed to start tournament" });
   }
 }
