@@ -7,7 +7,7 @@ import * as svc from "../services/tournament.service.js";
 // -------------------------
 function requireClub(req, res) {
   if (req.authType !== "club" || !req.clubId || !req.club) {
-    res.status(403).json({ message: "Club authorization required" });
+    jsonErr(res, "Club authorization required", 403);
     return false;
   }
   return true;
@@ -16,11 +16,11 @@ function requireClub(req, res) {
 async function loadOwnedTournament(req, res, id, select = "") {
   const t = await Tournament.findById(id).select(select || "");
   if (!t) {
-    res.status(404).json({ message: "Tournament not found" });
+    jsonErr(res, "Tournament not found", 404);
     return null;
   }
   if (t.clubId && String(t.clubId) !== String(req.clubId)) {
-    res.status(403).json({ message: "Not allowed for this tournament" });
+    jsonErr(res, "Not allowed for this tournament", 403);
     return null;
   }
   return t;
@@ -68,6 +68,16 @@ function rosterLockMessage(t) {
 function lockStatusCode() {
   // Use 409 Conflict for state-based lockouts
   return 409;
+}
+
+function jsonOk(res, data, code = 200, message) {
+  const payload = { success: true, data };
+  if (message) payload.message = message;
+  return res.status(code).json(payload);
+}
+
+function jsonErr(res, message, code = 400, extra = {}) {
+  return res.status(code).json({ success: false, message, ...extra });
 }
 
 // -------------------------
@@ -274,9 +284,9 @@ export async function create(req, res) {
       // closedAt/closedBy default null in schema
     });
 
-    return res.status(201).json({ message: "Tournament created", data: t });
+    return jsonOk(res, t, 201, "Tournament created");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to create tournament" });
+    return jsonErr(res, e?.message || "Failed to create tournament", 500);
   }
 }
 
@@ -293,9 +303,9 @@ export async function listMine(req, res) {
       .limit(50)
       .lean();
 
-    return res.status(200).json({ data: list });
+    return jsonOk(res, list);
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to list tournaments" });
+    return jsonErr(res, e?.message || "Failed to list tournaments", 500);
   }
 }
 
@@ -311,9 +321,9 @@ export async function getOne(req, res) {
     const t = await loadOwnedTournament(req, res, id);
     if (!t) return;
 
-    return res.status(200).json({ data: t });
+    return jsonOk(res, t);
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to get tournament" });
+    return jsonErr(res, e?.message || "Failed to get tournament", 500);
   }
 }
 
@@ -332,16 +342,16 @@ export async function patch(req, res) {
 
     const status = normUpper(t.status, "DRAFT");
     if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+      return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
     if (req.body.title != null) t.title = String(req.body.title || "").trim();
     if (req.body.format != null) t.format = String(req.body.format || "").trim();
 
     await t.save();
-    return res.status(200).json({ message: "Tournament updated", data: t });
+    return jsonOk(res, t, 200, "Tournament updated");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to patch tournament" });
+    return jsonErr(res, e?.message || "Failed to patch tournament", 500);
   }
 }
 
@@ -372,21 +382,23 @@ export async function patchSettings(req, res) {
     const formatFinalised = formatStatus === "FINALISED";
 
     if (isActive || isCompleted) {
-      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+      return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
     // accessMode
     if (req.body.accessMode != null) {
       const next = normUpper(req.body.accessMode, "");
       if (!["OPEN", "INVITE_ONLY"].includes(next)) {
-        return res.status(400).json({ message: "Invalid accessMode" });
+        return jsonErr(res, "Invalid accessMode", 400);
       }
       if (entriesClosed || formatFinalised) {
-        return res.status(lockStatusCode()).json({
-          message: formatFinalised
+        return jsonErr(
+          res,
+          formatFinalised
             ? "Tournament format is finalised. Settings locked."
             : "Entries are closed for this tournament",
-        });
+          lockStatusCode()
+        );
       }
       tournament.accessMode = next;
     }
@@ -395,21 +407,21 @@ export async function patchSettings(req, res) {
     if (req.body.entriesStatus != null) {
       const next = normUpper(req.body.entriesStatus, "");
       if (!["OPEN", "CLOSED"].includes(next)) {
-        return res.status(400).json({ message: "Invalid entriesStatus" });
+        return jsonErr(res, "Invalid entriesStatus", 400);
       }
       if (next === "OPEN") {
         if (formatFinalised) {
-          return res
-            .status(lockStatusCode())
-            .json({ message: "Tournament format is finalised. Entrants are locked." });
+          return jsonErr(
+            res,
+            "Tournament format is finalised. Entrants are locked.",
+            lockStatusCode()
+          );
         }
         tournament.entriesStatus = "OPEN";
         tournament.closedAt = null;
         tournament.closedBy = null;
       } else {
-        return res.status(400).json({
-          message: "Use /entries/close endpoint to close entries",
-        });
+        return jsonErr(res, "Use /entries/close endpoint to close entries", 400);
       }
     }
 
@@ -421,17 +433,19 @@ export async function patchSettings(req, res) {
       req.body.formatConfig != null;
 
     if ((entriesClosed || formatFinalised) && hasFormatSettingsChange) {
-      return res.status(lockStatusCode()).json({
-        message: formatFinalised
+      return jsonErr(
+        res,
+        formatFinalised
           ? "Tournament format is finalised. Settings locked."
           : "Entries are closed for this tournament",
-      });
+        lockStatusCode()
+      );
     }
 
     if (req.body.groupCount != null) {
       const v = parseInt(req.body.groupCount, 10);
       if (Number.isNaN(v) || v < 2) {
-        return res.status(400).json({ message: "Invalid groupCount" });
+        return jsonErr(res, "Invalid groupCount", 400);
       }
       tournament.groupCount = v;
     }
@@ -439,7 +453,7 @@ export async function patchSettings(req, res) {
     if (req.body.topNPerGroup != null) {
       const v = parseInt(req.body.topNPerGroup, 10);
       if (Number.isNaN(v) || v < 1) {
-        return res.status(400).json({ message: "Invalid topNPerGroup" });
+        return jsonErr(res, "Invalid topNPerGroup", 400);
       }
       tournament.topNPerGroup = v;
     }
@@ -457,9 +471,9 @@ export async function patchSettings(req, res) {
     }
 
     await tournament.save();
-    return res.status(200).json({ message: "Settings updated", data: tournament });
+    return jsonOk(res, tournament, 200, "Settings updated");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to patch settings" });
+    return jsonErr(res, e?.message || "Failed to patch settings", 500);
   }
 }
 
@@ -485,7 +499,7 @@ export async function closeEntries(req, res) {
     const isCompleted = status === "COMPLETED";
 
     if (isActive || isCompleted) {
-      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+      return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
     if (isFormatFinalised(tournament)) {
@@ -494,7 +508,7 @@ export async function closeEntries(req, res) {
     }
 
     if (normUpper(tournament.entriesStatus, "OPEN") === "CLOSED") {
-      return res.status(200).json({ message: "Entries already closed", data: tournament });
+      return jsonOk(res, tournament, 200, "Entries already closed");
     }
 
     tournament.entriesStatus = "CLOSED";
@@ -503,9 +517,9 @@ export async function closeEntries(req, res) {
 
     await tournament.save();
 
-    return res.status(200).json({ message: "Entries closed", data: tournament });
+    return jsonOk(res, tournament, 200, "Entries closed");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to close entries" });
+    return jsonErr(res, e?.message || "Failed to close entries", 500);
   }
 }
 
@@ -531,17 +545,19 @@ export async function openEntries(req, res) {
     const isCompleted = status === "COMPLETED";
 
     if (isActive || isCompleted) {
-      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+      return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
     if (isFormatFinalised(tournament)) {
-      return res
-        .status(lockStatusCode())
-        .json({ message: "Tournament format is finalised. Entrants are locked." });
+      return jsonErr(
+        res,
+        "Tournament format is finalised. Entrants are locked.",
+        lockStatusCode()
+      );
     }
 
     if (normUpper(tournament.entriesStatus, "OPEN") === "OPEN") {
-      return res.status(200).json({ message: "Entries already open", data: tournament });
+      return jsonOk(res, tournament, 200, "Entries already open");
     }
 
     tournament.entriesStatus = "OPEN";
@@ -550,9 +566,9 @@ export async function openEntries(req, res) {
 
     await tournament.save();
 
-    return res.status(200).json({ message: "Entries opened", data: tournament });
+    return jsonOk(res, tournament, 200, "Entries opened");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to open entries" });
+    return jsonErr(res, e?.message || "Failed to open entries", 500);
   }
 }
 
@@ -575,15 +591,15 @@ export async function finaliseFormat(req, res) {
 
     const status = normUpper(t.status, "DRAFT");
     if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+      return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
     t.formatStatus = "FINALISED";
     await t.save();
 
-    return res.status(200).json({ message: "Format finalised", data: t });
+    return jsonOk(res, t, 200, "Format finalised");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to finalise format" });
+    return jsonErr(res, e?.message || "Failed to finalise format", 500);
   }
 }
 
@@ -606,7 +622,7 @@ export async function setEntrants(req, res) {
     if (!lockCheck) return;
 
     if (isLockedForRoster(lockCheck)) {
-      return res.status(lockStatusCode()).json({ message: rosterLockMessage(lockCheck) });
+      return jsonErr(res, rosterLockMessage(lockCheck), lockStatusCode());
     }
 
     const entrants = req.body?.entrants;
@@ -614,20 +630,22 @@ export async function setEntrants(req, res) {
 
     if (Array.isArray(entrants) && entrants.length && typeof entrants[0] === "object") {
       const t = await svc.setEntrantsObjects(id, entrants);
-      return res.status(200).json({ message: "Entrants saved", data: t });
+      return jsonOk(res, t, 200, "Entrants saved");
     }
 
     const ids = Array.isArray(entrantIds) ? entrantIds : entrants;
     if (!Array.isArray(ids) || ids.length < 2) {
-      return res
-        .status(400)
-        .json({ message: "Provide entrants (objects) or entrantIds (min 2)" });
+      return jsonErr(
+        res,
+        "Provide entrants (objects) or entrantIds (min 2)",
+        400
+      );
     }
 
     const t = await svc.setEntrants(id, ids);
-    return res.status(200).json({ message: "Entrants saved", data: t });
+    return jsonOk(res, t, 200, "Entrants saved");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to set entrants" });
+    return jsonErr(res, e?.message || "Failed to set entrants", 500);
   }
 }
 
@@ -645,7 +663,7 @@ export async function generateGroups(req, res) {
     if (!t0) return;
 
     if (isLockedForRoster(t0)) {
-      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t0) });
+      return jsonErr(res, rosterLockMessage(t0), lockStatusCode());
     }
 
     const groupCount =
@@ -655,9 +673,9 @@ export async function generateGroups(req, res) {
     const randomize = req.body?.randomize != null ? !!req.body.randomize : undefined;
 
     const t = await svc.generateGroupsSeeded(id, { groupCount, groupSize, randomize });
-    return res.status(200).json({ message: "Groups generated", data: t });
+    return jsonOk(res, t, 200, "Groups generated");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to generate groups" });
+    return jsonErr(res, e?.message || "Failed to generate groups", 500);
   }
 }
 
@@ -674,15 +692,15 @@ export async function generateGroupMatches(req, res) {
     if (!t0) return;
 
     if (isLockedForRoster(t0)) {
-      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t0) });
+      return jsonErr(res, rosterLockMessage(t0), lockStatusCode());
     }
 
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
 
     const t = await svc.generateGroupMatches(id, { defaultVenue });
-    return res.status(200).json({ message: "Group matches generated", data: t });
+    return jsonOk(res, t, 200, "Group matches generated");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to generate group matches" });
+    return jsonErr(res, e?.message || "Failed to generate group matches", 500);
   }
 }
 
@@ -701,21 +719,23 @@ export async function generateMatches(req, res) {
 
     // Generating matches is a "format action"—lock it when entries closed or finalised
     if (isLockedForRoster(t)) {
-      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t) });
+      return jsonErr(res, rosterLockMessage(t), lockStatusCode());
     }
 
     const format = String(req.body?.format || t.format || "").trim();
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
 
     if (!format) {
-      return res.status(400).json({ message: "Missing format" });
+      return jsonErr(res, "Missing format", 400);
     }
 
     const keys = pickParticipantKeysFromTournament(t);
     if (keys.length < 2) {
-      return res
-        .status(400)
-        .json({ message: "Need at least 2 entrants before generating matches" });
+      return jsonErr(
+        res,
+        "Need at least 2 entrants before generating matches",
+        400
+      );
     }
 
     const entrantIndex = buildEntrantIndex(t);
@@ -734,10 +754,10 @@ export async function generateMatches(req, res) {
     }
 
     const saved = await persistMatches(t, matches);
-    return res.status(200).json({ message: "Matches generated", data: saved });
+    return jsonOk(res, saved, 200, "Matches generated");
   } catch (e) {
     const sc = e?.statusCode || 500;
-    return res.status(sc).json({ message: e?.message || "Failed to generate matches" });
+    return jsonErr(res, e?.message || "Failed to generate matches", sc);
   }
 }
 
@@ -754,15 +774,15 @@ export async function generatePlayoffs(req, res) {
     if (!t0) return;
 
     if (isLockedForRoster(t0)) {
-      return res.status(lockStatusCode()).json({ message: rosterLockMessage(t0) });
+      return jsonErr(res, rosterLockMessage(t0), lockStatusCode());
     }
 
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
 
     const t = await svc.generatePlayoffs(id, { defaultVenue });
-    return res.status(200).json({ message: "Playoffs generated", data: t });
+    return jsonOk(res, t, 200, "Playoffs generated");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to generate playoffs" });
+    return jsonErr(res, e?.message || "Failed to generate playoffs", 500);
   }
 }
 
@@ -777,9 +797,9 @@ export async function upsertMatch(req, res) {
     // So we do NOT block on status here.
     const { id } = req.params;
     const t = await svc.upsertMatch(id, req.body);
-    return res.status(200).json({ message: "Match updated", data: t });
+    return jsonOk(res, t, 200, "Match updated");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to update match" });
+    return jsonErr(res, e?.message || "Failed to update match", 500);
   }
 }
 
@@ -804,15 +824,15 @@ export async function startTournament(req, res) {
 
     const status = normUpper(t.status, "DRAFT");
     if (isActiveStatus(status) || status === "COMPLETED") {
-      return res.status(lockStatusCode()).json({ message: "Tournament already started" });
+      return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
     // Enforce correct flow (recommended)
     if (!isEntriesClosed(t)) {
-      return res.status(400).json({ message: "Close entries before starting" });
+      return jsonErr(res, "Close entries before starting", 400);
     }
     if (!isFormatFinalised(t)) {
-      return res.status(400).json({ message: "Finalise format before starting" });
+      return jsonErr(res, "Finalise format before starting", 400);
     }
 
     // ✅ Ensure matches exist (repair step)
@@ -821,7 +841,7 @@ export async function startTournament(req, res) {
       const format = String(t.format || "").trim();
       const keys = pickParticipantKeysFromTournament(t);
       if (keys.length < 2) {
-        return res.status(400).json({ message: "Need at least 2 entrants before starting" });
+        return jsonErr(res, "Need at least 2 entrants before starting", 400);
       }
 
       const entrantIndex = buildEntrantIndex(t);
@@ -843,13 +863,13 @@ export async function startTournament(req, res) {
       await persistMatches(t, matches);
       // reload for consistent return
       const reloaded = await Tournament.findById(id);
-      if (!reloaded) return res.status(404).json({ message: "Tournament not found" });
+      if (!reloaded) return jsonErr(res, "Tournament not found", 404);
 
       reloaded.status = "ACTIVE";
       reloaded.startedAt = new Date();
       await reloaded.save();
 
-      return res.status(200).json({ message: "Tournament started", data: reloaded });
+      return jsonOk(res, reloaded, 200, "Tournament started");
     }
 
     // Matches already exist -> just start
@@ -857,8 +877,8 @@ export async function startTournament(req, res) {
     t.startedAt = new Date();
     await t.save();
 
-    return res.status(200).json({ message: "Tournament started", data: t });
+    return jsonOk(res, t, 200, "Tournament started");
   } catch (e) {
-    return res.status(500).json({ message: e?.message || "Failed to start tournament" });
+    return jsonErr(res, e?.message || "Failed to start tournament", 500);
   }
 }
