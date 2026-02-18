@@ -1,14 +1,11 @@
 // src/routes/tournament.routes.js
 import express from "express";
 import { clubAuthMiddleware } from "../middleware/clubAuthMiddleware.js";
-import * as c from "../controllers/tournamentController.js";
+import * as c from "../controllers/tournamentController.js"; // ✅ FIXED import
 
 const router = express.Router();
 
-// ✅ FIX: Flutter is calling GET /api/tournaments?scope=club
-// Your router previously had no GET "/" route, so Express returned:
-// "Cannot GET /api/tournaments" (404 HTML)
-// This makes GET "/" behave like your existing "listMine".
+// ✅ Flutter calling GET /api/tournaments?scope=club
 router.get("/", clubAuthMiddleware, c.listMine);
 
 // Create tournament
@@ -35,13 +32,9 @@ router.post("/:id/entrants", clubAuthMiddleware, c.setEntrants);
 router.post("/:id/groups/generate", clubAuthMiddleware, c.generateGroups);
 
 // Group matches
-router.post(
-  "/:id/matches/generate-group",
-  clubAuthMiddleware,
-  c.generateGroupMatches
-);
+router.post("/:id/matches/generate-group", clubAuthMiddleware, c.generateGroupMatches);
 
-// Generate matches for any format (✅ persists and supports double_elim)
+// Generate matches for any format
 router.post("/:id/matches/generate", clubAuthMiddleware, c.generateMatches);
 
 // Playoffs

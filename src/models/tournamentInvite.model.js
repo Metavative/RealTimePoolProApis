@@ -4,7 +4,9 @@ const { Schema } = mongoose;
 const TournamentInviteSchema = new Schema(
   {
     tournamentId: { type: Schema.Types.ObjectId, ref: "Tournament", required: true, index: true },
-    organizerId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+
+    // ✅ FIX: this is a club id in your controller (req.clubId)
+    organizerId: { type: Schema.Types.ObjectId, ref: "Club", required: true, index: true },
 
     toUserId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     toUsername: { type: String, required: true, trim: true, index: true },

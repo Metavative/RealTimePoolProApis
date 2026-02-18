@@ -60,6 +60,9 @@ const TournamentSchema = new mongoose.Schema(
 
     title: { type: String, trim: true, default: "" },
 
+    // ✅ Used by controller + Flutter for match generation defaults
+    defaultVenue: { type: String, trim: true, default: "" },
+
     accessMode: {
       type: String,
       enum: ["OPEN", "INVITE_ONLY"],
@@ -72,7 +75,7 @@ const TournamentSchema = new mongoose.Schema(
       default: "OPEN",
     },
 
-    // ✅ NEW: close metadata (club closes entries)
+    // ✅ Close metadata
     closedAt: { type: Date, default: null },
     closedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Club", default: null },
 
@@ -84,13 +87,14 @@ const TournamentSchema = new mongoose.Schema(
 
     formatConfig: { type: Object, default: {} },
 
+    // ✅ Add LIVE for compatibility with Flutter checks (you can still only set ACTIVE)
     status: {
       type: String,
-      enum: ["DRAFT", "ACTIVE", "COMPLETED"],
+      enum: ["DRAFT", "ACTIVE", "LIVE", "COMPLETED"],
       default: "DRAFT",
     },
 
-    startedAt: { type: Date },
+    startedAt: { type: Date, default: null },
 
     format: {
       type: String,
@@ -104,11 +108,17 @@ const TournamentSchema = new mongoose.Schema(
 
     // Group-stage config
     groupCount: { type: Number, default: 2 },
-    groupSize: { type: Number, default: 0 },
+    groupSize: { type: Number, default: 0 }, // legacy ok
     groupRandomize: { type: Boolean, default: true },
+
+    // Optional but handy (Flutter local config uses it)
+    groupBalanced: { type: Boolean, default: true },
 
     // Qualifiers
     topNPerGroup: { type: Number, default: 1 },
+
+    // ✅ Flutter/controller create uses this for group_stage tournaments
+    enableKnockoutStage: { type: Boolean, default: true },
 
     // Generated group assignments
     groups: { type: [TournamentGroupSchema], default: [] },
