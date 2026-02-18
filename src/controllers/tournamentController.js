@@ -1,3 +1,4 @@
+// controllers/tournament.controller.js (or wherever this file lives)
 import Tournament from "../models/tournament.model.js";
 import * as svc from "../services/tournament.service.js";
 
@@ -56,8 +57,10 @@ function isLockedForRoster(t) {
 }
 
 function rosterLockMessage(t) {
-  if (isActiveStatus(t.status) || isCompletedStatus(t.status)) return "Tournament already started";
-  if (isFormatFinalised(t)) return "Tournament format is finalised. Entrants are locked.";
+  if (isActiveStatus(t.status) || isCompletedStatus(t.status))
+    return "Tournament already started";
+  if (isFormatFinalised(t))
+    return "Tournament format is finalised. Entrants are locked.";
   if (isEntriesClosed(t)) return "Entries are closed for this tournament";
   return "Tournament is locked";
 }
@@ -106,13 +109,9 @@ function makeMatch({ id, teamA, teamB, venue, entrantIndex }) {
   const bKey = String(teamB || "").trim();
 
   const aName =
-    aKey.toUpperCase() === "BYE"
-      ? "BYE"
-      : (entrantIndex.get(aKey)?.name || "");
+    aKey.toUpperCase() === "BYE" ? "BYE" : (entrantIndex.get(aKey)?.name || "");
   const bName =
-    bKey.toUpperCase() === "BYE"
-      ? "BYE"
-      : (entrantIndex.get(bKey)?.name || "");
+    bKey.toUpperCase() === "BYE" ? "BYE" : (entrantIndex.get(bKey)?.name || "");
 
   return {
     id: String(id || "").trim(),
@@ -579,11 +578,6 @@ export async function finaliseFormat(req, res) {
       return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
 
-    // If you want to force close entries when finalising (recommended), uncomment:
-    // t.entriesStatus = "CLOSED";
-    // t.closedAt = t.closedAt || new Date();
-    // t.closedBy = t.closedBy || req.clubId;
-
     t.formatStatus = "FINALISED";
     await t.save();
 
@@ -791,6 +785,7 @@ export async function upsertMatch(req, res) {
 
 // -------------------------
 // POST /api/tournaments/:id/start
+// ✅ FIX: Start guarantees matches exist before ACTIVE
 // -------------------------
 export async function startTournament(req, res) {
   try {
@@ -798,11 +793,12 @@ export async function startTournament(req, res) {
 
     const { id } = req.params;
 
+    // Load everything needed to generate matches if missing
     const t = await loadOwnedTournament(
       req,
       res,
       id,
-      "clubId status startedAt entriesStatus formatStatus"
+      "clubId status startedAt entriesStatus formatStatus format entrants groups matches playoffDefaultVenue"
     );
     if (!t) return;
 
@@ -811,12 +807,52 @@ export async function startTournament(req, res) {
       return res.status(lockStatusCode()).json({ message: "Tournament already started" });
     }
 
-    // Recommended: must have entries closed OR format finalised before start
-    // If you want to enforce it, uncomment below:
-    // if (!isEntriesClosed(t) && !isFormatFinalised(t)) {
-    //   return res.status(400).json({ message: "Close entries or finalise format before starting" });
-    // }
+    // Enforce correct flow (recommended)
+    if (!isEntriesClosed(t)) {
+      return res.status(400).json({ message: "Close entries before starting" });
+    }
+    if (!isFormatFinalised(t)) {
+      return res.status(400).json({ message: "Finalise format before starting" });
+    }
 
+    // ✅ Ensure matches exist (repair step)
+    const hasServerMatches = Array.isArray(t.matches) && t.matches.length > 0;
+    if (!hasServerMatches) {
+      const format = String(t.format || "").trim();
+      const keys = pickParticipantKeysFromTournament(t);
+      if (keys.length < 2) {
+        return res.status(400).json({ message: "Need at least 2 entrants before starting" });
+      }
+
+      const entrantIndex = buildEntrantIndex(t);
+      const venue = String(t.playoffDefaultVenue || "").trim();
+
+      let matches = [];
+      if (format === "round_robin") {
+        matches = rrMatches(keys, venue, entrantIndex);
+      } else if (format === "knockout") {
+        matches = koMatches(keys, venue, entrantIndex);
+      } else if (format === "group_stage") {
+        matches = groupStageMatchesFromGroups(t, venue, entrantIndex);
+      } else if (format === "double_elim") {
+        matches = deMatchesWinnersR1(keys, venue, entrantIndex);
+      } else {
+        matches = rrMatches(keys, venue, entrantIndex);
+      }
+
+      await persistMatches(t, matches);
+      // reload for consistent return
+      const reloaded = await Tournament.findById(id);
+      if (!reloaded) return res.status(404).json({ message: "Tournament not found" });
+
+      reloaded.status = "ACTIVE";
+      reloaded.startedAt = new Date();
+      await reloaded.save();
+
+      return res.status(200).json({ message: "Tournament started", data: reloaded });
+    }
+
+    // Matches already exist -> just start
     t.status = "ACTIVE";
     t.startedAt = new Date();
     await t.save();
