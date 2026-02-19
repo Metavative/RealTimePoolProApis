@@ -35,6 +35,7 @@ import tournamentRoutes from "./routes/tournament.route.js";
 
 import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
 import clubOwnerRoutes from "./routes/clubOwner.route.js";
+import storeRoutes from "./routes/store.route.js";
 
 dotenv.config();
 
@@ -96,6 +97,9 @@ app.use("/api/zego", zegoRoutes);
 
 // ✅ Tournament routes (club-auth)
 app.use("/api/tournaments", tournamentRoutes);
+
+// Store routes (user auth for me/*, purchase, equip)
+app.use("/api/store", storeRoutes);
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {
