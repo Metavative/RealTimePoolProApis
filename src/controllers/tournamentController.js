@@ -1,4 +1,4 @@
-// src/controllers/tournament.controller.js
+// src/controllers/tournamentController.js
 import Tournament from "../models/tournament.model.js";
 import * as svc from "../services/tournament.service.js";
 
@@ -62,6 +62,59 @@ function toInt(v, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function getEntrantKeys(t) {
+  const keys = Array.isArray(t?.entrants)
+    ? t.entrants
+        .map((e) => String(e.participantKey || "").trim())
+        .filter(Boolean)
+    : [];
+  // unique
+  return Array.from(new Set(keys));
+}
+
+function getConfiguredFormatConfig(t) {
+  const fc = t?.formatConfig || {};
+  return {
+    groupCount: toInt(fc.groupCount, toInt(t.groupCount, 2)),
+    qualifiersPerGroup: toInt(fc.qualifiersPerGroup, toInt(t.topNPerGroup, 1)),
+    knockoutType: String(fc.knockoutType || "SINGLE_ELIM").trim() || "SINGLE_ELIM",
+    thirdPlacePlayoff: !!fc.thirdPlacePlayoff,
+    groupRandomize: fc.groupRandomize != null ? !!fc.groupRandomize : !!t.groupRandomize,
+    groupBalanced: fc.groupBalanced != null ? !!fc.groupBalanced : !!t.groupBalanced,
+    enableKnockoutStage:
+      fc.enableKnockoutStage != null ? !!fc.enableKnockoutStage : !!t.enableKnockoutStage,
+  };
+}
+
+function validateFormatConfig({ groupCount, qualifiersPerGroup }, entrantCount) {
+  const issues = [];
+
+  if (!Number.isFinite(groupCount) || groupCount < 1) issues.push("groupCount must be >= 1");
+  if (!Number.isFinite(qualifiersPerGroup) || qualifiersPerGroup < 1)
+    issues.push("qualifiersPerGroup must be >= 1");
+
+  if (Number.isFinite(groupCount) && groupCount > entrantCount) {
+    issues.push("groupCount cannot exceed number of entrants");
+  }
+
+  // Must have at least 2 entrants overall
+  if (entrantCount < 2) issues.push("Need at least 2 entrants");
+
+  // If groupCount is 1, qualifiersPerGroup cannot exceed entrants
+  if (groupCount === 1 && qualifiersPerGroup > entrantCount) {
+    issues.push("qualifiersPerGroup cannot exceed entrants");
+  }
+
+  // If groupCount > 1, rough sanity: at least one player per group
+  if (groupCount > 1 && entrantCount < groupCount) {
+    issues.push("Not enough entrants for the selected groupCount");
+  }
+
+  // ensure at least 2 qualifiers total if knockout stage is expected
+  // (we keep it soft: allow 1 qualifier total if user disables knockout later)
+  return issues;
+}
+
 // -------------------------
 // POST /api/tournaments
 // -------------------------
@@ -118,7 +171,7 @@ export async function create(req, res) {
 }
 
 // -------------------------
-// GET /api/tournaments/my  (and GET /api/tournaments/ via routes)
+// GET /api/tournaments/my
 // -------------------------
 export async function listMine(req, res) {
   try {
@@ -170,7 +223,7 @@ export async function patch(req, res) {
     }
 
     if (req.body.title != null) t.title = String(req.body.title || "").trim();
-    if (req.body.format !=null) t.format = String(req.body.format || "").trim();
+    if (req.body.format != null) t.format = String(req.body.format || "").trim();
 
     await t.save();
     return jsonOk(res, t, 200, "Tournament updated");
@@ -181,6 +234,7 @@ export async function patch(req, res) {
 
 // -------------------------
 // PATCH /api/tournaments/:id/settings
+// NOTE: formatConfig is now set via /format/configure ONLY
 // -------------------------
 export async function patchSettings(req, res) {
   try {
@@ -192,7 +246,7 @@ export async function patchSettings(req, res) {
       req,
       res,
       id,
-      "clubId status accessMode entriesStatus formatStatus format groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage defaultVenue playoffDefaultVenue formatConfig closedAt closedBy"
+      "clubId status accessMode entriesStatus formatStatus format groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage defaultVenue playoffDefaultVenue closedAt closedBy formatConfig"
     );
     if (!tournament) return;
 
@@ -235,11 +289,7 @@ export async function patchSettings(req, res) {
       }
       if (next === "OPEN") {
         if (formatFinalised) {
-          return jsonErr(
-            res,
-            "Tournament format is finalised. Entrants are locked.",
-            lockStatusCode()
-          );
+          return jsonErr(res, "Tournament format is finalised. Entrants are locked.", lockStatusCode());
         }
         tournament.entriesStatus = "OPEN";
         tournament.closedAt = null;
@@ -249,6 +299,7 @@ export async function patchSettings(req, res) {
       }
     }
 
+    // Settings that should NOT change after entries are closed OR format finalised
     const hasFormatSettingsChange =
       req.body.groupCount != null ||
       req.body.topNPerGroup != null ||
@@ -256,8 +307,7 @@ export async function patchSettings(req, res) {
       req.body.groupBalanced != null ||
       req.body.enableKnockoutStage != null ||
       req.body.defaultVenue != null ||
-      req.body.playoffDefaultVenue != null ||
-      req.body.formatConfig != null;
+      req.body.playoffDefaultVenue != null;
 
     if ((entriesClosed || formatFinalised) && hasFormatSettingsChange) {
       return jsonErr(
@@ -271,7 +321,7 @@ export async function patchSettings(req, res) {
 
     if (req.body.groupCount != null) {
       const v = toInt(req.body.groupCount, NaN);
-      if (Number.isNaN(v) || v < 2) return jsonErr(res, "Invalid groupCount", 400);
+      if (Number.isNaN(v) || v < 1) return jsonErr(res, "Invalid groupCount", 400);
       tournament.groupCount = v;
     }
 
@@ -294,8 +344,9 @@ export async function patchSettings(req, res) {
       tournament.playoffDefaultVenue = String(req.body.playoffDefaultVenue || "").trim();
     }
 
-    if (req.body.formatConfig != null && typeof req.body.formatConfig === "object") {
-      tournament.formatConfig = req.body.formatConfig;
+    // 🚫 Do NOT allow patchSettings to set formatConfig anymore (Step 3 ownership)
+    if (req.body.formatConfig != null) {
+      return jsonErr(res, "Use /format/configure to set formatConfig", 400);
     }
 
     await tournament.save();
@@ -365,11 +416,7 @@ export async function openEntries(req, res) {
     }
 
     if (isFormatFinalised(tournament)) {
-      return jsonErr(
-        res,
-        "Tournament format is finalised. Entrants are locked.",
-        lockStatusCode()
-      );
+      return jsonErr(res, "Tournament format is finalised. Entrants are locked.", lockStatusCode());
     }
 
     if (normUpper(tournament.entriesStatus, "OPEN") === "OPEN") {
@@ -380,6 +427,10 @@ export async function openEntries(req, res) {
     tournament.closedAt = null;
     tournament.closedBy = null;
 
+    // If organiser re-opens entries, make format flow go back to DRAFT
+    // (keeps logic clean, avoids stale configured format)
+    tournament.formatStatus = "DRAFT";
+
     await tournament.save();
     return jsonOk(res, tournament, 200, "Entries opened");
   } catch (e) {
@@ -387,9 +438,103 @@ export async function openEntries(req, res) {
   }
 }
 
-// -------------------------
-// POST /api/tournaments/:id/finalise
-// -------------------------
+// =========================================================
+// ✅ STEP 3A: Configure Format
+// POST /api/tournaments/:id/format/configure
+// =========================================================
+export async function configureFormat(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const t = await loadOwnedTournament(
+      req,
+      res,
+      id,
+      "clubId status entriesStatus formatStatus entrants groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage formatConfig"
+    );
+    if (!t) return;
+
+    const status = normUpper(t.status, "DRAFT");
+    if (isActiveStatus(status) || status === "COMPLETED") {
+      return jsonErr(res, "Tournament already started", lockStatusCode());
+    }
+
+    if (!isEntriesClosed(t)) {
+      return jsonErr(res, "Close entries first", 400);
+    }
+
+    const fStatus = normUpper(t.formatStatus, "DRAFT");
+    if (fStatus === "FINALISED") {
+      return jsonErr(res, "Tournament format is finalised. Locked.", lockStatusCode());
+    }
+
+    const keys = getEntrantKeys(t);
+    const entrantCount = keys.length;
+
+    const body = req.body || {};
+    const groupCount = toInt(body.groupCount, undefined);
+    const qualifiersPerGroup = toInt(body.qualifiersPerGroup, undefined);
+
+    const knockoutType = String(body.knockoutType || "SINGLE_ELIM").trim().toUpperCase();
+    const thirdPlacePlayoff = body.thirdPlacePlayoff != null ? !!body.thirdPlacePlayoff : false;
+
+    const groupRandomize = body.groupRandomize != null ? !!body.groupRandomize : t.groupRandomize;
+    const groupBalanced = body.groupBalanced != null ? !!body.groupBalanced : t.groupBalanced;
+    const enableKnockoutStage =
+      body.enableKnockoutStage != null ? !!body.enableKnockoutStage : t.enableKnockoutStage;
+
+    const effectiveGroupCount = Number.isFinite(groupCount) ? groupCount : toInt(t.groupCount, 2);
+    const effectiveQualifiers = Number.isFinite(qualifiersPerGroup)
+      ? qualifiersPerGroup
+      : toInt(t.topNPerGroup, 1);
+
+    const issues = validateFormatConfig(
+      { groupCount: effectiveGroupCount, qualifiersPerGroup: effectiveQualifiers },
+      entrantCount
+    );
+
+    if (!["SINGLE_ELIM"].includes(knockoutType)) {
+      issues.push("Invalid knockoutType");
+    }
+
+    if (issues.length) {
+      return jsonErr(res, "Invalid format configuration", 400, { issues });
+    }
+
+    // ✅ Persist to formatConfig (Step 3 canonical)
+    t.formatConfig = {
+      groupCount: effectiveGroupCount,
+      qualifiersPerGroup: effectiveQualifiers,
+      knockoutType,
+      thirdPlacePlayoff,
+      groupRandomize,
+      groupBalanced,
+      enableKnockoutStage,
+    };
+
+    // ✅ Keep legacy fields aligned (services + Flutter already depend on these)
+    t.groupCount = effectiveGroupCount;
+    t.topNPerGroup = effectiveQualifiers;
+    t.groupRandomize = groupRandomize;
+    t.groupBalanced = groupBalanced;
+    t.enableKnockoutStage = enableKnockoutStage;
+
+    t.formatStatus = "CONFIGURED";
+    await t.save();
+
+    return jsonOk(res, t, 200, "Format configured");
+  } catch (e) {
+    return jsonErr(res, e?.message || "Failed to configure format", 500);
+  }
+}
+
+// =========================================================
+// ✅ STEP 3B: Finalise Format (generates groups + matches)
+// POST /api/tournaments/:id/format/finalise
+// (also used by POST /:id/finalise alias in routes)
+// =========================================================
 export async function finaliseFormat(req, res) {
   try {
     if (!requireClub(req, res)) return;
@@ -400,7 +545,7 @@ export async function finaliseFormat(req, res) {
       req,
       res,
       id,
-      "clubId status entriesStatus formatStatus"
+      "clubId status entriesStatus formatStatus format entrants groups matches defaultVenue playoffDefaultVenue groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage formatConfig championName"
     );
     if (!t) return;
 
@@ -409,15 +554,95 @@ export async function finaliseFormat(req, res) {
       return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
-    // ✅ Enforce step order
     if (!isEntriesClosed(t)) {
       return jsonErr(res, "Close entries first", 400);
     }
 
-    t.formatStatus = "FINALISED";
-    await t.save();
+    const keys = getEntrantKeys(t);
+    if (keys.length < 2) {
+      return jsonErr(res, "Need at least 2 entrants", 400);
+    }
 
-    return jsonOk(res, t, 200, "Format finalised");
+    const fStatus = normUpper(t.formatStatus, "DRAFT");
+
+    // Backwards compatibility:
+    // If still DRAFT, allow finalise to auto-configure from legacy fields once.
+    if (fStatus === "DRAFT") {
+      const cfg = getConfiguredFormatConfig(t);
+      const issues = validateFormatConfig(
+        { groupCount: cfg.groupCount, qualifiersPerGroup: cfg.qualifiersPerGroup },
+        keys.length
+      );
+      if (issues.length) return jsonErr(res, "Configure format first", 400, { issues });
+
+      t.formatConfig = {
+        groupCount: cfg.groupCount,
+        qualifiersPerGroup: cfg.qualifiersPerGroup,
+        knockoutType: cfg.knockoutType,
+        thirdPlacePlayoff: cfg.thirdPlacePlayoff,
+        groupRandomize: cfg.groupRandomize,
+        groupBalanced: cfg.groupBalanced,
+        enableKnockoutStage: cfg.enableKnockoutStage,
+      };
+      t.formatStatus = "CONFIGURED";
+      await t.save();
+    } else if (fStatus === "FINALISED") {
+      return jsonOk(res, t, 200, "Format already finalised");
+    } else if (fStatus !== "CONFIGURED") {
+      return jsonErr(res, "Invalid formatStatus state", 400);
+    }
+
+    // Reload after potential auto-config
+    const t2 = await Tournament.findById(id);
+    if (!t2) return jsonErr(res, "Tournament not found", 404);
+
+    const cfg2 = getConfiguredFormatConfig(t2);
+    const issues2 = validateFormatConfig(
+      { groupCount: cfg2.groupCount, qualifiersPerGroup: cfg2.qualifiersPerGroup },
+      keys.length
+    );
+    if (issues2.length) {
+      return jsonErr(res, "Invalid format configuration", 400, { issues: issues2 });
+    }
+
+    // ✅ Deterministic generation happens here:
+    // clear generated data first (safe because not active yet)
+    t2.groups = [];
+    t2.matches = [];
+    t2.championName = "";
+
+    // keep legacy aligned again (defensive)
+    t2.groupCount = cfg2.groupCount;
+    t2.topNPerGroup = cfg2.qualifiersPerGroup;
+    t2.groupRandomize = cfg2.groupRandomize;
+    t2.groupBalanced = cfg2.groupBalanced;
+    t2.enableKnockoutStage = cfg2.enableKnockoutStage;
+
+    await t2.save();
+
+    // Generate groups for group_stage format
+    const format = String(t2.format || "").trim();
+    const venue = String(t2.defaultVenue || t2.playoffDefaultVenue || "").trim();
+
+    if (format === "group_stage") {
+      await svc.generateGroupsSeeded(id, {
+        groupCount: cfg2.groupCount,
+        groupSize: undefined,
+        randomize: cfg2.groupRandomize,
+      });
+    }
+
+    // Ensure matches exist (group + playoffs as per your existing service behavior)
+    await svc.generateMatchesForFormat(id, { format, defaultVenue: venue });
+
+    // Mark finalised last
+    const finalReload = await Tournament.findById(id);
+    if (!finalReload) return jsonErr(res, "Tournament not found", 404);
+
+    finalReload.formatStatus = "FINALISED";
+    await finalReload.save();
+
+    return jsonOk(res, finalReload, 200, "Format finalised");
   } catch (e) {
     return jsonErr(res, e?.message || "Failed to finalise format", 500);
   }
@@ -440,7 +665,6 @@ export async function setEntrants(req, res) {
     );
     if (!lockCheck) return;
 
-    // roster lock
     const locked =
       normUpper(lockCheck.status, "DRAFT") === "ACTIVE" ||
       normUpper(lockCheck.status, "DRAFT") === "COMPLETED" ||
@@ -618,7 +842,7 @@ export async function upsertMatch(req, res) {
     if (!requireClub(req, res)) return;
 
     const { id } = req.params;
-    const t = await svc.upsertMatch(id, req.body); // ✅ service now enforces ACTIVE locks
+    const t = await svc.upsertMatch(id, req.body); // ✅ service enforces ACTIVE locks
     return jsonOk(res, t, 200, "Match updated");
   } catch (e) {
     return jsonErr(res, e?.message || "Failed to update match", 500);
@@ -652,7 +876,7 @@ export async function startTournament(req, res) {
     if (!isEntriesClosed(t)) issues.push("Close entries before starting");
     if (!isFormatFinalised(t)) issues.push("Finalise format before starting");
 
-    const keys = Array.isArray(t.entrants) ? t.entrants.map(e => String(e.participantKey||"").trim()).filter(Boolean) : [];
+    const keys = getEntrantKeys(t);
     if (keys.length < 2) issues.push("Need at least 2 entrants");
 
     const format = String(t.format || "").trim();
@@ -667,7 +891,6 @@ export async function startTournament(req, res) {
       return jsonErr(res, "Tournament not ready", 400, { issues });
     }
 
-    // ✅ Ensure matches exist (generate if missing)
     const hasMatches = Array.isArray(t.matches) && t.matches.length > 0;
     if (!hasMatches) {
       const venue = String(t.defaultVenue || t.playoffDefaultVenue || "").trim();

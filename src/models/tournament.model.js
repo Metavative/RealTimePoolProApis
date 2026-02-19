@@ -21,9 +21,7 @@ const TournamentGroupSchema = new mongoose.Schema(
   {
     id: { type: String, trim: true }, // "A"
     name: { type: String, trim: true }, // "Group A"
-
-    // ✅ participantKeys (NOT ObjectIds)
-    members: { type: [String], default: [] },
+    members: { type: [String], default: [] }, // participantKeys
   },
   { _id: false }
 );
@@ -32,12 +30,10 @@ const TournamentMatchSchema = new mongoose.Schema(
   {
     id: { type: String, trim: true }, // g_A_1, po_r1_1 etc.
 
-    // Optional: set only when teamA/teamB are uid:<mongoId>
     teamAId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     teamBId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 
-    // ✅ participantKey strings (uid:/un:/nm: or BYE)
-    teamA: { type: String, trim: true, default: "" },
+    teamA: { type: String, trim: true, default: "" }, // participantKey or BYE
     teamB: { type: String, trim: true, default: "" },
 
     teamAName: { type: String, trim: true, default: "" },
@@ -54,13 +50,35 @@ const TournamentMatchSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ✅ Step 3: structured formatConfig (still stored under tournament.formatConfig)
+const TournamentFormatConfigSchema = new mongoose.Schema(
+  {
+    // organizer picks
+    groupCount: { type: Number, default: 2 },
+    qualifiersPerGroup: { type: Number, default: 1 },
+
+    knockoutType: {
+      type: String,
+      enum: ["SINGLE_ELIM"],
+      default: "SINGLE_ELIM",
+    },
+
+    thirdPlacePlayoff: { type: Boolean, default: false },
+
+    // optional knobs (kept for compatibility)
+    groupRandomize: { type: Boolean, default: true },
+    groupBalanced: { type: Boolean, default: true },
+    enableKnockoutStage: { type: Boolean, default: true },
+  },
+  { _id: false }
+);
+
 const TournamentSchema = new mongoose.Schema(
   {
     clubId: { type: mongoose.Schema.Types.ObjectId, ref: "Club", index: true },
 
     title: { type: String, trim: true, default: "" },
 
-    // ✅ Used by controller + Flutter for match generation defaults
     defaultVenue: { type: String, trim: true, default: "" },
 
     accessMode: {
@@ -75,19 +93,19 @@ const TournamentSchema = new mongoose.Schema(
       default: "OPEN",
     },
 
-    // ✅ Close metadata
     closedAt: { type: Date, default: null },
     closedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Club", default: null },
 
+    // ✅ Step 3: DRAFT → CONFIGURED → FINALISED
     formatStatus: {
       type: String,
-      enum: ["DRAFT", "FINALISED"],
+      enum: ["DRAFT", "CONFIGURED", "FINALISED"],
       default: "DRAFT",
     },
 
-    formatConfig: { type: Object, default: {} },
+    // ✅ Step 3: typed config (instead of plain Object)
+    formatConfig: { type: TournamentFormatConfigSchema, default: () => ({}) },
 
-    // ✅ Add LIVE for compatibility with Flutter checks (you can still only set ACTIVE)
     status: {
       type: String,
       enum: ["DRAFT", "ACTIVE", "LIVE", "COMPLETED"],
@@ -103,27 +121,17 @@ const TournamentSchema = new mongoose.Schema(
       index: true,
     },
 
-    // Entrants (persisted)
     entrants: { type: [TournamentEntrantSchema], default: [] },
 
-    // Group-stage config
+    // legacy/compat (services + Flutter already use these)
     groupCount: { type: Number, default: 2 },
-    groupSize: { type: Number, default: 0 }, // legacy ok
+    groupSize: { type: Number, default: 0 },
     groupRandomize: { type: Boolean, default: true },
-
-    // Optional but handy (Flutter local config uses it)
     groupBalanced: { type: Boolean, default: true },
-
-    // Qualifiers
     topNPerGroup: { type: Number, default: 1 },
-
-    // ✅ Flutter/controller create uses this for group_stage tournaments
     enableKnockoutStage: { type: Boolean, default: true },
 
-    // Generated group assignments
     groups: { type: [TournamentGroupSchema], default: [] },
-
-    // Matches (group + playoffs)
     matches: { type: [TournamentMatchSchema], default: [] },
 
     playoffDefaultVenue: { type: String, trim: true, default: "" },

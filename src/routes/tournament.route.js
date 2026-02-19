@@ -1,7 +1,7 @@
 // src/routes/tournament.routes.js
 import express from "express";
 import { clubAuthMiddleware } from "../middleware/clubAuthMiddleware.js";
-import * as c from "../controllers/tournamentController.js"; // ✅ FIXED import
+import * as c from "../controllers/tournamentController.js";
 
 const router = express.Router();
 
@@ -23,6 +23,11 @@ router.patch("/:id/settings", clubAuthMiddleware, c.patchSettings);
 router.post("/:id/entries/close", clubAuthMiddleware, c.closeEntries);
 router.post("/:id/entries/open", clubAuthMiddleware, c.openEntries);
 
+// ✅ Step 3: Format configure/finalise
+router.post("/:id/format/configure", clubAuthMiddleware, c.configureFormat);
+router.post("/:id/format/finalise", clubAuthMiddleware, c.finaliseFormat);
+
+// ✅ Backwards compatible alias (previous endpoint used by Flutter)
 router.post("/:id/finalise", clubAuthMiddleware, c.finaliseFormat);
 
 // Entrants
