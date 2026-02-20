@@ -678,31 +678,83 @@ function computeGroupStandings(t) {
   return out;
 }
 
+/**
+ * ✅ Group stage complete when all group matches (g_*) are played.
+ */
+export async function isGroupStageComplete(tournamentId) {
+  const t = await Tournament.findById(tournamentId).lean();
+  if (!t) throw new Error("Tournament not found");
+
+  const groupMatches = (t.matches || []).filter((m) => isGroupMatchId(m.id));
+  if (!groupMatches.length) return false;
+
+  return groupMatches.every((m) => m.status === "played");
+}
+
 // ------------------------------
-// Playoffs generation
+// Playoffs generation (ACTIVE-safe: allowed during ACTIVE/LIVE when format FINALISED)
 // ------------------------------
-export async function generatePlayoffs(tournamentId, { defaultVenue }) {
+export async function generatePlayoffs(tournamentId, { defaultVenue, force = false }) {
   const t = await Tournament.findById(tournamentId);
   if (!t) throw new Error("Tournament not found");
 
-  assertNotStartedOrCompleted(t);
-  assertFormatNotFinalised(t);
-
-  if (t.format !== "group_stage") throw new Error("Tournament is not group_stage");
-  if (!t.groups || t.groups.length === 0) throw new Error("Groups not generated");
-
-  t.playoffDefaultVenue = String(defaultVenue || "").trim();
-
-  const hasGroupMatches = (t.matches || []).some((m) => isGroupMatchId(m.id));
-  if (!hasGroupMatches) {
-    await generateGroupMatches(tournamentId, { defaultVenue });
-    const fresh = await Tournament.findById(tournamentId);
-    if (!fresh) throw new Error("Tournament not found after group match generation");
-    t.groups = fresh.groups;
-    t.matches = fresh.matches;
-    t.entrants = fresh.entrants;
+  // ✅ Playoffs are a LIVE operation
+  const status = normUpper(t.status, "DRAFT");
+  if (!(status === "ACTIVE" || status === "LIVE")) {
+    const err = new Error("Playoffs can only be generated after the tournament starts");
+    err.statusCode = 409;
+    throw err;
   }
 
+  if (!isFormatFinalised(t)) {
+    const err = new Error("Finalise format before generating playoffs");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  if (t.format !== "group_stage") {
+    const err = new Error("Playoffs generation is supported for group_stage only");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!t.groups || t.groups.length === 0) {
+    const err = new Error("Groups not generated");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // ✅ Idempotent: if playoffs already exist, do nothing
+  const hasPlayoffs = (t.matches || []).some((m) => isPlayoffMatchId(m.id));
+  if (hasPlayoffs) return t;
+
+  // Must have group matches
+  const hasGroupMatches = (t.matches || []).some((m) => isGroupMatchId(m.id));
+  if (!hasGroupMatches) {
+    const err = new Error("Group matches missing. Generate group matches first.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Require group stage completion unless forced
+  if (!force) {
+    const groupMatches = (t.matches || []).filter((m) => isGroupMatchId(m.id));
+    const allPlayed =
+      groupMatches.length > 0 && groupMatches.every((m) => m.status === "played");
+    if (!allPlayed) {
+      const err = new Error("Group stage not complete yet");
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+
+  // Use venue fallback chain
+  const venue = String(
+    defaultVenue || t.playoffDefaultVenue || t.defaultVenue || ""
+  ).trim();
+  t.playoffDefaultVenue = venue;
+
+  // Create playoffs from standings
   removePlayoffs(t);
 
   const standings = computeGroupStandings(t);
@@ -714,7 +766,10 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
     qualifiersByGroup[g.id] = rows.slice(0, n);
   }
 
-  const totalQualifiers = Object.values(qualifiersByGroup).reduce((a, b) => a + b.length, 0);
+  const totalQualifiers = Object.values(qualifiersByGroup).reduce(
+    (a, b) => a + b.length,
+    0
+  );
   if (totalQualifiers < 2) {
     await t.save();
     return t;
@@ -748,7 +803,7 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
         id: `po_r1_${counter++}`,
         teamA: ordered[i],
         teamB: ordered[j],
-        venue: defaultVenue || "",
+        venue,
         nameByKey,
       })
     );
@@ -762,7 +817,7 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
         id: `po_r1_${counter++}`,
         teamA: ordered[i],
         teamB: "BYE",
-        venue: defaultVenue || "",
+        venue,
         nameByKey,
       })
     );
@@ -780,20 +835,36 @@ export async function generatePlayoffs(tournamentId, { defaultVenue }) {
 // ------------------------------
 export async function upsertMatch(tournamentId, matchUpdate) {
   const t = await Tournament.findById(tournamentId);
-  if (!t) throw new Error("Tournament not found");
+  if (!t) {
+    const err = new Error("Tournament not found");
+    err.statusCode = 404;
+    throw err;
+  }
 
   const id = String(matchUpdate?.id || "").trim();
-  if (!id) throw new Error("Match id required");
+  if (!id) {
+    const err = new Error("Match id required");
+    err.statusCode = 400;
+    throw err;
+  }
 
-  const idx = (t.matches || []).findIndex((m) => m.id === id);
-  if (idx < 0) throw new Error("Match not found");
+  const idx = (t.matches || []).findIndex((m) => String(m.id) === id);
+  if (idx < 0) {
+    const err = new Error("Match not found");
+    err.statusCode = 404;
+    throw err;
+  }
 
   const m = t.matches[idx];
 
   const active = isActiveStatus(t.status);
   const completed = isCompletedStatus(t.status);
 
-  if (completed) throw new Error("Tournament is completed. Matches are locked.");
+  if (completed) {
+    const err = new Error("Tournament is completed. Matches are locked.");
+    err.statusCode = 409;
+    throw err;
+  }
 
   const tryingToChangeTeams =
     matchUpdate.teamA !== undefined ||
@@ -802,32 +873,66 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     matchUpdate.teamBName !== undefined;
 
   if (active && tryingToChangeTeams) {
-    throw new Error("Tournament is live. You cannot change match teams.");
+    const err = new Error("Tournament is live. You cannot change match teams.");
+    err.statusCode = 409;
+    throw err;
   }
 
-  if (matchUpdate.teamA !== undefined) m.teamA = String(matchUpdate.teamA || "");
-  if (matchUpdate.teamB !== undefined) m.teamB = String(matchUpdate.teamB || "");
-  if (matchUpdate.teamAName !== undefined) m.teamAName = String(matchUpdate.teamAName || "");
-  if (matchUpdate.teamBName !== undefined) m.teamBName = String(matchUpdate.teamBName || "");
-  if (matchUpdate.venue !== undefined) m.venue = String(matchUpdate.venue || "");
-  if (matchUpdate.dateTime !== undefined)
-    m.dateTime = matchUpdate.dateTime ? new Date(matchUpdate.dateTime) : null;
+  // ---------- apply patch ----------
+  if (matchUpdate.teamA !== undefined) m.teamA = String(matchUpdate.teamA || "").trim();
+  if (matchUpdate.teamB !== undefined) m.teamB = String(matchUpdate.teamB || "").trim();
+  if (matchUpdate.teamAName !== undefined) m.teamAName = String(matchUpdate.teamAName || "").trim();
+  if (matchUpdate.teamBName !== undefined) m.teamBName = String(matchUpdate.teamBName || "").trim();
+
+  if (matchUpdate.venue !== undefined) m.venue = String(matchUpdate.venue || "").trim();
+
+  // ✅ date/time: accept dateTime OR scheduledAt
+  const dt =
+    matchUpdate.dateTime !== undefined
+      ? matchUpdate.dateTime
+      : matchUpdate.scheduledAt !== undefined
+        ? matchUpdate.scheduledAt
+        : undefined;
+
+  if (dt !== undefined) {
+    m.dateTime = dt ? new Date(dt) : null;
+    // Guard against invalid date strings
+    if (m.dateTime && Number.isNaN(m.dateTime.getTime())) {
+      const err = new Error("Invalid dateTime");
+      err.statusCode = 400;
+      throw err;
+    }
+  }
 
   if (matchUpdate.scoreA !== undefined) m.scoreA = Number(matchUpdate.scoreA || 0);
   if (matchUpdate.scoreB !== undefined) m.scoreB = Number(matchUpdate.scoreB || 0);
-  if (matchUpdate.status !== undefined) m.status = String(matchUpdate.status || "scheduled");
 
+  // ✅ status normalization (be forgiving)
+  if (matchUpdate.status !== undefined) {
+    const raw = String(matchUpdate.status || "scheduled").trim().toLowerCase();
+    if (raw === "played" || raw === "complete" || raw === "completed" || raw === "done") {
+      m.status = "played";
+    } else {
+      m.status = "scheduled";
+    }
+  }
+
+  // keep ids aligned after any team changes
   m.teamAId = pkToUserObjectId(m.teamA);
   m.teamBId = pkToUserObjectId(m.teamB);
 
+  // playoff validation
   if (isPlayoffMatchId(m.id) && m.status === "played") {
     const aBye = String(m.teamA || "").trim().toUpperCase() === "BYE";
     const bBye = String(m.teamB || "").trim().toUpperCase() === "BYE";
     if (!aBye && !bBye && m.scoreA === m.scoreB) {
-      throw new Error("Playoff matches cannot end in a draw");
+      const err = new Error("Playoff matches cannot end in a draw");
+      err.statusCode = 400;
+      throw err;
     }
   }
 
+  // update playoffs tree / champion
   if (isPlayoffMatchId(m.id)) {
     const r = playoffRoundOf(m.id);
     if (r != null) {

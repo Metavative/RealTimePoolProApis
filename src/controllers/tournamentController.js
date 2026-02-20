@@ -461,9 +461,8 @@ export async function configureFormat(req, res) {
       return jsonErr(res, "Tournament already started", lockStatusCode());
     }
 
-    if (!isEntriesClosed(t)) {
-      return jsonErr(res, "Close entries first", 400);
-    }
+    // ✅ Allow configuring format while entries are OPEN or CLOSED.
+    // Finalise will still require entries to be CLOSED.
 
     const fStatus = normUpper(t.formatStatus, "DRAFT");
     if (fStatus === "FINALISED") {
@@ -815,37 +814,55 @@ export async function generatePlayoffs(req, res) {
     const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
     if (!t0) return;
 
-    const locked =
-      isActiveStatus(t0.status) ||
-      normUpper(t0.status, "DRAFT") === "COMPLETED" ||
-      isEntriesClosed(t0) ||
-      isFormatFinalised(t0);
-
-    if (locked) {
-      return jsonErr(res, "Tournament is locked", lockStatusCode());
+    // ✅ Playoffs generation is allowed during ACTIVE/LIVE after format is FINALISED
+    const status = normUpper(t0.status, "DRAFT");
+    if (!(status === "ACTIVE" || status === "LIVE")) {
+      return jsonErr(res, "Playoffs can only be generated after start", lockStatusCode());
+    }
+    if (!isFormatFinalised(t0)) {
+      return jsonErr(res, "Finalise format first", lockStatusCode());
     }
 
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
+    const force = req.body?.force === true;
 
-    const t = await svc.generatePlayoffs(id, { defaultVenue });
+    const t = await svc.generatePlayoffs(id, { defaultVenue, force });
     return jsonOk(res, t, 200, "Playoffs generated");
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to generate playoffs", 500);
+    return jsonErr(res, e?.message || "Failed to generate playoffs", e?.statusCode || 500);
   }
 }
 
 // -------------------------
-// PATCH /api/tournaments/:id/matches
+// PATCH /api/tournaments/:id/matches (body must include match id)
 // -------------------------
 export async function upsertMatch(req, res) {
   try {
     if (!requireClub(req, res)) return;
 
     const { id } = req.params;
-    const t = await svc.upsertMatch(id, req.body); // ✅ service enforces ACTIVE locks
+    const t = await svc.upsertMatch(id, req.body);
     return jsonOk(res, t, 200, "Match updated");
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to update match", 500);
+    return jsonErr(res, e?.message || "Failed to update match", e?.statusCode || 500);
+  }
+}
+
+// -------------------------
+// PATCH /api/tournaments/:id/matches/:matchId (Flutter-friendly: matchId in URL)
+// -------------------------
+export async function patchMatchById(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id, matchId } = req.params;
+
+    const payload = { ...(req.body || {}), id: String(matchId).trim() };
+    const t = await svc.upsertMatch(id, payload);
+
+    return jsonOk(res, t, 200, "Match updated");
+  } catch (e) {
+    return jsonErr(res, e?.message || "Failed to update match", e?.statusCode || 500);
   }
 }
 

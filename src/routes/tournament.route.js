@@ -45,7 +45,8 @@ router.post("/:id/matches/generate", clubAuthMiddleware, c.generateMatches);
 // Playoffs
 router.post("/:id/playoffs/generate", clubAuthMiddleware, c.generatePlayoffs);
 
-// Update match
+// Update match (more specific first for Flutter PATCH .../matches/:matchId)
+router.patch("/:id/matches/:matchId", clubAuthMiddleware, c.patchMatchById);
 router.patch("/:id/matches", clubAuthMiddleware, c.upsertMatch);
 
 // Start tournament
