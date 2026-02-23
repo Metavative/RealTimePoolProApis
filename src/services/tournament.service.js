@@ -480,13 +480,21 @@ export async function setEntrantsObjects(tournamentId, entrants = []) {
 // ------------------------------
 // Balanced Groups (snake seeding)
 // ------------------------------
-export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize, randomize }) {
+export async function generateGroupsSeeded(
+  tournamentId,
+  { groupCount, groupSize, randomize },
+  options = {}
+) {
+  const { allowFinalised = false } = options;
+
   const t = await Tournament.findById(tournamentId);
   if (!t) throw new Error("Tournament not found");
 
   // ✅ Step 2 completion: entries CLOSED is OK for generation
   assertNotStartedOrCompleted(t);
-  assertFormatNotFinalised(t);
+  if (!allowFinalised) {
+    assertFormatNotFinalised(t);
+  }
 
   if (!t.entrants || t.entrants.length < 2) throw new Error("Entrants not set");
 
@@ -544,12 +552,20 @@ export async function generateGroupsSeeded(tournamentId, { groupCount, groupSize
 // ------------------------------
 // Group matches generation
 // ------------------------------
-export async function generateGroupMatches(tournamentId, { defaultVenue }) {
+export async function generateGroupMatches(
+  tournamentId,
+  { defaultVenue },
+  options = {}
+) {
+  const { allowFinalised = false } = options;
+
   const t = await Tournament.findById(tournamentId);
   if (!t) throw new Error("Tournament not found");
 
   assertNotStartedOrCompleted(t);
-  assertFormatNotFinalised(t);
+  if (!allowFinalised) {
+    assertFormatNotFinalised(t);
+  }
 
   if (t.format !== "group_stage") throw new Error("Tournament is not group_stage");
   if (!t.groups || t.groups.length === 0) throw new Error("Groups not generated");
@@ -689,6 +705,100 @@ export async function isGroupStageComplete(tournamentId) {
   if (!groupMatches.length) return false;
 
   return groupMatches.every((m) => m.status === "played");
+}
+
+// ------------------------------
+// Regenerate matches safely before start (finalised format)
+// ------------------------------
+export async function regenerateFinalisedMatchesForStart(tournamentId) {
+  const t = await Tournament.findById(tournamentId);
+  if (!t) {
+    const err = new Error("Tournament not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  // Only allowed before start
+  assertNotStartedOrCompleted(t);
+
+  if (!isEntriesClosed(t)) {
+    const err = new Error("Close entries first");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!isFormatFinalised(t)) {
+    const err = new Error("Finalise format first");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const format = String(t.format || "").trim();
+  const venue = String(t.defaultVenue || t.playoffDefaultVenue || "").trim();
+
+  // Clear generated data safely (still DRAFT/ACTIVE/LIVE status, but not started)
+  t.groups = t.groups || [];
+  t.matches = [];
+  t.championName = "";
+  await t.save();
+
+  // Rebuild from current tournament state
+  if (format === "group_stage") {
+    // If groups are missing, generate them using stored config/legacy values
+    if (!t.groups || t.groups.length === 0) {
+      const cfg = {
+        groupCount: Number(t.groupCount || 2),
+        groupRandomize: Boolean(t.groupRandomize),
+      };
+
+      await generateGroupsSeeded(
+        tournamentId,
+        {
+          groupCount: cfg.groupCount,
+          groupSize: undefined,
+          randomize: cfg.groupRandomize,
+        },
+        { allowFinalised: true }
+      );
+    }
+
+    // Generate group matches (allowed here even though finalised, because this is a recovery path)
+    const t2 = await Tournament.findById(tournamentId);
+    const venue2 = String(t2.defaultVenue || t2.playoffDefaultVenue || "").trim();
+    await generateGroupMatches(
+      tournamentId,
+      { defaultVenue: venue2 },
+      { allowFinalised: true }
+    );
+  } else {
+    // Non group formats: regenerate matches directly
+    const entrants = Array.isArray(t.entrants) ? t.entrants : [];
+    const keys = entrants.map((e) => String(e.participantKey || "").trim()).filter(Boolean);
+    if (keys.length < 2) {
+      const err = new Error("Need at least 2 entrants");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const nameByKey = new Map(
+      entrants.map((e) => [String(e.participantKey), pickEntrantName(e)])
+    );
+
+    let matches = [];
+    if (format === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);
+    else if (format === "knockout")
+      matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
+    else if (format === "double_elim" || format === "double_elimination")
+      matches = generateDoubleElim(keys, venue, nameByKey);
+    else matches = generateRoundRobin(keys, venue, nameByKey);
+
+    const t3 = await Tournament.findById(tournamentId);
+    t3.matches = matches;
+    t3.championName = "";
+    await t3.save();
+  }
+
+  return await Tournament.findById(tournamentId);
 }
 
 // ------------------------------

@@ -939,8 +939,9 @@ export async function startTournament(req, res) {
 
     const hasMatches = Array.isArray(t.matches) && t.matches.length > 0;
     if (!hasMatches) {
-      const venue = String(t.defaultVenue || t.playoffDefaultVenue || "").trim();
-      await svc.generateMatchesForFormat(id, { format, defaultVenue: venue });
+      // Recovery path: regenerate matches even if format is FINALISED,
+      // but ONLY because tournament is not started yet.
+      await svc.regenerateFinalisedMatchesForStart(id);
     }
 
     const reloaded = await Tournament.findById(id);
