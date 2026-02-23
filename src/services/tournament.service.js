@@ -724,9 +724,14 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
     throw err;
   }
 
-  // ✅ Idempotent: if playoffs already exist, do nothing
+  // ✅ Idempotent by default: if playoffs already exist, do nothing
   const hasPlayoffs = (t.matches || []).some((m) => isPlayoffMatchId(m.id));
-  if (hasPlayoffs) return t;
+  if (hasPlayoffs && !force) return t;
+
+  // If force, wipe and regenerate
+  if (hasPlayoffs && force) {
+    removePlayoffs(t);
+  }
 
   // Must have group matches
   const hasGroupMatches = (t.matches || []).some((m) => isGroupMatchId(m.id));
@@ -755,8 +760,6 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
   t.playoffDefaultVenue = venue;
 
   // Create playoffs from standings
-  removePlayoffs(t);
-
   const standings = computeGroupStandings(t);
   const qualifiersByGroup = {};
 
@@ -826,6 +829,17 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
   t.matches = [...(t.matches || []), ...out];
 
   autoProgressFromRound(t, 1);
+  await t.save();
+  return t;
+}
+
+// ------------------------------
+// Clear playoffs on server
+// ------------------------------
+export async function clearPlayoffs(tournamentId) {
+  const t = await Tournament.findById(tournamentId);
+  if (!t) throw new Error("Tournament not found");
+  removePlayoffs(t);
   await t.save();
   return t;
 }

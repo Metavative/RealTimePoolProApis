@@ -834,6 +834,35 @@ export async function generatePlayoffs(req, res) {
 }
 
 // -------------------------
+// DELETE /api/tournaments/:id/playoffs
+// -------------------------
+export async function clearPlayoffs(req, res) {
+  try {
+    if (!requireClub(req, res)) return;
+
+    const { id } = req.params;
+
+    const t0 = await loadOwnedTournament(
+      req,
+      res,
+      id,
+      "clubId status entriesStatus formatStatus"
+    );
+    if (!t0) return;
+
+    const status = normUpper(t0.status, "DRAFT");
+    if (status === "COMPLETED") {
+      return jsonErr(res, "Tournament completed", lockStatusCode());
+    }
+
+    const t = await svc.clearPlayoffs(id);
+    return jsonOk(res, t, 200, "Playoffs cleared");
+  } catch (e) {
+    return jsonErr(res, e?.message || "Failed to clear playoffs", e?.statusCode || 500);
+  }
+}
+
+// -------------------------
 // PATCH /api/tournaments/:id/matches (body must include match id)
 // -------------------------
 export async function upsertMatch(req, res) {
