@@ -120,6 +120,29 @@ function pickEntrantName(entrant) {
   );
 }
 
+function buildNameByKey(t) {
+  return new Map(
+    (t.entrants || []).map((e) => [String(e.participantKey), pickEntrantName(e)])
+  );
+}
+
+function applyNamesForMatchFromEntrants(t, match) {
+  const nameByKey = buildNameByKey(t);
+
+  const aKey = String(match.teamA || "").trim();
+  const bKey = String(match.teamB || "").trim();
+
+  match.teamAName =
+    aKey.toUpperCase() === "BYE"
+      ? "BYE"
+      : (nameByKey.get(aKey) || String(match.teamAName || "").trim() || "Player");
+
+  match.teamBName =
+    bKey.toUpperCase() === "BYE"
+      ? "BYE"
+      : (nameByKey.get(bKey) || String(match.teamBName || "").trim() || "Player");
+}
+
 function makeMatchBase({ id, teamA, teamB, venue, nameByKey }) {
   const a = String(teamA || "").trim();
   const b = String(teamB || "").trim();
@@ -349,13 +372,17 @@ async function reseedEntrantsFromCurrentList(rawEntrants = []) {
   }
 
   const uidIds = clean
-    .map((e) => (e.participantKey || "").startsWith("uid:") ? e.participantKey.substring(4) : "")
+    .map((e) =>
+      (e.participantKey || "").startsWith("uid:") ? e.participantKey.substring(4) : ""
+    )
     .filter(Boolean);
 
   let byId = new Map();
   if (uidIds.length) {
     const users = await User.find({ _id: { $in: uidIds } })
-      .select("profile.nickname stats.score stats.rank stats.totalWinnings stats.bestWinStreak stats.userIdTag")
+      .select(
+        "profile.nickname stats.score stats.rank stats.totalWinnings stats.bestWinStreak stats.userIdTag"
+      )
       .lean();
     byId = new Map(users.map((u) => [String(u._id), u]));
   }
@@ -567,11 +594,7 @@ export async function generateGroupsSeeded(
 // ------------------------------
 // Group matches generation
 // ------------------------------
-export async function generateGroupMatches(
-  tournamentId,
-  { defaultVenue },
-  options = {}
-) {
+export async function generateGroupMatches(tournamentId, { defaultVenue }, options = {}) {
   const { allowFinalised = false } = options;
 
   const t = await Tournament.findById(tournamentId);
@@ -700,7 +723,9 @@ function computeGroupStandings(t) {
       if (gd !== 0) return gd;
       const gf = y.gf - x.gf;
       if (gf !== 0) return gf;
-      return String(x.name).toLowerCase().localeCompare(String(y.name).toLowerCase());
+      return String(x.name)
+        .toLowerCase()
+        .localeCompare(String(y.name).toLowerCase());
     });
 
     out[g.id] = rows;
@@ -788,7 +813,9 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
   } else {
     // Non group formats: regenerate matches directly
     const entrants = Array.isArray(t.entrants) ? t.entrants : [];
-    const keys = entrants.map((e) => String(e.participantKey || "").trim()).filter(Boolean);
+    const keys = entrants
+      .map((e) => String(e.participantKey || "").trim())
+      .filter(Boolean);
     if (keys.length < 2) {
       const err = new Error("Need at least 2 entrants");
       err.statusCode = 400;
@@ -888,13 +915,7 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
   t.playoffDefaultVenue = venue;
 
   // ✅ Canonical qualifiersPerGroup (Step 4 rule)
-  const qpg = Math.max(
-    1,
-    Number(
-      t?.formatConfig?.qualifiersPerGroup ??
-        1
-    )
-  );
+  const qpg = Math.max(1, Number(t?.formatConfig?.qualifiersPerGroup ?? 1));
 
   // Create playoffs from standings
   const standings = computeGroupStandings(t);
@@ -1043,8 +1064,21 @@ export async function upsertMatch(tournamentId, matchUpdate) {
   }
 
   // ---------- apply patch ----------
-  if (matchUpdate.teamA !== undefined) m.teamA = String(matchUpdate.teamA || "").trim();
-  if (matchUpdate.teamB !== undefined) m.teamB = String(matchUpdate.teamB || "").trim();
+  let teamsChanged = false;
+
+  if (matchUpdate.teamA !== undefined) {
+    const next = String(matchUpdate.teamA || "").trim();
+    if (next !== m.teamA) teamsChanged = true;
+    m.teamA = next;
+  }
+
+  if (matchUpdate.teamB !== undefined) {
+    const next = String(matchUpdate.teamB || "").trim();
+    if (next !== m.teamB) teamsChanged = true;
+    m.teamB = next;
+  }
+
+  // allow explicit names, but server will ensure consistency (esp when teams changed)
   if (matchUpdate.teamAName !== undefined) m.teamAName = String(matchUpdate.teamAName || "").trim();
   if (matchUpdate.teamBName !== undefined) m.teamBName = String(matchUpdate.teamBName || "").trim();
 
@@ -1060,7 +1094,6 @@ export async function upsertMatch(tournamentId, matchUpdate) {
 
   if (dt !== undefined) {
     m.dateTime = dt ? new Date(dt) : null;
-    // Guard against invalid date strings
     if (m.dateTime && Number.isNaN(m.dateTime.getTime())) {
       const err = new Error("Invalid dateTime");
       err.statusCode = 400;
@@ -1084,6 +1117,14 @@ export async function upsertMatch(tournamentId, matchUpdate) {
   // keep ids aligned after any team changes
   m.teamAId = pkToUserObjectId(m.teamA);
   m.teamBId = pkToUserObjectId(m.teamB);
+
+  // ✅ Ensure names are consistent from entrants (and normalize BYE)
+  if (teamsChanged || !String(m.teamAName || "").trim() || !String(m.teamBName || "").trim()) {
+    applyNamesForMatchFromEntrants(t, m);
+  } else {
+    if (String(m.teamA || "").trim().toUpperCase() === "BYE") m.teamAName = "BYE";
+    if (String(m.teamB || "").trim().toUpperCase() === "BYE") m.teamBName = "BYE";
+  }
 
   // playoff validation
   if (isPlayoffMatchId(m.id) && m.status === "played") {
@@ -1130,7 +1171,15 @@ function generateRoundRobin(keys, defaultVenue = "", nameByKey) {
   let counter = 1;
   for (let i = 0; i < keys.length; i++) {
     for (let j = i + 1; j < keys.length; j++) {
-      out.push(makeMatchBase({ id: `rr_${counter++}`, teamA: keys[i], teamB: keys[j], venue: defaultVenue, nameByKey }));
+      out.push(
+        makeMatchBase({
+          id: `rr_${counter++}`,
+          teamA: keys[i],
+          teamB: keys[j],
+          venue: defaultVenue,
+          nameByKey,
+        })
+      );
     }
   }
   return out;
@@ -1144,7 +1193,15 @@ function generateKnockoutRound1(keys, defaultVenue = "", prefix = "ko", nameByKe
   for (let i = 0; i < shuffled.length; i += 2) {
     const a = shuffled[i];
     const b = i + 1 < shuffled.length ? shuffled[i + 1] : "BYE";
-    out.push(makeMatchBase({ id: `${prefix}_${counter++}`, teamA: a, teamB: b, venue: defaultVenue, nameByKey }));
+    out.push(
+      makeMatchBase({
+        id: `${prefix}_${counter++}`,
+        teamA: a,
+        teamB: b,
+        venue: defaultVenue,
+        nameByKey,
+      })
+    );
   }
   return out;
 }
@@ -1162,11 +1219,15 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
   assertFormatNotFinalised(t);
 
   const entrants = Array.isArray(t.entrants) ? t.entrants : [];
-  const keys = entrants.map((e) => String(e.participantKey || "").trim()).filter(Boolean);
+  const keys = entrants
+    .map((e) => String(e.participantKey || "").trim())
+    .filter(Boolean);
 
   if (keys.length < 2) throw new Error("Add at least 2 players");
 
-  const nameByKey = new Map(entrants.map((e) => [String(e.participantKey), pickEntrantName(e)]));
+  const nameByKey = new Map(
+    entrants.map((e) => [String(e.participantKey), pickEntrantName(e)])
+  );
 
   const f = String(format || t.format || "").trim();
   const venue = String(defaultVenue || t.defaultVenue || t.playoffDefaultVenue || "").trim();
@@ -1183,7 +1244,8 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
   let matches = [];
   if (f === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);
   else if (f === "knockout") matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
-  else if (f === "double_elim" || f === "double_elimination") matches = generateDoubleElim(keys, venue, nameByKey);
+  else if (f === "double_elim" || f === "double_elimination")
+    matches = generateDoubleElim(keys, venue, nameByKey);
   else matches = generateRoundRobin(keys, venue, nameByKey);
 
   t.matches = matches;

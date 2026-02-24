@@ -1,152 +1,121 @@
+// src/models/tournament.model.js
 import mongoose from "mongoose";
 
-const TournamentEntrantSchema = new mongoose.Schema(
+const { Schema } = mongoose;
+
+const EntrantSchema = new Schema(
   {
-    entrantId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // optional
-    name: { type: String, trim: true, default: "" },
-
-    // stable key: uid:<id> | un:<usernameLower> | nm:<nameLower>
-    participantKey: { type: String, trim: true, default: "" },
-    username: { type: String, trim: true, default: "" },
-    userId: { type: String, trim: true, default: "" }, // string id copy (optional)
+    entrantId: { type: Schema.Types.ObjectId, ref: "User", required: false },
+    participantKey: { type: String, required: true }, // uid:<id> | un:<username> | nm:<name>:<ts>
+    name: { type: String, default: "" },
+    username: { type: String, default: "" },
+    userId: { type: String, default: "" }, // string id for convenience
     isLocal: { type: Boolean, default: false },
-
     rating: { type: Number, default: 0 },
     seed: { type: Number, default: 0 },
   },
   { _id: false }
 );
 
-const TournamentGroupSchema = new mongoose.Schema(
+const GroupSchema = new Schema(
   {
-    id: { type: String, trim: true }, // "A"
-    name: { type: String, trim: true }, // "Group A"
+    id: { type: String, required: true }, // A, B, C...
+    name: { type: String, default: "" },
     members: { type: [String], default: [] }, // participantKeys
   },
   { _id: false }
 );
 
-const TournamentMatchSchema = new mongoose.Schema(
+const MatchSchema = new Schema(
   {
-    id: { type: String, trim: true }, // g_A_1, po_r1_1 etc.
+    id: { type: String, required: true }, // g_A_1, rr_1, ko_1, po_r1_1 ...
+    teamA: { type: String, default: "" }, // participantKey or BYE
+    teamB: { type: String, default: "" }, // participantKey or BYE
 
-    teamAId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-    teamBId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    teamAId: { type: Schema.Types.ObjectId, ref: "User", required: false },
+    teamBId: { type: Schema.Types.ObjectId, ref: "User", required: false },
 
-    teamA: { type: String, trim: true, default: "" }, // participantKey or BYE
-    teamB: { type: String, trim: true, default: "" },
+    teamAName: { type: String, default: "" },
+    teamBName: { type: String, default: "" },
 
-    teamAName: { type: String, trim: true, default: "" },
-    teamBName: { type: String, trim: true, default: "" },
-
-    venue: { type: String, trim: true, default: "" },
+    venue: { type: String, default: "" },
     dateTime: { type: Date, default: null },
 
     scoreA: { type: Number, default: 0 },
     scoreB: { type: Number, default: 0 },
 
-    status: { type: String, enum: ["scheduled", "played"], default: "scheduled" },
+    status: { type: String, default: "scheduled" }, // scheduled | played
   },
   { _id: false }
 );
 
-// ✅ Step 3: structured formatConfig (still stored under tournament.formatConfig)
-const TournamentFormatConfigSchema = new mongoose.Schema(
+const TournamentSchema = new Schema(
   {
-    // organizer picks
-    groupCount: { type: Number, default: 2 },
-    qualifiersPerGroup: { type: Number, default: 1 },
+    // ownership
+    clubId: { type: Schema.Types.ObjectId, ref: "Club", required: false },
 
-    knockoutType: {
+    // basic
+    title: { type: String, default: "" },
+    format: {
       type: String,
-      enum: ["SINGLE_ELIM"],
-      default: "SINGLE_ELIM",
+      default: "round_robin",
+      enum: ["round_robin", "knockout", "group_stage", "double_elim", "double_elimination"],
     },
-
-    thirdPlacePlayoff: { type: Boolean, default: false },
-
-    // optional knobs (kept for compatibility)
-    groupRandomize: { type: Boolean, default: true },
-    groupBalanced: { type: Boolean, default: true },
-    enableKnockoutStage: { type: Boolean, default: true },
-  },
-  { _id: false }
-);
-
-const TournamentSchema = new mongoose.Schema(
-  {
-    clubId: { type: mongoose.Schema.Types.ObjectId, ref: "Club", index: true },
-
-    title: { type: String, trim: true, default: "" },
-
-    defaultVenue: { type: String, trim: true, default: "" },
-
-    accessMode: {
-      type: String,
-      enum: ["OPEN", "INVITE_ONLY"],
-      default: "INVITE_ONLY",
-    },
-
-    entriesStatus: {
-      type: String,
-      enum: ["OPEN", "CLOSED"],
-      default: "OPEN",
-    },
-
-    closedAt: { type: Date, default: null },
-    closedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Club", default: null },
-
-    // ✅ Step 3: DRAFT → CONFIGURED → FINALISED
-    formatStatus: {
-      type: String,
-      enum: ["DRAFT", "CONFIGURED", "FINALISED"],
-      default: "DRAFT",
-    },
-
-    // ✅ Step 3: typed config (instead of plain Object)
-    formatConfig: { type: TournamentFormatConfigSchema, default: () => ({}) },
 
     status: {
       type: String,
-      enum: ["DRAFT", "ACTIVE", "LIVE", "COMPLETED"],
       default: "DRAFT",
+      enum: ["DRAFT", "ACTIVE", "LIVE", "COMPLETED"],
     },
 
-    startedAt: { type: Date, default: null },
+    // step 2
+    accessMode: { type: String, default: "INVITE_ONLY", enum: ["OPEN", "INVITE_ONLY"] },
+    entriesStatus: { type: String, default: "OPEN", enum: ["OPEN", "CLOSED"] },
 
-    format: {
-      type: String,
-      enum: ["round_robin", "knockout", "double_elim", "group_stage"],
-      default: "group_stage",
-      index: true,
+    // step 3
+    formatStatus: { type: String, default: "DRAFT", enum: ["DRAFT", "CONFIGURED", "FINALISED"] },
+
+    formatConfig: {
+      groupCount: { type: Number, default: 2 },
+      qualifiersPerGroup: { type: Number, default: 1 },
+      knockoutType: { type: String, default: "SINGLE_ELIM" }, // optional future
+      thirdPlacePlayoff: { type: Boolean, default: false },
+      groupRandomize: { type: Boolean, default: true },
+      groupBalanced: { type: Boolean, default: true },
+      enableKnockoutStage: { type: Boolean, default: true },
     },
 
-    entrants: { type: [TournamentEntrantSchema], default: [] },
-
-    // legacy/compat (services + Flutter already use these)
+    // legacy mirrors (keep for compatibility with older clients)
     groupCount: { type: Number, default: 2 },
     groupSize: { type: Number, default: 0 },
     groupRandomize: { type: Boolean, default: true },
     groupBalanced: { type: Boolean, default: true },
     topNPerGroup: { type: Number, default: 1 },
     enableKnockoutStage: { type: Boolean, default: true },
+    thirdPlacePlayoff: { type: Boolean, default: false },
 
-    groups: { type: [TournamentGroupSchema], default: [] },
-    matches: { type: [TournamentMatchSchema], default: [] },
+    // venues
+    defaultVenue: { type: String, default: "" },
+    playoffDefaultVenue: { type: String, default: "" },
 
+    // core arrays
+    entrants: { type: [EntrantSchema], default: [] },
+    groups: { type: [GroupSchema], default: [] },
+    matches: { type: [MatchSchema], default: [] },
+
+    // champion
+    championName: { type: String, default: "" }, // stores participantKey
+
+    // playoffs metadata (Step 4/5)
     playoffs: {
       generatedAt: { type: Date, default: null },
       qualifiersPerGroup: { type: Number, default: 0 },
       bracketSize: { type: Number, default: 0 },
       force: { type: Boolean, default: false },
-      venue: { type: String, trim: true, default: "" },
+      venue: { type: String, default: "" },
     },
-
-    playoffDefaultVenue: { type: String, trim: true, default: "" },
-
-    championName: { type: String, trim: true, default: "" },
   },
   { timestamps: true }
 );
 
-export default mongoose.models.Tournament || mongoose.model("Tournament", TournamentSchema);
+export default mongoose.model("Tournament", TournamentSchema);

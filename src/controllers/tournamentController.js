@@ -3,509 +3,330 @@ import Tournament from "../models/tournament.model.js";
 import * as svc from "../services/tournament.service.js";
 
 // -------------------------
-// helpers
+// response helpers
 // -------------------------
-function jsonOk(res, data, code = 200, message) {
-  const payload = { success: true, data };
-  if (message) payload.message = message;
-  return res.status(code).json(payload);
+function ok(res, data) {
+  return res.json({ ok: true, data });
 }
 
-function jsonErr(res, message, code = 400, extra = {}) {
-  return res.status(code).json({ success: false, message, ...extra });
+function fail(res, err) {
+  const status = err?.statusCode || err?.status || 500;
+  return res.status(status).json({
+    ok: false,
+    message: err?.message || "Server error",
+    issues: err?.issues || undefined,
+  });
 }
 
-function requireClub(req, res) {
-  if (req.authType !== "club" || !req.clubId || !req.club) {
-    jsonErr(res, "Club authorization required", 403);
-    return false;
-  }
-  return true;
+function upper(v, fb = "") {
+  return String(v ?? fb).trim().toUpperCase();
 }
 
-async function loadOwnedTournament(req, res, id, select = "") {
-  const t = await Tournament.findById(id).select(select || "");
-  if (!t) {
-    jsonErr(res, "Tournament not found", 404);
-    return null;
-  }
-  if (t.clubId && String(t.clubId) !== String(req.clubId)) {
-    jsonErr(res, "Not allowed for this tournament", 403);
-    return null;
-  }
-  return t;
+function getClubId(req) {
+  // be defensive: depends on your clubAuthMiddleware
+  return (
+    req?.club?._id ||
+    req?.clubId ||
+    req?.club?._id?.toString?.() ||
+    req?.user?.clubId ||
+    null
+  );
 }
 
-function normUpper(v, fallback) {
-  return String(v ?? fallback ?? "").trim().toUpperCase();
-}
-
-function isActiveStatus(status) {
-  const s = normUpper(status, "DRAFT");
-  return s === "ACTIVE" || s === "LIVE";
-}
-
-function isEntriesClosed(t) {
-  return normUpper(t?.entriesStatus, "OPEN") === "CLOSED";
-}
-
-function isFormatFinalised(t) {
-  return normUpper(t?.formatStatus, "DRAFT") === "FINALISED";
-}
-
-function lockStatusCode() {
-  return 409;
-}
-
-function toInt(v, fallback) {
-  const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function getEntrantKeys(t) {
-  const keys = Array.isArray(t?.entrants)
-    ? t.entrants
-        .map((e) => String(e.participantKey || "").trim())
-        .filter(Boolean)
-    : [];
-  // unique
-  return Array.from(new Set(keys));
-}
-
-function getConfiguredFormatConfig(t) {
-  const fc = t?.formatConfig || {};
-  return {
-    groupCount: toInt(fc.groupCount, toInt(t.groupCount, 2)),
-    qualifiersPerGroup: toInt(fc.qualifiersPerGroup, toInt(t.topNPerGroup, 1)),
-    knockoutType: String(fc.knockoutType || "SINGLE_ELIM").trim() || "SINGLE_ELIM",
-    thirdPlacePlayoff: !!fc.thirdPlacePlayoff,
-    groupRandomize: fc.groupRandomize != null ? !!fc.groupRandomize : !!t.groupRandomize,
-    groupBalanced: fc.groupBalanced != null ? !!fc.groupBalanced : !!t.groupBalanced,
-    enableKnockoutStage:
-      fc.enableKnockoutStage != null ? !!fc.enableKnockoutStage : !!t.enableKnockoutStage,
-  };
-}
-
-function validateFormatConfig({ groupCount, qualifiersPerGroup }, entrantCount) {
-  const issues = [];
-
-  if (!Number.isFinite(groupCount) || groupCount < 1) issues.push("groupCount must be >= 1");
-  if (!Number.isFinite(qualifiersPerGroup) || qualifiersPerGroup < 1)
-    issues.push("qualifiersPerGroup must be >= 1");
-
-  if (Number.isFinite(groupCount) && groupCount > entrantCount) {
-    issues.push("groupCount cannot exceed number of entrants");
+function assertSameClub(req, tournament) {
+  const cid = getClubId(req);
+  if (!cid) {
+    const err = new Error("Unauthorized");
+    err.statusCode = 401;
+    throw err;
   }
 
-  // Must have at least 2 entrants overall
-  if (entrantCount < 2) issues.push("Need at least 2 entrants");
-
-  // If groupCount is 1, qualifiersPerGroup cannot exceed entrants
-  if (groupCount === 1 && qualifiersPerGroup > entrantCount) {
-    issues.push("qualifiersPerGroup cannot exceed entrants");
-  }
-
-  // If groupCount > 1, rough sanity: at least one player per group
-  if (groupCount > 1 && entrantCount < groupCount) {
-    issues.push("Not enough entrants for the selected groupCount");
-  }
-
-  // ensure at least 2 qualifiers total if knockout stage is expected
-  // (we keep it soft: allow 1 qualifier total if user disables knockout later)
-  return issues;
-}
-
-// -------------------------
-// POST /api/tournaments
-// -------------------------
-export async function create(req, res) {
-  try {
-    if (!requireClub(req, res)) return;
-
-    const title = String(req.body.title || req.body.name || "").trim();
-    const format = String(req.body.format || "group_stage").trim();
-
-    const accessMode = normUpper(req.body.accessMode, "INVITE_ONLY");
-    const entriesStatus = normUpper(req.body.entriesStatus, "OPEN");
-
-    const groupCount =
-      req.body.groupCount != null ? toInt(req.body.groupCount, undefined) : undefined;
-
-    const topNPerGroup =
-      req.body.topNPerGroup != null ? toInt(req.body.topNPerGroup, undefined) : undefined;
-
-    const groupRandomize =
-      req.body.groupRandomize != null ? !!req.body.groupRandomize : undefined;
-
-    const groupBalanced =
-      req.body.groupBalanced != null ? !!req.body.groupBalanced : undefined;
-
-    const enableKnockoutStage =
-      req.body.enableKnockoutStage != null ? !!req.body.enableKnockoutStage : undefined;
-
-    const defaultVenue = String(req.body.defaultVenue || "").trim();
-    const playoffDefaultVenue = String(req.body.playoffDefaultVenue || defaultVenue || "").trim();
-
-    const t = await Tournament.create({
-      clubId: req.clubId,
-      title,
-      format,
-      accessMode,
-      entriesStatus,
-
-      defaultVenue,
-      playoffDefaultVenue,
-
-      groupCount: Number.isFinite(groupCount) ? groupCount : undefined,
-      topNPerGroup: Number.isFinite(topNPerGroup) ? topNPerGroup : undefined,
-
-      ...(groupRandomize != null ? { groupRandomize } : {}),
-      ...(groupBalanced != null ? { groupBalanced } : {}),
-      ...(enableKnockoutStage != null ? { enableKnockoutStage } : {}),
-    });
-
-    return jsonOk(res, t, 201, "Tournament created");
-  } catch (e) {
-    return jsonErr(res, e?.message || "Failed to create tournament", 500);
+  // If your system doesn't tie tournament to clubId yet, you can relax this check.
+  // But it’s better to enforce.
+  const tClub = tournament?.clubId ? String(tournament.clubId) : "";
+  if (tClub && String(cid) !== tClub) {
+    const err = new Error("Forbidden");
+    err.statusCode = 403;
+    throw err;
   }
 }
 
 // -------------------------
-// GET /api/tournaments/my
+// basic CRUD
 // -------------------------
 export async function listMine(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const list = await Tournament.find({ clubId: req.clubId })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean();
-
-    return jsonOk(res, list);
-  } catch (e) {
-    return jsonErr(res, e?.message || "Failed to list tournaments", 500);
-  }
-}
-
-// -------------------------
-// GET /api/tournaments/:id
-// -------------------------
-export async function getOne(req, res) {
-  try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-    const t = await loadOwnedTournament(req, res, id);
-    if (!t) return;
-
-    return jsonOk(res, t);
-  } catch (e) {
-    return jsonErr(res, e?.message || "Failed to get tournament", 500);
-  }
-}
-
-// -------------------------
-// PATCH /api/tournaments/:id
-// -------------------------
-export async function patch(req, res) {
-  try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t = await loadOwnedTournament(req, res, id, "clubId status title format");
-    if (!t) return;
-
-    const status = normUpper(t.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
+    const cid = getClubId(req);
+    if (!cid) {
+      const err = new Error("Unauthorized");
+      err.statusCode = 401;
+      throw err;
     }
 
-    if (req.body.title != null) t.title = String(req.body.title || "").trim();
-    if (req.body.format != null) t.format = String(req.body.format || "").trim();
+    const items = await Tournament.find({ clubId: cid })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    return ok(res, items);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+export async function create(req, res) {
+  try {
+    const cid = getClubId(req);
+    if (!cid) {
+      const err = new Error("Unauthorized");
+      err.statusCode = 401;
+      throw err;
+    }
+
+    const format = String(req.body?.format || "round_robin").trim();
+    const title = String(req.body?.name || req.body?.title || "").trim();
+    const defaultVenue = String(req.body?.defaultVenue || "").trim();
+
+    const groupCount = Number(req.body?.groupCount || 2);
+    const topNPerGroup = Number(req.body?.topNPerGroup || 1);
+    const enableKnockoutStage =
+      req.body?.enableKnockoutStage === undefined ? true : !!req.body.enableKnockoutStage;
+
+    const t = await Tournament.create({
+      clubId: cid,
+      title,
+      format,
+      defaultVenue,
+
+      status: "DRAFT",
+      accessMode: "INVITE_ONLY",
+      entriesStatus: "OPEN",
+      formatStatus: "DRAFT",
+
+      // legacy mirrors
+      groupCount,
+      topNPerGroup,
+      enableKnockoutStage,
+
+      // default format config (Step 3)
+      formatConfig: {
+        groupCount,
+        qualifiersPerGroup: topNPerGroup,
+        knockoutType: "SINGLE_ELIM",
+        thirdPlacePlayoff: false,
+        groupRandomize: true,
+        groupBalanced: true,
+        enableKnockoutStage,
+      },
+    });
+
+    return ok(res, t);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+export async function getOne(req, res) {
+  try {
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
+
+    assertSameClub(req, t);
+
+    return ok(res, t);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+export async function patch(req, res) {
+  try {
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
+
+    assertSameClub(req, t);
+
+    // safe patch set
+    if (req.body?.title !== undefined) t.title = String(req.body.title || "").trim();
+    if (req.body?.defaultVenue !== undefined) t.defaultVenue = String(req.body.defaultVenue || "").trim();
+    if (req.body?.playoffDefaultVenue !== undefined)
+      t.playoffDefaultVenue = String(req.body.playoffDefaultVenue || "").trim();
 
     await t.save();
-    return jsonOk(res, t, 200, "Tournament updated");
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to patch tournament", 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// PATCH /api/tournaments/:id/settings
-// NOTE: formatConfig is now set via /format/configure ONLY
+// Step 2: access mode
 // -------------------------
 export async function patchSettings(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const tournament = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status accessMode entriesStatus formatStatus format groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage defaultVenue playoffDefaultVenue closedAt closedBy formatConfig"
-    );
-    if (!tournament) return;
-
-    const status = normUpper(tournament.status, "DRAFT");
-    const entriesStatus = normUpper(tournament.entriesStatus, "OPEN");
-    const formatStatus = normUpper(tournament.formatStatus, "DRAFT");
-
-    const isActive = isActiveStatus(status);
-    const isCompleted = status === "COMPLETED";
-    const entriesClosed = entriesStatus === "CLOSED";
-    const formatFinalised = formatStatus === "FINALISED";
-
-    if (isActive || isCompleted) {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
 
-    // accessMode
-    if (req.body.accessMode != null) {
-      const next = normUpper(req.body.accessMode, "");
-      if (!["OPEN", "INVITE_ONLY"].includes(next)) {
-        return jsonErr(res, "Invalid accessMode", 400);
+    assertSameClub(req, t);
+
+    const status = upper(t.status, "DRAFT");
+    const entriesStatus = upper(t.entriesStatus, "OPEN");
+    const formatStatus = upper(t.formatStatus, "DRAFT");
+
+    const rosterLocked =
+      status === "ACTIVE" ||
+      status === "LIVE" ||
+      status === "COMPLETED" ||
+      entriesStatus === "CLOSED" ||
+      formatStatus === "FINALISED";
+
+    if (rosterLocked) {
+      const err = new Error("Tournament is locked");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    if (req.body?.accessMode !== undefined) {
+      const next = upper(req.body.accessMode, "INVITE_ONLY");
+      if (next !== "OPEN" && next !== "INVITE_ONLY") {
+        const err = new Error("Invalid accessMode");
+        err.statusCode = 400;
+        throw err;
       }
-      if (entriesClosed || formatFinalised) {
-        return jsonErr(
-          res,
-          formatFinalised
-            ? "Tournament format is finalised. Settings locked."
-            : "Entries are closed for this tournament",
-          lockStatusCode()
-        );
-      }
-      tournament.accessMode = next;
+      t.accessMode = next;
     }
 
-    // entriesStatus (ALLOW ONLY OPEN HERE; close via endpoint)
-    if (req.body.entriesStatus != null) {
-      const next = normUpper(req.body.entriesStatus, "");
-      if (!["OPEN", "CLOSED"].includes(next)) {
-        return jsonErr(res, "Invalid entriesStatus", 400);
-      }
-      if (next === "OPEN") {
-        if (formatFinalised) {
-          return jsonErr(res, "Tournament format is finalised. Entrants are locked.", lockStatusCode());
-        }
-        tournament.entriesStatus = "OPEN";
-        tournament.closedAt = null;
-        tournament.closedBy = null;
-      } else {
-        return jsonErr(res, "Use /entries/close endpoint to close entries", 400);
-      }
-    }
-
-    // Settings that should NOT change after entries are closed OR format finalised
-    const hasFormatSettingsChange =
-      req.body.groupCount != null ||
-      req.body.topNPerGroup != null ||
-      req.body.groupRandomize != null ||
-      req.body.groupBalanced != null ||
-      req.body.enableKnockoutStage != null ||
-      req.body.defaultVenue != null ||
-      req.body.playoffDefaultVenue != null;
-
-    if ((entriesClosed || formatFinalised) && hasFormatSettingsChange) {
-      return jsonErr(
-        res,
-        formatFinalised
-          ? "Tournament format is finalised. Settings locked."
-          : "Entries are closed for this tournament",
-        lockStatusCode()
-      );
-    }
-
-    if (req.body.groupCount != null) {
-      const v = toInt(req.body.groupCount, NaN);
-      if (Number.isNaN(v) || v < 1) return jsonErr(res, "Invalid groupCount", 400);
-      tournament.groupCount = v;
-    }
-
-    if (req.body.topNPerGroup != null) {
-      const v = toInt(req.body.topNPerGroup, NaN);
-      if (Number.isNaN(v) || v < 1) return jsonErr(res, "Invalid topNPerGroup", 400);
-      tournament.topNPerGroup = v;
-    }
-
-    if (req.body.groupRandomize != null) tournament.groupRandomize = !!req.body.groupRandomize;
-    if (req.body.groupBalanced != null) tournament.groupBalanced = !!req.body.groupBalanced;
-    if (req.body.enableKnockoutStage != null)
-      tournament.enableKnockoutStage = !!req.body.enableKnockoutStage;
-
-    if (req.body.defaultVenue != null) {
-      tournament.defaultVenue = String(req.body.defaultVenue || "").trim();
-    }
-
-    if (req.body.playoffDefaultVenue != null) {
-      tournament.playoffDefaultVenue = String(req.body.playoffDefaultVenue || "").trim();
-    }
-
-    // 🚫 Do NOT allow patchSettings to set formatConfig anymore (Step 3 ownership)
-    if (req.body.formatConfig != null) {
-      return jsonErr(res, "Use /format/configure to set formatConfig", 400);
-    }
-
-    await tournament.save();
-    return jsonOk(res, tournament, 200, "Settings updated");
+    await t.save();
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to patch settings", 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// POST /api/tournaments/:id/entries/close
+// Step 2: entries open/close
 // -------------------------
 export async function closeEntries(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const tournament = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status entriesStatus formatStatus closedAt closedBy"
-    );
-    if (!tournament) return;
-
-    const status = normUpper(tournament.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
 
-    if (normUpper(tournament.entriesStatus, "OPEN") === "CLOSED") {
-      return jsonOk(res, tournament, 200, "Entries already closed");
+    assertSameClub(req, t);
+
+    const status = upper(t.status, "DRAFT");
+    if (status === "ACTIVE" || status === "LIVE" || status === "COMPLETED") {
+      const err = new Error("Tournament already started");
+      err.statusCode = 409;
+      throw err;
     }
 
-    tournament.entriesStatus = "CLOSED";
-    tournament.closedAt = new Date();
-    tournament.closedBy = req.clubId;
-
-    await tournament.save();
-    return jsonOk(res, tournament, 200, "Entries closed");
+    t.entriesStatus = "CLOSED";
+    await t.save();
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to close entries", 500);
+    return fail(res, e);
   }
 }
 
-// -------------------------
-// POST /api/tournaments/:id/entries/open
-// -------------------------
 export async function openEntries(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const tournament = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status entriesStatus formatStatus closedAt closedBy"
-    );
-    if (!tournament) return;
-
-    const status = normUpper(tournament.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
 
-    if (isFormatFinalised(tournament)) {
-      return jsonErr(res, "Tournament format is finalised. Entrants are locked.", lockStatusCode());
+    assertSameClub(req, t);
+
+    const status = upper(t.status, "DRAFT");
+    if (status === "ACTIVE" || status === "LIVE" || status === "COMPLETED") {
+      const err = new Error("Tournament already started");
+      err.statusCode = 409;
+      throw err;
     }
 
-    if (normUpper(tournament.entriesStatus, "OPEN") === "OPEN") {
-      return jsonOk(res, tournament, 200, "Entries already open");
+    const fs = upper(t.formatStatus, "DRAFT");
+    if (fs === "FINALISED") {
+      const err = new Error("Format finalised. Re-open entries not allowed.");
+      err.statusCode = 409;
+      throw err;
     }
 
-    tournament.entriesStatus = "OPEN";
-    tournament.closedAt = null;
-    tournament.closedBy = null;
-
-    // If organiser re-opens entries, make format flow go back to DRAFT
-    // (keeps logic clean, avoids stale configured format)
-    tournament.formatStatus = "DRAFT";
-
-    await tournament.save();
-    return jsonOk(res, tournament, 200, "Entries opened");
+    t.entriesStatus = "OPEN";
+    await t.save();
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to open entries", 500);
+    return fail(res, e);
   }
 }
 
-// =========================================================
-// ✅ STEP 3A: Configure Format
-// POST /api/tournaments/:id/format/configure
-// =========================================================
+// -------------------------
+// Step 3: configure/finalise format
+// -------------------------
 export async function configureFormat(req, res) {
   try {
-    if (!requireClub(req, res)) return;
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
 
-    const { id } = req.params;
+    assertSameClub(req, t);
 
-    const t = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status entriesStatus formatStatus entrants groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage formatConfig"
+    const status = upper(t.status, "DRAFT");
+    if (status === "ACTIVE" || status === "LIVE" || status === "COMPLETED") {
+      const err = new Error("Tournament already started");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const fs = upper(t.formatStatus, "DRAFT");
+    if (fs === "FINALISED") {
+      const err = new Error("Format finalised. Configuration locked.");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    // canonical config
+    const groupCount = Math.max(1, Number(req.body?.groupCount || t.formatConfig?.groupCount || 2));
+    const qualifiersPerGroup = Math.max(
+      1,
+      Number(req.body?.qualifiersPerGroup || t.formatConfig?.qualifiersPerGroup || 1)
     );
-    if (!t) return;
 
-    const status = normUpper(t.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
-    }
-
-    // ✅ Allow configuring format while entries are OPEN or CLOSED.
-    // Finalise will still require entries to be CLOSED.
-
-    const fStatus = normUpper(t.formatStatus, "DRAFT");
-    if (fStatus === "FINALISED") {
-      return jsonErr(res, "Tournament format is finalised. Locked.", lockStatusCode());
-    }
-
-    const keys = getEntrantKeys(t);
-    const entrantCount = keys.length;
-
-    const body = req.body || {};
-    const groupCount = toInt(body.groupCount, undefined);
-    const qualifiersPerGroup = toInt(body.qualifiersPerGroup, undefined);
-
-    const knockoutType = String(body.knockoutType || "SINGLE_ELIM").trim().toUpperCase();
-    const thirdPlacePlayoff = body.thirdPlacePlayoff != null ? !!body.thirdPlacePlayoff : false;
-
-    const groupRandomize = body.groupRandomize != null ? !!body.groupRandomize : t.groupRandomize;
-    const groupBalanced = body.groupBalanced != null ? !!body.groupBalanced : t.groupBalanced;
+    const knockoutType = String(req.body?.knockoutType || t.formatConfig?.knockoutType || "SINGLE_ELIM").trim();
+    const thirdPlacePlayoff = !!req.body?.thirdPlacePlayoff;
+    const groupRandomize = req.body?.groupRandomize === undefined ? true : !!req.body.groupRandomize;
+    const groupBalanced = req.body?.groupBalanced === undefined ? true : !!req.body.groupBalanced;
     const enableKnockoutStage =
-      body.enableKnockoutStage != null ? !!body.enableKnockoutStage : t.enableKnockoutStage;
+      req.body?.enableKnockoutStage === undefined ? true : !!req.body.enableKnockoutStage;
 
-    const effectiveGroupCount = Number.isFinite(groupCount) ? groupCount : toInt(t.groupCount, 2);
-    const effectiveQualifiers = Number.isFinite(qualifiersPerGroup)
-      ? qualifiersPerGroup
-      : toInt(t.topNPerGroup, 1);
-
-    const issues = validateFormatConfig(
-      { groupCount: effectiveGroupCount, qualifiersPerGroup: effectiveQualifiers },
-      entrantCount
-    );
-
-    if (!["SINGLE_ELIM"].includes(knockoutType)) {
-      issues.push("Invalid knockoutType");
-    }
-
-    if (issues.length) {
-      return jsonErr(res, "Invalid format configuration", 400, { issues });
-    }
-
-    // ✅ Persist to formatConfig (Step 3 canonical)
     t.formatConfig = {
-      groupCount: effectiveGroupCount,
-      qualifiersPerGroup: effectiveQualifiers,
+      groupCount,
+      qualifiersPerGroup,
       knockoutType,
       thirdPlacePlayoff,
       groupRandomize,
@@ -513,451 +334,296 @@ export async function configureFormat(req, res) {
       enableKnockoutStage,
     };
 
-    // ✅ Keep legacy fields aligned (services + Flutter already depend on these)
-    t.groupCount = effectiveGroupCount;
-    t.topNPerGroup = effectiveQualifiers;
+    // keep legacy mirrors aligned for older clients / recovery
+    t.groupCount = groupCount;
+    t.topNPerGroup = qualifiersPerGroup;
+    t.thirdPlacePlayoff = thirdPlacePlayoff;
     t.groupRandomize = groupRandomize;
     t.groupBalanced = groupBalanced;
     t.enableKnockoutStage = enableKnockoutStage;
 
     t.formatStatus = "CONFIGURED";
-    await t.save();
 
-    return jsonOk(res, t, 200, "Format configured");
+    await t.save();
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to configure format", 500);
+    return fail(res, e);
   }
 }
 
-// =========================================================
-// ✅ STEP 3B: Finalise Format (generates groups + matches)
-// POST /api/tournaments/:id/format/finalise
-// (also used by POST /:id/finalise alias in routes)
-// =========================================================
 export async function finaliseFormat(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status entriesStatus formatStatus format entrants groups matches defaultVenue playoffDefaultVenue groupCount topNPerGroup groupRandomize groupBalanced enableKnockoutStage formatConfig championName"
-    );
-    if (!t) return;
-
-    const status = normUpper(t.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
 
-    if (!isEntriesClosed(t)) {
-      return jsonErr(res, "Close entries first", 400);
+    assertSameClub(req, t);
+
+    const status = upper(t.status, "DRAFT");
+    if (status === "ACTIVE" || status === "LIVE" || status === "COMPLETED") {
+      const err = new Error("Tournament already started");
+      err.statusCode = 409;
+      throw err;
     }
 
-    const keys = getEntrantKeys(t);
-    if (keys.length < 2) {
-      return jsonErr(res, "Need at least 2 entrants", 400);
+    const es = upper(t.entriesStatus, "OPEN");
+    if (es !== "CLOSED") {
+      const err = new Error("Close entries first");
+      err.statusCode = 409;
+      throw err;
     }
 
-    const fStatus = normUpper(t.formatStatus, "DRAFT");
-
-    // Backwards compatibility:
-    // If still DRAFT, allow finalise to auto-configure from legacy fields once.
-    if (fStatus === "DRAFT") {
-      const cfg = getConfiguredFormatConfig(t);
-      const issues = validateFormatConfig(
-        { groupCount: cfg.groupCount, qualifiersPerGroup: cfg.qualifiersPerGroup },
-        keys.length
-      );
-      if (issues.length) return jsonErr(res, "Configure format first", 400, { issues });
-
-      t.formatConfig = {
-        groupCount: cfg.groupCount,
-        qualifiersPerGroup: cfg.qualifiersPerGroup,
-        knockoutType: cfg.knockoutType,
-        thirdPlacePlayoff: cfg.thirdPlacePlayoff,
-        groupRandomize: cfg.groupRandomize,
-        groupBalanced: cfg.groupBalanced,
-        enableKnockoutStage: cfg.enableKnockoutStage,
-      };
-      t.formatStatus = "CONFIGURED";
-      await t.save();
-    } else if (fStatus === "FINALISED") {
-      return jsonOk(res, t, 200, "Format already finalised");
-    } else if (fStatus !== "CONFIGURED") {
-      return jsonErr(res, "Invalid formatStatus state", 400);
+    // For group_stage: require configured
+    const fmt = String(t.format || "").trim();
+    const fs = upper(t.formatStatus, "DRAFT");
+    if (fmt === "group_stage") {
+      const cfg = t.formatConfig || {};
+      const hasCfg = cfg && Object.keys(cfg).length > 0;
+      if (fs === "DRAFT" || !hasCfg) {
+        const err = new Error("Configure format first");
+        err.statusCode = 409;
+        throw err;
+      }
     }
 
-    // Reload after potential auto-config
-    const t2 = await Tournament.findById(id);
-    if (!t2) return jsonErr(res, "Tournament not found", 404);
-
-    const cfg2 = getConfiguredFormatConfig(t2);
-    const issues2 = validateFormatConfig(
-      { groupCount: cfg2.groupCount, qualifiersPerGroup: cfg2.qualifiersPerGroup },
-      keys.length
-    );
-    if (issues2.length) {
-      return jsonErr(res, "Invalid format configuration", 400, { issues: issues2 });
-    }
-
-    // ✅ Deterministic generation happens here:
-    // clear generated data first (safe because not active yet)
-    t2.groups = [];
-    t2.matches = [];
-    t2.championName = "";
-
-    // keep legacy aligned again (defensive)
-    t2.groupCount = cfg2.groupCount;
-    t2.topNPerGroup = cfg2.qualifiersPerGroup;
-    t2.groupRandomize = cfg2.groupRandomize;
-    t2.groupBalanced = cfg2.groupBalanced;
-    t2.enableKnockoutStage = cfg2.enableKnockoutStage;
-
-    await t2.save();
-
-    // Generate groups for group_stage format
-    const format = String(t2.format || "").trim();
-    const venue = String(t2.defaultVenue || t2.playoffDefaultVenue || "").trim();
-
-    if (format === "group_stage") {
-      await svc.generateGroupsSeeded(id, {
-        groupCount: cfg2.groupCount,
-        groupSize: undefined,
-        randomize: cfg2.groupRandomize,
-      });
-    }
-
-    // Ensure matches exist (group + playoffs as per your existing service behavior)
-    await svc.generateMatchesForFormat(id, { format, defaultVenue: venue });
-
-    // Mark finalised last
-    const finalReload = await Tournament.findById(id);
-    if (!finalReload) return jsonErr(res, "Tournament not found", 404);
-
-    finalReload.formatStatus = "FINALISED";
-    await finalReload.save();
-
-    return jsonOk(res, finalReload, 200, "Format finalised");
+    t.formatStatus = "FINALISED";
+    await t.save();
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to finalise format", 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// POST /api/tournaments/:id/entrants
+// Entrants sync (server truth)
+// POST /:id/entrants { entrants: [...] }
 // -------------------------
-export async function setEntrants(req, res) {
+export async function setEntrantsObjects(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const lockCheck = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status entriesStatus formatStatus"
-    );
-    if (!lockCheck) return;
-
-    const locked =
-      normUpper(lockCheck.status, "DRAFT") === "ACTIVE" ||
-      normUpper(lockCheck.status, "DRAFT") === "COMPLETED" ||
-      isEntriesClosed(lockCheck) ||
-      isFormatFinalised(lockCheck);
-
-    if (locked) {
-      return jsonErr(
-        res,
-        isFormatFinalised(lockCheck)
-          ? "Tournament format is finalised. Entrants are locked."
-          : isEntriesClosed(lockCheck)
-          ? "Entries are closed for this tournament"
-          : "Tournament already started",
-        lockStatusCode()
-      );
+    const id = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(id);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
+    assertSameClub(req, t0);
 
-    const entrants = req.body?.entrants;
-    const entrantIds = req.body?.entrantIds;
-
-    if (Array.isArray(entrants) && entrants.length && typeof entrants[0] === "object") {
-      const t = await svc.setEntrantsObjects(id, entrants);
-      return jsonOk(res, t, 200, "Entrants saved");
-    }
-
-    const ids = Array.isArray(entrantIds) ? entrantIds : entrants;
-    if (!Array.isArray(ids) || ids.length < 2) {
-      return jsonErr(res, "Provide entrants (objects) or entrantIds (min 2)", 400);
-    }
-
-    const t = await svc.setEntrants(id, ids);
-    return jsonOk(res, t, 200, "Entrants saved");
+    const entrants = Array.isArray(req.body?.entrants) ? req.body.entrants : [];
+    const t = await svc.setEntrantsObjects(id, entrants);
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to set entrants", 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// POST /api/tournaments/:id/groups/generate
+// Groups generation (server truth)
+// POST /:id/groups/generate
+// body: { groupCount, groupSize, randomize }
 // -------------------------
 export async function generateGroups(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
-    if (!t0) return;
-
-    const locked =
-      isActiveStatus(t0.status) ||
-      normUpper(t0.status, "DRAFT") === "COMPLETED" ||
-      isEntriesClosed(t0) ||
-      isFormatFinalised(t0);
-
-    if (locked) {
-      return jsonErr(res, "Tournament is locked", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(id);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
+    assertSameClub(req, t0);
 
-    const groupCount =
-      req.body?.groupCount != null ? toInt(req.body.groupCount, undefined) : undefined;
-    const groupSize =
-      req.body?.groupSize != null ? toInt(req.body.groupSize, undefined) : undefined;
-    const randomize = req.body?.randomize != null ? !!req.body.randomize : undefined;
+    const groupCount = req.body?.groupCount;
+    const groupSize = req.body?.groupSize;
+    const randomize = req.body?.randomize;
 
     const t = await svc.generateGroupsSeeded(id, { groupCount, groupSize, randomize });
-    return jsonOk(res, t, 200, "Groups generated");
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to generate groups", 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// POST /api/tournaments/:id/matches/generate-group
+// Group matches generation (server truth)
+// POST /:id/matches/generate-group { defaultVenue }
 // -------------------------
 export async function generateGroupMatches(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus defaultVenue");
-    if (!t0) return;
-
-    const locked =
-      isActiveStatus(t0.status) ||
-      normUpper(t0.status, "DRAFT") === "COMPLETED" ||
-      isEntriesClosed(t0) ||
-      isFormatFinalised(t0);
-
-    if (locked) {
-      return jsonErr(res, "Tournament is locked", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(id);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
+    assertSameClub(req, t0);
 
-    const defaultVenue = String(req.body?.defaultVenue || t0.defaultVenue || "").trim();
-
+    const defaultVenue = String(req.body?.defaultVenue || "").trim();
     const t = await svc.generateGroupMatches(id, { defaultVenue });
-    return jsonOk(res, t, 200, "Group matches generated");
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to generate group matches", 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// POST /api/tournaments/:id/matches/generate
+// Matches generation for non-group formats (server truth)
+// POST /:id/matches/generate { format, defaultVenue }
 // -------------------------
-export async function generateMatches(req, res) {
+export async function generateMatchesForFormat(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus format defaultVenue playoffDefaultVenue");
-    if (!t0) return;
-
-    const locked =
-      isActiveStatus(t0.status) ||
-      normUpper(t0.status, "DRAFT") === "COMPLETED" ||
-      isEntriesClosed(t0) ||
-      isFormatFinalised(t0);
-
-    if (locked) {
-      return jsonErr(res, "Tournament is locked", lockStatusCode());
+    const id = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(id);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
+    assertSameClub(req, t0);
 
-    const format = String(req.body?.format || t0.format || "").trim();
-    const defaultVenue = String(
-      req.body?.defaultVenue || t0.defaultVenue || t0.playoffDefaultVenue || ""
-    ).trim();
+    const format = req.body?.format;
+    const defaultVenue = req.body?.defaultVenue;
 
     const t = await svc.generateMatchesForFormat(id, { format, defaultVenue });
-    return jsonOk(res, t, 200, "Matches generated");
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to generate matches", e?.statusCode || 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// POST /api/tournaments/:id/playoffs/generate
+// Patch match (server truth; handles playoffs propagation)
+// PATCH /:id/matches body: { id, ...patch }
+// -------------------------
+export async function patchMatch(req, res) {
+  try {
+    const tid = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(tid);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
+    assertSameClub(req, t0);
+
+    const t = await svc.upsertMatch(tid, req.body || {});
+    return ok(res, t);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+// -------------------------
+// Playoffs generate / clear (server truth)
 // -------------------------
 export async function generatePlayoffs(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t0 = await loadOwnedTournament(req, res, id, "clubId status entriesStatus formatStatus");
-    if (!t0) return;
-
-    // ✅ Playoffs generation is allowed during ACTIVE/LIVE after format is FINALISED
-    const status = normUpper(t0.status, "DRAFT");
-    if (!(status === "ACTIVE" || status === "LIVE")) {
-      return jsonErr(res, "Playoffs can only be generated after start", lockStatusCode());
+    const tid = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(tid);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
-    if (!isFormatFinalised(t0)) {
-      return jsonErr(res, "Finalise format first", lockStatusCode());
-    }
+    assertSameClub(req, t0);
 
-    const defaultVenue = String(req.body?.defaultVenue || "").trim();
-    const force = req.body?.force === true;
+    const defaultVenue = req.body?.defaultVenue;
+    const force = !!req.body?.force;
 
-    const t = await svc.generatePlayoffs(id, { defaultVenue, force });
-    return jsonOk(res, t, 200, "Playoffs generated");
+    const t = await svc.generatePlayoffs(tid, { defaultVenue, force });
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to generate playoffs", e?.statusCode || 500);
+    return fail(res, e);
   }
 }
 
-// -------------------------
-// DELETE /api/tournaments/:id/playoffs
-// -------------------------
 export async function clearPlayoffs(req, res) {
   try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-
-    const t0 = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status entriesStatus formatStatus"
-    );
-    if (!t0) return;
-
-    const status = normUpper(t0.status, "DRAFT");
-    if (status === "COMPLETED") {
-      return jsonErr(res, "Tournament completed", lockStatusCode());
+    const tid = String(req.params.id || "").trim();
+    const t0 = await Tournament.findById(tid);
+    if (!t0) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
+    assertSameClub(req, t0);
 
-    const t = await svc.clearPlayoffs(id);
-    return jsonOk(res, t, 200, "Playoffs cleared");
+    const t = await svc.clearPlayoffs(tid);
+    return ok(res, t);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to clear playoffs", e?.statusCode || 500);
+    return fail(res, e);
   }
 }
 
 // -------------------------
-// PATCH /api/tournaments/:id/matches (body must include match id)
-// -------------------------
-export async function upsertMatch(req, res) {
-  try {
-    if (!requireClub(req, res)) return;
-
-    const { id } = req.params;
-    const t = await svc.upsertMatch(id, req.body);
-    return jsonOk(res, t, 200, "Match updated");
-  } catch (e) {
-    return jsonErr(res, e?.message || "Failed to update match", e?.statusCode || 500);
-  }
-}
-
-// -------------------------
-// PATCH /api/tournaments/:id/matches/:matchId (Flutter-friendly: matchId in URL)
-// -------------------------
-export async function patchMatchById(req, res) {
-  try {
-    if (!requireClub(req, res)) return;
-
-    const { id, matchId } = req.params;
-
-    const payload = { ...(req.body || {}), id: String(matchId).trim() };
-    const t = await svc.upsertMatch(id, payload);
-
-    return jsonOk(res, t, 200, "Match updated");
-  } catch (e) {
-    return jsonErr(res, e?.message || "Failed to update match", e?.statusCode || 500);
-  }
-}
-
-// -------------------------
-// POST /api/tournaments/:id/start
+// START with auto-repair
+// POST /:id/start
 // -------------------------
 export async function startTournament(req, res) {
   try {
-    if (!requireClub(req, res)) return;
+    const tid = String(req.params.id || "").trim();
 
-    const { id } = req.params;
-
-    const t = await loadOwnedTournament(
-      req,
-      res,
-      id,
-      "clubId status startedAt entriesStatus formatStatus format entrants groups matches defaultVenue playoffDefaultVenue"
-    );
-    if (!t) return;
-
-    const status = normUpper(t.status, "DRAFT");
-    if (isActiveStatus(status) || status === "COMPLETED") {
-      return jsonErr(res, "Tournament already started", lockStatusCode());
+    let t = await Tournament.findById(tid);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
     }
 
+    assertSameClub(req, t);
+
+    // Must be closed + finalised
     const issues = [];
-
-    if (!isEntriesClosed(t)) issues.push("Close entries before starting");
-    if (!isFormatFinalised(t)) issues.push("Finalise format before starting");
-
-    const keys = getEntrantKeys(t);
-    if (keys.length < 2) issues.push("Need at least 2 entrants");
-
-    const format = String(t.format || "").trim();
-    if (!format) issues.push("Tournament format is missing");
-
-    const hasGroups = Array.isArray(t.groups) && t.groups.length > 0;
-    if (format === "group_stage" && !hasGroups) {
-      issues.push("Generate groups before starting");
-    }
+    if (upper(t.entriesStatus, "OPEN") !== "CLOSED") issues.push("Close entries first");
+    if (upper(t.formatStatus, "DRAFT") !== "FINALISED") issues.push("Finalise format first");
 
     if (issues.length) {
-      return jsonErr(res, "Tournament not ready", 400, { issues });
+      return res.status(409).json({ ok: false, message: "Tournament not ready", issues });
     }
+
+    // Auto-repair: regenerate missing groups/matches even though finalised
+    const fmt = String(t.format || "").trim();
+    const isGroup = fmt === "group_stage";
 
     const hasMatches = Array.isArray(t.matches) && t.matches.length > 0;
-    if (!hasMatches) {
-      // ✅ Step 3 patch: allow recovery regeneration even when FINALISED,
-      // but only pre-start and only for Start flow.
-      await svc.regenerateFinalisedMatchesForStart(id);
+    const hasGroups = Array.isArray(t.groups) && t.groups.length > 0;
+
+    if (!hasMatches || (isGroup && !hasGroups)) {
+      await svc.regenerateFinalisedMatchesForStart(tid);
+      t = await Tournament.findById(tid);
     }
 
-    const reloaded = await Tournament.findById(id);
-    if (!reloaded) return jsonErr(res, "Tournament not found", 404);
+    const hasMatches2 = Array.isArray(t.matches) && t.matches.length > 0;
+    const hasGroups2 = Array.isArray(t.groups) && t.groups.length > 0;
 
-    // final safety: ensure matches exist after regeneration
-    if (!Array.isArray(reloaded.matches) || reloaded.matches.length === 0) {
-      return jsonErr(res, "Start failed: no matches exist on server", 500);
+    const issues2 = [];
+    if (!hasMatches2) issues2.push("Matches are missing");
+    if (isGroup && !hasGroups2) issues2.push("Groups are missing");
+
+    if (issues2.length) {
+      return res.status(409).json({ ok: false, message: "Tournament not ready", issues: issues2 });
     }
 
-    reloaded.status = "ACTIVE";
-    reloaded.startedAt = new Date();
-    await reloaded.save();
+    // Start
+    const st = upper(t.status, "DRAFT");
+    if (st === "COMPLETED") {
+      const err = new Error("Tournament is completed");
+      err.statusCode = 409;
+      throw err;
+    }
+    if (st !== "ACTIVE" && st !== "LIVE") {
+      t.status = "ACTIVE";
+      await t.save();
+    }
 
-    return jsonOk(res, reloaded, 200, "Tournament started");
+    const out = await Tournament.findById(tid);
+    return ok(res, out);
   } catch (e) {
-    return jsonErr(res, e?.message || "Failed to start tournament", 500);
+    return fail(res, e);
   }
 }
