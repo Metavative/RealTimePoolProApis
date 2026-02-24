@@ -146,6 +146,12 @@ function makeMatchBase({ id, teamA, teamB, venue, nameByKey }) {
 // ------------------------------
 // Playoffs helpers
 // ------------------------------
+function nextPowerOf2(n) {
+  let p = 1;
+  while (p < n) p *= 2;
+  return p;
+}
+
 function playoffWinnerKey(match) {
   const aKey = String(match.teamA || "").trim();
   const bKey = String(match.teamB || "").trim();
@@ -166,6 +172,15 @@ function playoffWinnerKey(match) {
 function removePlayoffs(t) {
   t.matches = (t.matches || []).filter((m) => !isPlayoffMatchId(m.id));
   t.championName = "";
+
+  // ✅ clear metadata
+  t.playoffs = {
+    generatedAt: null,
+    qualifiersPerGroup: 0,
+    bracketSize: 0,
+    force: false,
+    venue: "",
+  };
 }
 
 function clearPlayoffRoundsAfter(t, round) {
@@ -793,6 +808,11 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
     else matches = generateRoundRobin(keys, venue, nameByKey);
 
     const t3 = await Tournament.findById(tournamentId);
+    if (!t3) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
     t3.matches = matches;
     t3.championName = "";
     await t3.save();
@@ -808,7 +828,7 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
   const t = await Tournament.findById(tournamentId);
   if (!t) throw new Error("Tournament not found");
 
-  // ✅ Playoffs are a LIVE operation
+  // ✅ Playoffs are a LIVE operation (your current rule)
   const status = normUpper(t.status, "DRAFT");
   if (!(status === "ACTIVE" || status === "LIVE")) {
     const err = new Error("Playoffs can only be generated after the tournament starts");
@@ -834,7 +854,7 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
     throw err;
   }
 
-  // ✅ Idempotent by default: if playoffs already exist, do nothing
+  // ✅ Idempotent by default
   const hasPlayoffs = (t.matches || []).some((m) => isPlayoffMatchId(m.id));
   if (hasPlayoffs && !force) return t;
 
@@ -863,31 +883,33 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
     }
   }
 
-  // Use venue fallback chain
-  const venue = String(
-    defaultVenue || t.playoffDefaultVenue || t.defaultVenue || ""
-  ).trim();
+  // ✅ Venue chain
+  const venue = String(defaultVenue || t.playoffDefaultVenue || t.defaultVenue || "").trim();
   t.playoffDefaultVenue = venue;
+
+  // ✅ Canonical qualifiersPerGroup (Step 4 rule)
+  const qpg = Math.max(
+    1,
+    Number(
+      t?.formatConfig?.qualifiersPerGroup ??
+        1
+    )
+  );
 
   // Create playoffs from standings
   const standings = computeGroupStandings(t);
-  const qualifiersByGroup = {};
 
+  const qualifiersByGroup = {};
   for (const g of t.groups) {
     const rows = standings[g.id] || [];
-    const n = Math.min(Number(t.topNPerGroup || 1), Math.max(0, rows.length));
+    const n = Math.min(qpg, Math.max(0, rows.length));
     qualifiersByGroup[g.id] = rows.slice(0, n);
   }
 
-  const totalQualifiers = Object.values(qualifiersByGroup).reduce(
-    (a, b) => a + b.length,
-    0
-  );
-  if (totalQualifiers < 2) {
-    await t.save();
-    return t;
-  }
-
+  // ✅ Deterministic ordering:
+  // r=0: all group winners in group order
+  // r=1: all group runners-up in group order
+  // etc
   const maxN = Object.values(qualifiersByGroup).reduce(
     (m, list) => Math.max(m, list.length),
     0
@@ -901,21 +923,42 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
     }
   }
 
+  if (ordered.length < 2) {
+    // Save metadata even if insufficient
+    t.playoffs = {
+      generatedAt: new Date(),
+      qualifiersPerGroup: qpg,
+      bracketSize: 0,
+      force: !!force,
+      venue,
+    };
+    await t.save();
+    return t;
+  }
+
+  // ✅ Bracket sizing: next power-of-2
+  const bracketSize = nextPowerOf2(ordered.length);
+
+  // Add BYEs deterministically at the end
+  const seeded = ordered.slice();
+  while (seeded.length < bracketSize) seeded.push("BYE");
+
   const nameByKey = new Map(
     (t.entrants || []).map((e) => [String(e.participantKey), pickEntrantName(e)])
   );
 
+  // ✅ Round 1: high vs low (1 vs N, 2 vs N-1, ...)
   const out = [];
   let counter = 1;
 
   let i = 0;
-  let j = ordered.length - 1;
+  let j = seeded.length - 1;
   while (i < j) {
     out.push(
       makeMatchBase({
         id: `po_r1_${counter++}`,
-        teamA: ordered[i],
-        teamB: ordered[j],
+        teamA: seeded[i],
+        teamB: seeded[j],
         venue,
         nameByKey,
       })
@@ -924,19 +967,16 @@ export async function generatePlayoffs(tournamentId, { defaultVenue, force = fal
     j--;
   }
 
-  if (i === j) {
-    out.push(
-      makeMatchBase({
-        id: `po_r1_${counter++}`,
-        teamA: ordered[i],
-        teamB: "BYE",
-        venue,
-        nameByKey,
-      })
-    );
-  }
-
   t.matches = [...(t.matches || []), ...out];
+
+  // ✅ Persist metadata
+  t.playoffs = {
+    generatedAt: new Date(),
+    qualifiersPerGroup: qpg,
+    bracketSize,
+    force: !!force,
+    venue,
+  };
 
   autoProgressFromRound(t, 1);
   await t.save();

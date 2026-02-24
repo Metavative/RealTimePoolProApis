@@ -939,13 +939,18 @@ export async function startTournament(req, res) {
 
     const hasMatches = Array.isArray(t.matches) && t.matches.length > 0;
     if (!hasMatches) {
-      // Recovery path: regenerate matches even if format is FINALISED,
-      // but ONLY because tournament is not started yet.
+      // ✅ Step 3 patch: allow recovery regeneration even when FINALISED,
+      // but only pre-start and only for Start flow.
       await svc.regenerateFinalisedMatchesForStart(id);
     }
 
     const reloaded = await Tournament.findById(id);
     if (!reloaded) return jsonErr(res, "Tournament not found", 404);
+
+    // final safety: ensure matches exist after regeneration
+    if (!Array.isArray(reloaded.matches) || reloaded.matches.length === 0) {
+      return jsonErr(res, "Start failed: no matches exist on server", 500);
+    }
 
     reloaded.status = "ACTIVE";
     reloaded.startedAt = new Date();

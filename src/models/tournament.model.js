@@ -134,6 +134,14 @@ const TournamentSchema = new mongoose.Schema(
     groups: { type: [TournamentGroupSchema], default: [] },
     matches: { type: [TournamentMatchSchema], default: [] },
 
+    playoffs: {
+      generatedAt: { type: Date, default: null },
+      qualifiersPerGroup: { type: Number, default: 0 },
+      bracketSize: { type: Number, default: 0 },
+      force: { type: Boolean, default: false },
+      venue: { type: String, trim: true, default: "" },
+    },
+
     playoffDefaultVenue: { type: String, trim: true, default: "" },
 
     championName: { type: String, trim: true, default: "" },
