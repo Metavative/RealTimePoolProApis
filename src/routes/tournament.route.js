@@ -44,5 +44,6 @@ router.delete("/:id/playoffs", clubAuthMiddleware, c.clearPlayoffs);
 
 // ✅ Start
 router.post("/:id/start", clubAuthMiddleware, c.startTournament);
+router.post("/:id/complete", clubAuthMiddleware, c.completeTournament);
 
 export default router;

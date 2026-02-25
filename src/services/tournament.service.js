@@ -167,6 +167,37 @@ function makeMatchBase({ id, teamA, teamB, venue, nameByKey }) {
 }
 
 // ------------------------------
+// ✅ roster comparison helpers (prevents match wipe when roster unchanged)
+// ------------------------------
+function rosterKeysOfEntrants(entrants) {
+  const keys = (Array.isArray(entrants) ? entrants : [])
+    .map((e) => String(e?.participantKey || "").trim())
+    .filter(Boolean);
+  keys.sort();
+  return keys;
+}
+
+function sameRosterByParticipantKey(oldEntrants, newEntrants) {
+  const a = rosterKeysOfEntrants(oldEntrants);
+  const b = rosterKeysOfEntrants(newEntrants);
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function refreshAllMatchNamesFromEntrants(t) {
+  if (!Array.isArray(t.matches) || t.matches.length === 0) return;
+  for (const m of t.matches) {
+    applyNamesForMatchFromEntrants(t, m);
+    // keep ids aligned too (safe)
+    m.teamAId = pkToUserObjectId(m.teamA);
+    m.teamBId = pkToUserObjectId(m.teamB);
+  }
+}
+
+// ------------------------------
 // Playoffs helpers
 // ------------------------------
 function nextPowerOf2(n) {
@@ -455,8 +486,10 @@ export async function addEntrantAndReseed(tournamentId, entrantPayload = {}) {
     },
   ];
 
+  const before = t.entrants || [];
   t.entrants = await reseedEntrantsFromCurrentList(t.entrants);
 
+  // ✅ roster changed (added) => clear generated data (existing logic)
   t.groups = [];
   t.matches = [];
   t.championName = "";
@@ -482,7 +515,7 @@ export async function setEntrants(tournamentId, entrantIds = []) {
       return `uid:${v}`;
     });
 
-  t.entrants = await reseedEntrantsFromCurrentList(
+  const incoming = await reseedEntrantsFromCurrentList(
     asKeys.map((pk) => ({
       participantKey: pk,
       entrantId: pkToUserObjectId(pk) || undefined,
@@ -495,9 +528,19 @@ export async function setEntrants(tournamentId, entrantIds = []) {
     }))
   );
 
-  t.groups = [];
-  t.matches = [];
-  t.championName = "";
+  const rosterSame = sameRosterByParticipantKey(t.entrants, incoming);
+
+  t.entrants = incoming;
+
+  // ✅ Only clear generated data if roster actually changed
+  if (!rosterSame) {
+    t.groups = [];
+    t.matches = [];
+    t.championName = "";
+  } else {
+    // keep matches/groups; just refresh names for consistency
+    refreshAllMatchNamesFromEntrants(t);
+  }
 
   await t.save();
   return t;
@@ -509,11 +552,20 @@ export async function setEntrantsObjects(tournamentId, entrants = []) {
 
   assertRosterMutable(t);
 
-  t.entrants = await reseedEntrantsFromCurrentList(entrants);
+  const incoming = await reseedEntrantsFromCurrentList(entrants);
+  const rosterSame = sameRosterByParticipantKey(t.entrants, incoming);
 
-  t.groups = [];
-  t.matches = [];
-  t.championName = "";
+  t.entrants = incoming;
+
+  // ✅ Only clear groups/matches when roster changes
+  if (!rosterSame) {
+    t.groups = [];
+    t.matches = [];
+    t.championName = "";
+  } else {
+    // keep generated data; update names/id links
+    refreshAllMatchNamesFromEntrants(t);
+  }
 
   await t.save();
   return t;
@@ -774,9 +826,8 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
   }
 
   const format = String(t.format || "").trim();
-  const venue = String(t.defaultVenue || t.playoffDefaultVenue || "").trim();
 
-  // Clear generated data safely (still DRAFT/ACTIVE/LIVE status, but not started)
+  // Clear generated data safely
   t.groups = t.groups || [];
   t.matches = [];
   t.championName = "";
@@ -784,7 +835,6 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
 
   // Rebuild from current tournament state
   if (format === "group_stage") {
-    // If groups are missing, generate them using stored config/legacy values
     if (!t.groups || t.groups.length === 0) {
       const cfg = {
         groupCount: Number(t.groupCount || 2),
@@ -802,16 +852,15 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
       );
     }
 
-    // Generate group matches (allowed here even though finalised, because this is a recovery path)
     const t2 = await Tournament.findById(tournamentId);
     const venue2 = String(t2.defaultVenue || t2.playoffDefaultVenue || "").trim();
+
     await generateGroupMatches(
       tournamentId,
       { defaultVenue: venue2 },
       { allowFinalised: true }
     );
   } else {
-    // Non group formats: regenerate matches directly
     const entrants = Array.isArray(t.entrants) ? t.entrants : [];
     const keys = entrants
       .map((e) => String(e.participantKey || "").trim())
@@ -825,6 +874,8 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
     const nameByKey = new Map(
       entrants.map((e) => [String(e.participantKey), pickEntrantName(e)])
     );
+
+    const venue = String(t.defaultVenue || t.playoffDefaultVenue || "").trim();
 
     let matches = [];
     if (format === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);

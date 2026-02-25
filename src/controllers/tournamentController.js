@@ -89,7 +89,9 @@ export async function create(req, res) {
     const groupCount = Number(req.body?.groupCount || 2);
     const topNPerGroup = Number(req.body?.topNPerGroup || 1);
     const enableKnockoutStage =
-      req.body?.enableKnockoutStage === undefined ? true : !!req.body.enableKnockoutStage;
+      req.body?.enableKnockoutStage === undefined
+        ? true
+        : !!req.body.enableKnockoutStage;
 
     const t = await Tournament.create({
       clubId: cid,
@@ -157,7 +159,8 @@ export async function patch(req, res) {
 
     // safe patch set
     if (req.body?.title !== undefined) t.title = String(req.body.title || "").trim();
-    if (req.body?.defaultVenue !== undefined) t.defaultVenue = String(req.body.defaultVenue || "").trim();
+    if (req.body?.defaultVenue !== undefined)
+      t.defaultVenue = String(req.body.defaultVenue || "").trim();
     if (req.body?.playoffDefaultVenue !== undefined)
       t.playoffDefaultVenue = String(req.body.playoffDefaultVenue || "").trim();
 
@@ -311,16 +314,24 @@ export async function configureFormat(req, res) {
     }
 
     // canonical config
-    const groupCount = Math.max(1, Number(req.body?.groupCount || t.formatConfig?.groupCount || 2));
+    const groupCount = Math.max(
+      1,
+      Number(req.body?.groupCount || t.formatConfig?.groupCount || 2)
+    );
     const qualifiersPerGroup = Math.max(
       1,
       Number(req.body?.qualifiersPerGroup || t.formatConfig?.qualifiersPerGroup || 1)
     );
 
-    const knockoutType = String(req.body?.knockoutType || t.formatConfig?.knockoutType || "SINGLE_ELIM").trim();
+    const knockoutType = String(
+      req.body?.knockoutType || t.formatConfig?.knockoutType || "SINGLE_ELIM"
+    ).trim();
+
     const thirdPlacePlayoff = !!req.body?.thirdPlacePlayoff;
-    const groupRandomize = req.body?.groupRandomize === undefined ? true : !!req.body.groupRandomize;
-    const groupBalanced = req.body?.groupBalanced === undefined ? true : !!req.body.groupBalanced;
+    const groupRandomize =
+      req.body?.groupRandomize === undefined ? true : !!req.body.groupRandomize;
+    const groupBalanced =
+      req.body?.groupBalanced === undefined ? true : !!req.body.groupBalanced;
     const enableKnockoutStage =
       req.body?.enableKnockoutStage === undefined ? true : !!req.body.enableKnockoutStage;
 
@@ -606,7 +617,11 @@ export async function startTournament(req, res) {
     if (isGroup && !hasGroups2) issues2.push("Groups are missing");
 
     if (issues2.length) {
-      return res.status(409).json({ ok: false, message: "Tournament not ready", issues: issues2 });
+      return res.status(409).json({
+        ok: false,
+        message: "Tournament not ready",
+        issues: issues2,
+      });
     }
 
     // Start
@@ -620,6 +635,52 @@ export async function startTournament(req, res) {
       t.status = "ACTIVE";
       await t.save();
     }
+
+    const out = await Tournament.findById(tid);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+// -------------------------
+// COMPLETE tournament
+// POST /:id/complete
+// -------------------------
+export async function completeTournament(req, res) {
+  try {
+    const tid = String(req.params.id || "").trim();
+
+    const t = await Tournament.findById(tid);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
+
+    assertSameClub(req, t);
+
+    const st = upper(t.status, "DRAFT");
+    if (st === "COMPLETED") {
+      // idempotent
+      return ok(res, t);
+    }
+
+    // optional rule: only allow complete if started
+    if (st !== "ACTIVE" && st !== "LIVE") {
+      const err = new Error("Tournament must be ACTIVE/LIVE to complete");
+      err.statusCode = 409;
+      err.issues = ["Start the tournament first"];
+      throw err;
+    }
+
+    t.status = "COMPLETED";
+    t.completedAt = new Date();
+
+    // if you store champion on server, keep it (do not overwrite)
+    // if you want to compute champion server-side later, you can add svc helpers here.
+
+    await t.save();
 
     const out = await Tournament.findById(tid);
     return ok(res, out);
