@@ -146,6 +146,22 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
   return now - last < windowMs;
 }
 
+// =========================
+// ✅ Name helpers (NEW)
+// =========================
+function normalizeName(v) {
+  const s = toStr(v);
+  return s ? s.replace(/\s+/g, " ").trim() : "";
+}
+
+function isLikelyHumanName(v) {
+  const s = normalizeName(v);
+  if (!s) return false;
+  if (s.length < 2) return false;
+  // letters (incl accents), spaces, apostrophe, hyphen
+  return /^[a-zA-ZÀ-ÿ\s'\-]+$/.test(s);
+}
+
 // Username validation (mirrors model constraints)
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
 const RESERVED_USERNAMES = new Set([
@@ -207,8 +223,23 @@ export const signUp = async (req, res) => {
 
     const nickname = pickNickname(body, email, phone);
 
+    // ✅ NEW: player KYC-ish fields
+    const firstName = normalizeName(body.firstName);
+    const lastName = normalizeName(body.lastName);
+    const isPlayer = (role || "").toLowerCase() === "player";
+
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!password) return res.status(400).json({ message: "Password required" });
+
+    // ✅ If player: require legal name
+    if (isPlayer) {
+      if (!firstName || !lastName) {
+        return res.status(400).json({ message: "First name and last name required" });
+      }
+      if (!isLikelyHumanName(firstName) || !isLikelyHumanName(lastName)) {
+        return res.status(400).json({ message: "Invalid first/last name" });
+      }
+    }
 
     // Check if username already taken (case-insensitive via usernameLower)
     const existingUsername = await User.findOne({ usernameLower: username.toLowerCase() }).select("_id username");
@@ -236,6 +267,14 @@ export const signUp = async (req, res) => {
 
         existing.profile = existing.profile || {};
         if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
+
+        // ✅ Persist names if player
+        if (isPlayer) {
+          existing.profile.firstName = existing.profile.firstName || firstName;
+          existing.profile.lastName = existing.profile.lastName || lastName;
+          existing.profile.legalName =
+            existing.profile.legalName || `${firstName} ${lastName}`.trim();
+        }
 
         existing.stats = existing.stats || {};
         if (!existing.stats.userIdTag) existing.stats.userIdTag = await createUniqueTag();
@@ -266,6 +305,13 @@ export const signUp = async (req, res) => {
         ...(nickname ? { nickname } : {}),
         ...(role ? { role, userType: role } : {}),
         ...(organizer ? { organizer } : {}),
+        ...(isPlayer
+          ? {
+              firstName,
+              lastName,
+              legalName: `${firstName} ${lastName}`.trim(),
+            }
+          : {}),
       },
       stats: { userIdTag: tag },
       emailVerified: false,

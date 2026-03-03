@@ -9,6 +9,16 @@ const FeedbackSchema = new mongoose.Schema({
 
 const ProfileSchema = new mongoose.Schema({
   nickname: String,
+
+  // ✅ NEW: KYC-ready identity fields
+  firstName: { type: String, default: "" },
+  lastName: { type: String, default: "" },
+  legalName: { type: String, default: "" },
+
+  // ✅ Good to explicitly define (your authController writes these)
+  role: { type: String, default: "" },
+  userType: { type: String, default: "" },
+
   avatar: { type: String, default: "" },
   highestLevelAchieve: String,
   musicPlayer: { type: Boolean, default: true },
@@ -28,6 +38,9 @@ const ProfileSchema = new mongoose.Schema({
   lastSeen: { type: Date, default: Date.now },
   latitude: { type: Number, default: null },
   longitude: { type: Number, default: null },
+
+  // If you later store organizer objects inside profile
+  organizer: { type: mongoose.Schema.Types.Mixed, default: null },
 });
 
 const EarningsSchema = new mongoose.Schema({
@@ -69,6 +82,11 @@ const RESERVED_USERNAMES = new Set([
   "undefined",
   "root",
 ]);
+
+function cleanName(v) {
+  const s = (v ?? "").toString().trim().replace(/\s+/g, " ");
+  return s;
+}
 
 const UserSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true, trim: true, lowercase: true },
@@ -148,16 +166,32 @@ UserSchema.pre("save", function (next) {
     this.usernameLower = null;
   }
 
-  // Profile avatar fallback
+  // Normalize profile name fields
   if (this.profile) {
+    if (typeof this.profile.firstName === "string") this.profile.firstName = cleanName(this.profile.firstName);
+    if (typeof this.profile.lastName === "string") this.profile.lastName = cleanName(this.profile.lastName);
+
+    // Keep legalName synced if missing
+    const fn = cleanName(this.profile.firstName || "");
+    const ln = cleanName(this.profile.lastName || "");
+    if ((!this.profile.legalName || !String(this.profile.legalName).trim()) && (fn || ln)) {
+      this.profile.legalName = cleanName(`${fn} ${ln}`.trim());
+    } else if (typeof this.profile.legalName === "string") {
+      this.profile.legalName = cleanName(this.profile.legalName);
+    }
+
+    // Profile avatar fallback
     if (!this.profile.avatar || this.profile.avatar === "") {
       if (this.profile.nickname && this.profile.nickname.length > 0) {
         this.profile.avatar = this.profile.nickname[0].toUpperCase();
+      } else if (this.profile.firstName && this.profile.firstName.length > 0) {
+        this.profile.avatar = this.profile.firstName[0].toUpperCase();
       } else {
         this.profile.avatar = "?";
       }
     }
   }
+
   next();
 });
 
