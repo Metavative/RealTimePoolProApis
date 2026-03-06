@@ -16,7 +16,7 @@ import connectCloudinary from "./config/cloudinary.config.js";
 import User from "./models/user.model.js";
 
 import authRoutes from "./routes/auth.route.js";
-import clubAuthRoutes from "./routes/clubAuth.route.js"; // ✅ NEW
+import clubAuthRoutes from "./routes/clubAuth.route.js";
 
 import userRoutes from "./routes/user.route.js";
 import friendRoutes from "./routes/friend.route.js";
@@ -24,22 +24,17 @@ import matchRoutes from "./routes/match.route.js";
 import clubRoutes from "./routes/club.route.js";
 import bookingRoutes from "./routes/booking.route.js";
 import zegoRoutes from "./routes/zego.route.js";
-
-import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
-
-// ✅ NOTE: route filename must match actual file name
-// You shared a routes file as tournament.route.js (singular) in this server file,
-// but earlier you shared tournament.routes.js (plural) in the backend.
-// Make sure the filename in /routes matches this import.
 import tournamentRoutes from "./routes/tournament.route.js";
-
 import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
 import clubOwnerRoutes from "./routes/clubOwner.route.js";
 import storeRoutes from "./routes/store.route.js";
+import adminRoutes from "./routes/admin.route.js";
+
+import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 
 dotenv.config();
 
-// ---- Global crash logging (so Railway ALWAYS shows something) ----
+// ---- Global crash logging ----
 process.on("unhandledRejection", (reason) => {
   console.error("❌ UNHANDLED REJECTION:", reason);
 });
@@ -50,16 +45,15 @@ process.on("uncaughtException", (err) => {
 
 const app = express();
 
-// ✅ Railway runs behind a reverse proxy; required for express-rate-limit + real IP
+// Railway / proxies
 app.set("trust proxy", 1);
 
-// Middleware setup
+// Middleware
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
-// CORS setup
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -67,16 +61,13 @@ app.use(
   })
 );
 
-// Logger
 app.use(morgan("dev"));
 
-// ✅ Force-log every request (even if morgan doesn’t show it in some env)
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-// Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
@@ -85,7 +76,9 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Routes (do NOT require io)
+// --------------------------------------------------
+// Routes that do NOT require io / presence
+// --------------------------------------------------
 app.use("/api/auth", authRoutes);
 app.use("/api/auth/club", clubAuthRoutes);
 
@@ -95,13 +88,11 @@ app.use("/api/club", clubRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/zego", zegoRoutes);
 
-// ✅ Tournament routes (club-auth)
 app.use("/api/tournaments", tournamentRoutes);
-
-// Store routes (user auth for me/*, purchase, equip)
 app.use("/api/store", storeRoutes);
+app.use("/api/admin", adminRoutes);
 
-// Health check endpoint
+// Health check
 app.get("/api/health", (req, res) => {
   console.log("✅ Health check endpoint hit");
   res.status(200).json({
@@ -111,7 +102,9 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Server and Socket.io setup
+// --------------------------------------------------
+// Server + Socket
+// --------------------------------------------------
 const server = Http.createServer(app);
 
 server.on("error", (err) => {
@@ -125,10 +118,9 @@ const io = new Server(server, {
   },
 });
 
-// Presence map for online players
+// Presence map
 const presence = new Map();
 
-// Small helper methods so controllers can use presence.isOnline / presence.getSocketIds
 presence.isOnline = (userId) => {
   return presence.has(String(userId));
 };
@@ -138,20 +130,25 @@ presence.getSocketIds = (userId) => {
   return sid ? [sid] : [];
 };
 
-// ✅ Routes that need io/presence MUST be mounted after io + presence exist
+// --------------------------------------------------
+// Routes that DO require io / presence
+// --------------------------------------------------
 app.use("/api/friend", friendRoutes(io, presence));
 app.use("/api/club", clubOwnerRoutes());
 app.use("/api", tournamentInviteRoutes(io, presence));
 
-// User status endpoint
+// User online status endpoint
 app.get("/api/user/status/:id", (req, res) => {
   const { id } = req.params;
   res.json({ userId: String(id), online: presence.has(String(id)) });
 });
 
-// Emit online players to connected clients
+// --------------------------------------------------
+// Presence helpers
+// --------------------------------------------------
 async function emitOnlinePlayers() {
   const ids = Array.from(presence.keys());
+
   if (ids.length === 0) {
     io.emit("presence:update", []);
     return;
@@ -166,11 +163,11 @@ async function emitOnlinePlayers() {
   io.emit("presence:update", users);
 }
 
-// Get nearby players based on the user's location
 async function getNearbyPlayersForUser(userId, radiusKm = 5) {
   const me = await User.findById(userId)
     .select("location profile.latitude profile.longitude")
     .lean();
+
   if (!me) return [];
 
   const coords = me.location?.coordinates;
@@ -197,7 +194,9 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
   return nearby;
 }
 
-// Socket.io connection handler
+// --------------------------------------------------
+// Socket.io
+// --------------------------------------------------
 io.on("connection", (socket) => {
   console.log(`✅ Socket connected: ${socket.id}`);
 
@@ -208,8 +207,6 @@ io.on("connection", (socket) => {
     if (!uid) return;
 
     socket.userId = uid;
-
-    // Join per-user room so server can emit to this user if you use rooms elsewhere
     socket.join(`user:${uid}`);
 
     presence.set(uid, socket.id);
@@ -287,6 +284,7 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", async () => {
     const uid = socket.userId ? String(socket.userId) : "";
+
     if (uid) {
       presence.delete(uid);
 
@@ -306,7 +304,9 @@ io.on("connection", (socket) => {
   });
 });
 
-// ✅ Error handling middleware MUST be after routes
+// --------------------------------------------------
+// Express error handler
+// --------------------------------------------------
 app.use((err, req, res, next) => {
   console.error("❌ EXPRESS ERROR:");
   console.error("Route:", req.method, req.originalUrl);
@@ -326,7 +326,9 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 4000;
 
+// --------------------------------------------------
 // Start server
+// --------------------------------------------------
 (async () => {
   try {
     console.log("🚀 Booting server...");
@@ -345,7 +347,7 @@ const PORT = process.env.PORT || 4000;
   }
 })();
 
-// Graceful shutdown on SIGINT
+// Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\nServer shutting down...");
   server.close(() => {

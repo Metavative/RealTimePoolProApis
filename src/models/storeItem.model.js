@@ -15,8 +15,8 @@ const StoreItemSchema = new mongoose.Schema(
       type: String,
       required: true,
       enum: ["CUE", "TABLE", "ACCESSORY"],
-      uppercase: true,
       trim: true,
+      uppercase: true,
     },
 
     name: {
@@ -40,8 +40,8 @@ const StoreItemSchema = new mongoose.Schema(
       type: String,
       default: "GBP",
       enum: ["GBP"],
-      uppercase: true,
       trim: true,
+      uppercase: true,
     },
 
     price: {
@@ -60,8 +60,8 @@ const StoreItemSchema = new mongoose.Schema(
       type: String,
       default: "COMMON",
       enum: ["COMMON", "RARE", "EPIC", "LEGENDARY"],
-      uppercase: true,
       trim: true,
+      uppercase: true,
     },
 
     tags: {
@@ -84,6 +84,7 @@ const StoreItemSchema = new mongoose.Schema(
     active: {
       type: Boolean,
       default: true,
+      index: true,
     },
 
     sortOrder: {

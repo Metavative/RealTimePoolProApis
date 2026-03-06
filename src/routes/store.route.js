@@ -34,7 +34,7 @@ router.patch("/admin/items/:sku", auth, adminUpdateItem);
 router.delete("/admin/items/:sku", auth, adminDeleteItem);
 
 // ------------------------------
-// Admin orders
+// Admin order management
 // ------------------------------
 router.get("/admin/orders", auth, adminListOrders);
 router.patch("/admin/orders/:orderId/status", auth, adminUpdateOrderStatus);

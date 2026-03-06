@@ -5,16 +5,31 @@ function userIdFromReq(req) {
   return req.user?.id || req.user?._id || null;
 }
 
-function isAdmin(req) {
-  const role =
-    req.user?.role ||
-    req.user?.userType ||
-    req.user?.profile?.role ||
-    req.user?.profile?.userType ||
-    "";
+function roleFromReq(req) {
+  const candidates = [
+    req.user?.role,
+    req.user?.userType,
+    req.user?.accountType,
+    req.user?.profile?.role,
+    req.user?.profile?.userType,
+    req.user?.profile?.type,
+  ];
 
-  const x = String(role).trim().toLowerCase();
-  return x.includes("admin") || x.includes("organizer") || x.includes("club");
+  for (const c of candidates) {
+    const s = String(c || "").trim();
+    if (s) return s.toLowerCase();
+  }
+  return "";
+}
+
+function isAdmin(req) {
+  const role = roleFromReq(req);
+  return (
+    role.includes("admin") ||
+    role.includes("organizer") ||
+    role.includes("club") ||
+    role.includes("venue")
+  );
 }
 
 function normalizeType(v) {
@@ -25,14 +40,18 @@ function normalizeSku(v) {
   return String(v || "").trim().toUpperCase();
 }
 
+function cleanString(v, fallback = "") {
+  return String(v ?? fallback).trim();
+}
+
 // --------------------------------------------------
-// PUBLIC / PLAYER
+// PLAYER / PUBLIC
 // --------------------------------------------------
 
 export async function listItems(req, res) {
   try {
     const type = normalizeType(req.query.type);
-    const q = String(req.query.q || "").trim();
+    const q = cleanString(req.query.q);
 
     const filter = { active: true };
 
@@ -44,7 +63,7 @@ export async function listItems(req, res) {
       filter.$or = [
         { name: { $regex: q, $options: "i" } },
         { description: { $regex: q, $options: "i" } },
-        { tags: { $in: [new RegExp(q, "i")] } },
+        { tags: { $elemMatch: { $regex: q, $options: "i" } } },
       ];
     }
 
@@ -92,13 +111,12 @@ export async function createOrder(req, res) {
 
     const sku = normalizeSku(req.body?.sku);
     const qty = Math.max(1, Number(req.body?.qty || 1));
+    const notes = cleanString(req.body?.notes);
 
     const shippingAddress =
       req.body?.shippingAddress && typeof req.body.shippingAddress === "object"
         ? req.body.shippingAddress
         : {};
-
-    const notes = String(req.body?.notes || "").trim();
 
     if (!sku) {
       return res.status(400).json({ ok: false, message: "Missing sku" });
@@ -113,7 +131,7 @@ export async function createOrder(req, res) {
     if (item.stockQty <= 0) {
       return res
         .status(400)
-        .json({ ok: false, code: "OUT_OF_STOCK", message: "Item out of stock" });
+        .json({ ok: false, code: "OUT_OF_STOCK", message: "Item is out of stock" });
     }
 
     if (qty > item.stockQty) {
@@ -135,7 +153,7 @@ export async function createOrder(req, res) {
           name: item.name,
           qty,
           unitPrice: item.price,
-          currency: item.currency,
+          currency: item.currency || "GBP",
           imageUrl: item.images?.thumbUrl || item.images?.previewUrl || "",
         },
       ],
@@ -144,14 +162,14 @@ export async function createOrder(req, res) {
       paymentStatus: "PENDING",
       orderStatus: "PENDING",
       shippingAddress: {
-        fullName: String(shippingAddress.fullName || "").trim(),
-        line1: String(shippingAddress.line1 || "").trim(),
-        line2: String(shippingAddress.line2 || "").trim(),
-        city: String(shippingAddress.city || "").trim(),
-        county: String(shippingAddress.county || "").trim(),
-        postcode: String(shippingAddress.postcode || "").trim(),
-        country: String(shippingAddress.country || "UK").trim(),
-        phone: String(shippingAddress.phone || "").trim(),
+        fullName: cleanString(shippingAddress.fullName),
+        line1: cleanString(shippingAddress.line1),
+        line2: cleanString(shippingAddress.line2),
+        city: cleanString(shippingAddress.city),
+        county: cleanString(shippingAddress.county),
+        postcode: cleanString(shippingAddress.postcode),
+        country: cleanString(shippingAddress.country, "UK"),
+        phone: cleanString(shippingAddress.phone),
       },
       notes,
     });
@@ -159,8 +177,8 @@ export async function createOrder(req, res) {
     return res.json({
       ok: true,
       message: "Order created",
-      order,
       stripeReady: false,
+      order,
     });
   } catch (e) {
     return res
@@ -190,7 +208,7 @@ export async function myOrders(req, res) {
 }
 
 // --------------------------------------------------
-// ADMIN
+// ADMIN - PRODUCTS
 // --------------------------------------------------
 
 export async function adminCreateItem(req, res) {
@@ -203,12 +221,12 @@ export async function adminCreateItem(req, res) {
 
     const sku = normalizeSku(body.sku);
     const type = normalizeType(body.type);
-    const name = String(body.name || "").trim();
-    const description = String(body.description || "").trim();
+    const name = cleanString(body.name);
+    const description = cleanString(body.description);
+    const currency = cleanString(body.currency || "GBP").toUpperCase();
     const price = Number(body.price || 0);
     const stockQty = Math.max(0, Number(body.stockQty || 0));
     const rarity = normalizeType(body.rarity || "COMMON");
-    const currency = String(body.currency || "GBP").trim().toUpperCase();
 
     if (!sku || !type || !name) {
       return res.status(400).json({
@@ -227,15 +245,15 @@ export async function adminCreateItem(req, res) {
       name,
       description,
       images: {
-        thumbUrl: String(body.images?.thumbUrl || "").trim(),
-        previewUrl: String(body.images?.previewUrl || "").trim(),
+        thumbUrl: cleanString(body.images?.thumbUrl),
+        previewUrl: cleanString(body.images?.previewUrl),
       },
       currency,
       price,
       stockQty,
       rarity,
       tags: Array.isArray(body.tags)
-        ? body.tags.map((x) => String(x).trim()).filter(Boolean)
+        ? body.tags.map((x) => cleanString(x)).filter(Boolean)
         : [],
       weightKg: Number(body.weightKg || 0),
       dimensions: {
@@ -268,6 +286,7 @@ export async function adminUpdateItem(req, res) {
     }
 
     const sku = normalizeSku(req.params.sku);
+
     if (!sku) {
       return res.status(400).json({ ok: false, message: "Missing sku" });
     }
@@ -276,20 +295,20 @@ export async function adminUpdateItem(req, res) {
     const patch = {};
 
     if (body.type != null) patch.type = normalizeType(body.type);
-    if (body.name != null) patch.name = String(body.name).trim();
-    if (body.description != null) patch.description = String(body.description).trim();
+    if (body.name != null) patch.name = cleanString(body.name);
+    if (body.description != null) patch.description = cleanString(body.description);
+    if (body.currency != null) patch.currency = cleanString(body.currency).toUpperCase();
     if (body.price != null) patch.price = Number(body.price);
     if (body.stockQty != null) patch.stockQty = Math.max(0, Number(body.stockQty));
     if (body.rarity != null) patch.rarity = normalizeType(body.rarity);
-    if (body.currency != null) patch.currency = String(body.currency).trim().toUpperCase();
     if (body.active != null) patch.active = !!body.active;
     if (body.sortOrder != null) patch.sortOrder = Number(body.sortOrder);
     if (body.weightKg != null) patch.weightKg = Number(body.weightKg);
 
     if (body.images) {
       patch.images = {
-        thumbUrl: String(body.images.thumbUrl || "").trim(),
-        previewUrl: String(body.images.previewUrl || "").trim(),
+        thumbUrl: cleanString(body.images.thumbUrl),
+        previewUrl: cleanString(body.images.previewUrl),
       };
     }
 
@@ -302,11 +321,12 @@ export async function adminUpdateItem(req, res) {
     }
 
     if (Array.isArray(body.tags)) {
-      patch.tags = body.tags.map((x) => String(x).trim()).filter(Boolean);
+      patch.tags = body.tags.map((x) => cleanString(x)).filter(Boolean);
     }
 
     const item = await StoreItem.findOneAndUpdate({ sku }, patch, {
       new: true,
+      runValidators: true,
     }).lean();
 
     if (!item) {
@@ -328,6 +348,7 @@ export async function adminDeleteItem(req, res) {
     }
 
     const sku = normalizeSku(req.params.sku);
+
     if (!sku) {
       return res.status(400).json({ ok: false, message: "Missing sku" });
     }
@@ -346,9 +367,13 @@ export async function adminDeleteItem(req, res) {
   } catch (e) {
     return res
       .status(500)
-      .json({ ok: false, message: e.message || "Failed to delete item" });
+      .json({ ok: false, message: e.message || "Failed to disable item" });
   }
 }
+
+// --------------------------------------------------
+// ADMIN - ORDERS
+// --------------------------------------------------
 
 export async function adminListOrders(req, res) {
   try {
@@ -374,9 +399,13 @@ export async function adminUpdateOrderStatus(req, res) {
       return res.status(403).json({ ok: false, message: "Forbidden" });
     }
 
-    const orderId = String(req.params.orderId || "").trim();
+    const orderId = cleanString(req.params.orderId);
     const orderStatus = normalizeType(req.body?.orderStatus);
     const paymentStatus = normalizeType(req.body?.paymentStatus);
+
+    if (!orderId) {
+      return res.status(400).json({ ok: false, message: "Missing orderId" });
+    }
 
     const patch = {};
 
@@ -394,6 +423,7 @@ export async function adminUpdateOrderStatus(req, res) {
 
     const order = await StoreOrder.findByIdAndUpdate(orderId, patch, {
       new: true,
+      runValidators: true,
     }).lean();
 
     if (!order) {

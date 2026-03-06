@@ -2,19 +2,53 @@ import mongoose from "mongoose";
 
 const StoreOrderItemSchema = new mongoose.Schema(
   {
-    sku: { type: String, required: true, trim: true, uppercase: true },
+    sku: {
+      type: String,
+      required: true,
+      trim: true,
+      uppercase: true,
+    },
+
     type: {
       type: String,
       required: true,
       enum: ["CUE", "TABLE", "ACCESSORY"],
+      trim: true,
       uppercase: true,
+    },
+
+    name: {
+      type: String,
+      required: true,
       trim: true,
     },
-    name: { type: String, required: true, trim: true },
-    qty: { type: Number, required: true, min: 1, default: 1 },
-    unitPrice: { type: Number, required: true, min: 0 },
-    currency: { type: String, required: true, default: "GBP", enum: ["GBP"] },
-    imageUrl: { type: String, default: "" },
+
+    qty: {
+      type: Number,
+      required: true,
+      min: 1,
+      default: 1,
+    },
+
+    unitPrice: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    currency: {
+      type: String,
+      required: true,
+      default: "GBP",
+      enum: ["GBP"],
+      trim: true,
+      uppercase: true,
+    },
+
+    imageUrl: {
+      type: String,
+      default: "",
+    },
   },
   { _id: false }
 );
@@ -30,11 +64,8 @@ const StoreOrderSchema = new mongoose.Schema(
 
     items: {
       type: [StoreOrderItemSchema],
+      required: true,
       default: [],
-      validate: {
-        validator: (arr) => Array.isArray(arr) && arr.length > 0,
-        message: "Order must contain at least one item",
-      },
     },
 
     subtotal: {
@@ -47,14 +78,15 @@ const StoreOrderSchema = new mongoose.Schema(
       type: String,
       default: "GBP",
       enum: ["GBP"],
-      uppercase: true,
       trim: true,
+      uppercase: true,
     },
 
     paymentStatus: {
       type: String,
       default: "PENDING",
       enum: ["PENDING", "PAID", "FAILED", "REFUNDED"],
+      trim: true,
       uppercase: true,
       index: true,
     },
@@ -62,13 +94,8 @@ const StoreOrderSchema = new mongoose.Schema(
     orderStatus: {
       type: String,
       default: "PENDING",
-      enum: [
-        "PENDING",
-        "PROCESSING",
-        "SHIPPED",
-        "DELIVERED",
-        "CANCELLED",
-      ],
+      enum: ["PENDING", "PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"],
+      trim: true,
       uppercase: true,
       index: true,
     },
