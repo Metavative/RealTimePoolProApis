@@ -2,35 +2,97 @@ import mongoose from "mongoose";
 
 const StoreItemSchema = new mongoose.Schema(
   {
-    sku: { type: String, required: true, unique: true, index: true },
-    type: { type: String, required: true, enum: ["CUE", "TABLE", "ACCESSORY"] },
+    sku: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+      trim: true,
+      uppercase: true,
+    },
 
-    name: { type: String, required: true },
-    description: { type: String, default: "" },
+    type: {
+      type: String,
+      required: true,
+      enum: ["CUE", "TABLE", "ACCESSORY"],
+      uppercase: true,
+      trim: true,
+    },
+
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
+    description: {
+      type: String,
+      default: "",
+      trim: true,
+    },
 
     images: {
       thumbUrl: { type: String, default: "" },
       previewUrl: { type: String, default: "" },
     },
 
-    currency: { type: String, default: "COINS", enum: ["COINS"] },
-    price: { type: Number, required: true, min: 0 },
+    currency: {
+      type: String,
+      default: "GBP",
+      enum: ["GBP"],
+      uppercase: true,
+      trim: true,
+    },
+
+    price: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    stockQty: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
 
     rarity: {
       type: String,
       default: "COMMON",
       enum: ["COMMON", "RARE", "EPIC", "LEGENDARY"],
+      uppercase: true,
+      trim: true,
     },
 
-    tags: { type: [String], default: [] },
+    tags: {
+      type: [String],
+      default: [],
+    },
 
-    // optional later: effects you can apply in gameplay
-    effects: { type: mongoose.Schema.Types.Mixed, default: {} },
+    weightKg: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
 
-    active: { type: Boolean, default: true },
-    sortOrder: { type: Number, default: 0 },
+    dimensions: {
+      lengthCm: { type: Number, default: 0, min: 0 },
+      widthCm: { type: Number, default: 0, min: 0 },
+      heightCm: { type: Number, default: 0, min: 0 },
+    },
+
+    active: {
+      type: Boolean,
+      default: true,
+    },
+
+    sortOrder: {
+      type: Number,
+      default: 0,
+    },
   },
   { timestamps: true }
 );
 
-export default mongoose.model("StoreItem", StoreItemSchema);
+export default mongoose.models.StoreItem ||
+  mongoose.model("StoreItem", StoreItemSchema);

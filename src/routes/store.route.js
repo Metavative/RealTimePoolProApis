@@ -3,23 +3,40 @@ import { authMiddleware as auth } from "../middleware/authMiddleware.js";
 import {
   listItems,
   getItem,
-  myEntitlements,
-  myLoadout,
-  purchase,
-  equip,
+  createOrder,
+  myOrders,
+  adminCreateItem,
+  adminUpdateItem,
+  adminDeleteItem,
+  adminListOrders,
+  adminUpdateOrderStatus,
 } from "../controllers/store.controller.js";
 
 const router = express.Router();
 
-// public-ish catalog (you can make it auth if you prefer)
+// ------------------------------
+// Public / player catalog
+// ------------------------------
 router.get("/items", listItems);
 router.get("/items/:sku", getItem);
 
-// user endpoints
-router.get("/me/entitlements", auth, myEntitlements);
-router.get("/me/loadout", auth, myLoadout);
+// ------------------------------
+// Player orders
+// ------------------------------
+router.get("/me/orders", auth, myOrders);
+router.post("/orders", auth, createOrder);
 
-router.post("/purchase", auth, purchase);
-router.post("/equip", auth, equip);
+// ------------------------------
+// Admin product management
+// ------------------------------
+router.post("/admin/items", auth, adminCreateItem);
+router.patch("/admin/items/:sku", auth, adminUpdateItem);
+router.delete("/admin/items/:sku", auth, adminDeleteItem);
+
+// ------------------------------
+// Admin orders
+// ------------------------------
+router.get("/admin/orders", auth, adminListOrders);
+router.patch("/admin/orders/:orderId/status", auth, adminUpdateOrderStatus);
 
 export default router;
