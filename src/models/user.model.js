@@ -10,7 +10,7 @@ const FeedbackSchema = new mongoose.Schema({
 const ProfileSchema = new mongoose.Schema({
   nickname: String,
 
-  // ✅ NEW: KYC-ready identity fields
+  // ✅ KYC-ready identity fields
   firstName: { type: String, default: "" },
   lastName: { type: String, default: "" },
   legalName: { type: String, default: "" },
@@ -39,7 +39,6 @@ const ProfileSchema = new mongoose.Schema({
   latitude: { type: Number, default: null },
   longitude: { type: Number, default: null },
 
-  // If you later store organizer objects inside profile
   organizer: { type: mongoose.Schema.Types.Mixed, default: null },
 });
 
@@ -92,7 +91,7 @@ const UserSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true, trim: true, lowercase: true },
   phone: { type: String, index: true, unique: true, sparse: true, trim: true },
 
-  // ✅ Public username handle (required at signup by controller)
+  // ✅ Public username handle
   username: { type: String, trim: true, default: null },
   usernameLower: {
     type: String,
@@ -104,11 +103,9 @@ const UserSchema = new mongoose.Schema({
     sparse: true,
   },
 
-  // ✅ Verification flags
   emailVerified: { type: Boolean, default: false, index: true },
   phoneVerified: { type: Boolean, default: false, index: true },
 
-  // ✅ OTP telemetry (rate limiting + debugging)
   lastOtpSent: { type: Date, default: null },
   lastOtpChannel: { type: String, enum: ["email", "phone", "multi", null], default: null },
 
@@ -126,7 +123,6 @@ const UserSchema = new mongoose.Schema({
   friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   createdAt: { type: Date, default: Date.now },
 
-  // ✅ Email OTP storage (only used for email OTP)
   otp: {
     code: String,
     expiresAt: Date,
@@ -143,11 +139,10 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ location: "2dsphere" });
 
 UserSchema.pre("save", function (next) {
-  // Normalize
   if (this.email) this.email = String(this.email).trim().toLowerCase();
   if (this.phone) this.phone = String(this.phone).trim();
 
-  // Normalize usernameLower and validate
+  // username normalization + validation
   if (this.username) {
     const raw = String(this.username).trim();
 
@@ -166,12 +161,11 @@ UserSchema.pre("save", function (next) {
     this.usernameLower = null;
   }
 
-  // Normalize profile name fields
+  // Profile name normalization
   if (this.profile) {
     if (typeof this.profile.firstName === "string") this.profile.firstName = cleanName(this.profile.firstName);
     if (typeof this.profile.lastName === "string") this.profile.lastName = cleanName(this.profile.lastName);
 
-    // Keep legalName synced if missing
     const fn = cleanName(this.profile.firstName || "");
     const ln = cleanName(this.profile.lastName || "");
     if ((!this.profile.legalName || !String(this.profile.legalName).trim()) && (fn || ln)) {
@@ -180,7 +174,6 @@ UserSchema.pre("save", function (next) {
       this.profile.legalName = cleanName(this.profile.legalName);
     }
 
-    // Profile avatar fallback
     if (!this.profile.avatar || this.profile.avatar === "") {
       if (this.profile.nickname && this.profile.nickname.length > 0) {
         this.profile.avatar = this.profile.nickname[0].toUpperCase();

@@ -147,7 +147,7 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
 }
 
 // =========================
-// ✅ Name helpers (NEW)
+// Name helpers
 // =========================
 function normalizeName(v) {
   const s = toStr(v);
@@ -158,11 +158,12 @@ function isLikelyHumanName(v) {
   const s = normalizeName(v);
   if (!s) return false;
   if (s.length < 2) return false;
-  // letters (incl accents), spaces, apostrophe, hyphen
   return /^[a-zA-ZÀ-ÿ\s'\-]+$/.test(s);
 }
 
-// Username validation (mirrors model constraints)
+// =========================
+// Username validation
+// =========================
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
 const RESERVED_USERNAMES = new Set([
   "admin",
@@ -203,6 +204,14 @@ function validateUsernameOrThrow(username) {
   return { raw, lower };
 }
 
+function canChangeUsername(user) {
+  if (!user) return true;
+  const hasPassword = !!getPasswordFromUser(user);
+  const verified = !!user.emailVerified || !!user.phoneVerified;
+  // ✅ if password set or verified, treat as "final"
+  return !(hasPassword || verified);
+}
+
 // =========================
 // PASSWORD signup/login
 // =========================
@@ -216,14 +225,14 @@ export const signUp = async (req, res) => {
     const password = toStr(body.password);
 
     // ✅ REQUIRED USERNAME
-    const { raw: username } = validateUsernameOrThrow(body.username);
+    const { raw: username, lower: usernameLower } = validateUsernameOrThrow(body.username);
 
     const role = toStr(body.role) || toStr(body.userType) || "";
     const organizer = body.organizer && typeof body.organizer === "object" ? body.organizer : null;
 
     const nickname = pickNickname(body, email, phone);
 
-    // ✅ NEW: player KYC-ish fields
+    // ✅ player fields
     const firstName = normalizeName(body.firstName);
     const lastName = normalizeName(body.lastName);
     const isPlayer = (role || "").toLowerCase() === "player";
@@ -231,7 +240,6 @@ export const signUp = async (req, res) => {
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!password) return res.status(400).json({ message: "Password required" });
 
-    // ✅ If player: require legal name
     if (isPlayer) {
       if (!firstName || !lastName) {
         return res.status(400).json({ message: "First name and last name required" });
@@ -241,57 +249,75 @@ export const signUp = async (req, res) => {
       }
     }
 
-    // Check if username already taken (case-insensitive via usernameLower)
-    const existingUsername = await User.findOne({ usernameLower: username.toLowerCase() }).select("_id username");
-    if (existingUsername) {
-      return res.status(409).json({ message: "Username already taken" });
-    }
-
+    // ✅ FIRST: find existing user by email/phone (placeholder or real)
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
-
     const existing = await User.findOne({ $or: queryOr }).select("+passwordHash +password");
+
+    // ✅ If existing user present, handle upgrade/signup completion
     if (existing) {
+      // If username differs:
+      if (existing.usernameLower && existing.usernameLower !== usernameLower) {
+        // If account is final, block
+        if (!canChangeUsername(existing)) {
+          return res.status(409).json({
+            code: "USERNAME_LOCKED",
+            message: "This account is already created. You can’t change the username here.",
+          });
+        }
+
+        // Otherwise allow change ONLY if not taken by someone else
+        const takenByOther = await User.findOne({
+          usernameLower,
+          _id: { $ne: existing._id },
+        }).select("_id username");
+        if (takenByOther) {
+          return res.status(409).json({ code: "USERNAME_TAKEN", message: "Username already taken" });
+        }
+
+        existing.username = username; // pre-save sets usernameLower
+      } else if (!existing.username) {
+        existing.username = username;
+      }
+
       const existingPass = getPasswordFromUser(existing);
 
-      // If user exists and already has a username, it must match
-      if (existing.usernameLower && existing.usernameLower !== username.toLowerCase()) {
-        return res.status(409).json({ message: "Account exists with a different username" });
+      // If user exists and already has a password -> it's a real account
+      if (existingPass) {
+        return res.status(409).json({ message: "User exists" });
       }
 
-      // upgrade if password missing
-      if (!existingPass) {
-        const hash = await bcrypt.hash(password, 10);
-        setPasswordOnUser(existing, hash);
+      // Upgrade placeholder: set password + fill profile
+      const hash = await bcrypt.hash(password, 10);
+      setPasswordOnUser(existing, hash);
 
-        existing.username = existing.username || username;
+      existing.profile = existing.profile || {};
+      if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
 
-        existing.profile = existing.profile || {};
-        if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
-
-        // ✅ Persist names if player
-        if (isPlayer) {
-          existing.profile.firstName = existing.profile.firstName || firstName;
-          existing.profile.lastName = existing.profile.lastName || lastName;
-          existing.profile.legalName =
-            existing.profile.legalName || `${firstName} ${lastName}`.trim();
-        }
-
-        existing.stats = existing.stats || {};
-        if (!existing.stats.userIdTag) existing.stats.userIdTag = await createUniqueTag();
-
-        if (role) {
-          existing.profile.role = existing.profile.role || role;
-          existing.profile.userType = existing.profile.userType || role;
-        }
-        if (organizer) existing.profile.organizer = organizer;
-
-        await existing.save();
-
-        const token = sign({ id: existing._id });
-        return res.json({ user: safeUser(existing), token, upgraded: true });
+      if (isPlayer) {
+        existing.profile.firstName = existing.profile.firstName || firstName;
+        existing.profile.lastName = existing.profile.lastName || lastName;
+        existing.profile.legalName = existing.profile.legalName || `${firstName} ${lastName}`.trim();
       }
 
-      return res.status(409).json({ message: "User exists" });
+      existing.stats = existing.stats || {};
+      if (!existing.stats.userIdTag) existing.stats.userIdTag = await createUniqueTag();
+
+      if (role) {
+        existing.profile.role = existing.profile.role || role;
+        existing.profile.userType = existing.profile.userType || role;
+      }
+      if (organizer) existing.profile.organizer = organizer;
+
+      await existing.save();
+
+      const token = sign({ id: existing._id });
+      return res.json({ user: safeUser(existing), token, upgraded: true });
+    }
+
+    // ✅ NEW USER: ensure username isn’t taken
+    const existingUsername = await User.findOne({ usernameLower }).select("_id username");
+    if (existingUsername) {
+      return res.status(409).json({ code: "USERNAME_TAKEN", message: "Username already taken" });
     }
 
     const hash = await bcrypt.hash(password, 10);
@@ -306,11 +332,7 @@ export const signUp = async (req, res) => {
         ...(role ? { role, userType: role } : {}),
         ...(organizer ? { organizer } : {}),
         ...(isPlayer
-          ? {
-              firstName,
-              lastName,
-              legalName: `${firstName} ${lastName}`.trim(),
-            }
+          ? { firstName, lastName, legalName: `${firstName} ${lastName}`.trim() }
           : {}),
       },
       stats: { userIdTag: tag },
@@ -325,12 +347,11 @@ export const signUp = async (req, res) => {
     const token = sign({ id: user._id });
     return res.json({ user: safeUser(user), token });
   } catch (error) {
-    console.error("[AUTH][SIGNUP][ERROR]", { requestId, message: error?.message, stack: error?.stack });
+    console.error("[AUTH][SIGNUP][ERROR]", { message: error?.message, stack: error?.stack });
 
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
 
     if (error && error.code === 11000) {
-      // Could be email/phone/usernameLower collisions
       return res.status(409).json({ message: "Duplicate value (email/phone/username) already exists" });
     }
     return res.status(500).json({ message: error?.message || "Internal server error" });
@@ -378,7 +399,6 @@ export async function requestSignupOtp(req, res) {
   try {
     const body = getBody(req);
 
-    // ✅ REQUIRED USERNAME FOR SIGNUP
     const { raw: username, lower: usernameLower } = validateUsernameOrThrow(body.username);
 
     const email =
@@ -389,7 +409,7 @@ export async function requestSignupOtp(req, res) {
       normalizePhone(body.phone) ||
       (!isEmailIdentifier(toStr(body.identifier)) ? normalizePhone(body.identifier) : undefined);
 
-    log("INPUT", { username, email, phone, raw: { email: body.email, phone: body.phone, identifier: body.identifier } });
+    log("INPUT", { username, email, phone });
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
@@ -398,17 +418,43 @@ export async function requestSignupOtp(req, res) {
       return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
-    // Block if username already taken (even before creating email/phone user)
-    const usernameTaken = await User.findOne({ usernameLower }).select("_id username");
-    if (usernameTaken) {
-      return res.status(409).json({ message: "Username already taken" });
-    }
-
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
-    let user = await User.findOne({ $or: queryOr });
+    let user = queryOr.length ? await User.findOne({ $or: queryOr }).select("+passwordHash +password") : null;
 
-    // Create if doesn't exist yet
-    if (!user) {
+    if (user) {
+      const usernameCanChange = canChangeUsername(user);
+
+      // If username differs and account is final -> block
+      if (!usernameCanChange && user.usernameLower && user.usernameLower !== usernameLower) {
+        return res.status(409).json({
+          code: "USERNAME_LOCKED",
+          message: "This account is already created. You can’t change the username here.",
+        });
+      }
+
+      // If username differs and still in signup -> allow change if not taken by someone else
+      if (user.usernameLower !== usernameLower) {
+        const usernameTakenByOther = await User.findOne({
+          usernameLower,
+          _id: { $ne: user._id },
+        }).select("_id username");
+
+        if (usernameTakenByOther) {
+          return res.status(409).json({ code: "USERNAME_TAKEN", message: "Username already taken" });
+        }
+
+        user.username = username; // pre-save sets usernameLower
+      }
+
+      user.stats = user.stats || {};
+      if (!user.stats.userIdTag) user.stats.userIdTag = await createUniqueTag();
+    } else {
+      // No user exists yet -> ensure username is free
+      const usernameTaken = await User.findOne({ usernameLower }).select("_id username");
+      if (usernameTaken) {
+        return res.status(409).json({ code: "USERNAME_TAKEN", message: "Username already taken" });
+      }
+
       log("USER_NOT_FOUND_CREATING");
       user = await User.create({
         ...(email ? { email } : {}),
@@ -421,14 +467,6 @@ export async function requestSignupOtp(req, res) {
         profile: { ...(email ? { nickname: email.split("@")[0] } : phone ? { nickname: phone } : {}) },
         stats: { userIdTag: await createUniqueTag() },
       });
-    } else {
-      // If user exists, ensure username matches or is set
-      if (user.usernameLower && user.usernameLower !== usernameLower) {
-        return res.status(409).json({ message: "Account exists with a different username" });
-      }
-      if (!user.username) {
-        user.username = username;
-      }
     }
 
     if (isRateLimited(user.lastOtpSent, 60_000)) {
@@ -453,13 +491,9 @@ export async function requestSignupOtp(req, res) {
         user.otp = { code, expiresAt };
         await user.save();
 
-        log("EMAIL_OTP_SAVED", { email: user.email, expiresAt });
         await sendOtpEmail(user.email, code);
-        log("EMAIL_SENT_OK", { email: user.email });
-
         channelsSent.push("email");
       } catch (e) {
-        log("EMAIL_SEND_FAILED", { message: e?.message, code: e?.code });
         channelsFailed.push({ channel: "email", error: e?.message || "email_failed" });
       }
     } else {
@@ -472,28 +506,17 @@ export async function requestSignupOtp(req, res) {
       channelsAttempted.push("phone");
       try {
         if (!isValidE164(user.phone)) {
-          log("INVALID_PHONE_E164_STORED", { phone: user.phone });
           channelsFailed.push({ channel: "phone", error: "invalid_e164" });
         } else {
-          log("TWILIO_CONFIG", {
-            hasAccountSid: !!TWILIO_ACCOUNT_SID,
-            hasAuthToken: !!TWILIO_AUTH_TOKEN,
-            hasClient: !!twilioClient,
-            verifyServiceSid: TWILIO_VERIFY_SERVICE_SID,
-          });
-
           await twilioSendVerifySms(user.phone);
-          log("TWILIO_SMS_SENT_OK", { phone: user.phone });
           channelsSent.push("phone");
         }
       } catch (e) {
-        log("TWILIO_SEND_FAILED", { message: e?.message, code: e?.code, more: e?.moreInfo });
         channelsFailed.push({ channel: "phone", error: e?.message || "twilio_failed" });
       }
     }
 
     const ok = channelsSent.length > 0;
-    log("RESULT", { ok, channelsAttempted, channelsSent, channelsFailed });
 
     return res.json({
       ok,
@@ -526,7 +549,6 @@ export async function requestOtp(req, res) {
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
-    // Safety: if someone uses this endpoint for signup, require username
     let requestedUsername = null;
     if (flow === "signup") {
       requestedUsername = validateUsernameOrThrow(body.username).raw;
@@ -576,7 +598,6 @@ export async function requestOtp(req, res) {
       return res.json({ ok: true, message: "OTP sent", channel: "email", target: email, flow });
     }
 
-    // phone -> Twilio Verify
     user.otp = undefined;
     await user.save();
     await twilioSendVerifySms(phone);
@@ -600,7 +621,7 @@ export async function verifyOtp(req, res) {
     const email = lookup.email;
     const phone = lookup.phone;
 
-    const flow = toStr(body.flow) || "login"; // signup|login
+    const flow = toStr(body.flow) || "login";
     const code = otpToString(body.code || body.otp);
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });

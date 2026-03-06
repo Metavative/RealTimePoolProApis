@@ -14,7 +14,7 @@ import {
   resetPassword,
   clerkLogin,
 
-  // legacy phone endpoints (exported in controller, no crash)
+  // legacy phone endpoints
   phoneRegisterRequestOtp,
   phoneRegisterVerifyOtp,
   phoneLoginRequestOtp,
