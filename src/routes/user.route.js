@@ -1,3 +1,4 @@
+// src/routes/user.routes.js
 import express from "express";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import * as useCtrl from "../controllers/userController.js";
@@ -29,13 +30,16 @@ router.get("/nearest/:id", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "Location not set" });
     }
 
-    const allUsers = await User.find({ "profile.onlineStatus": true });
+    const allUsers = await User.find({
+      "profile.onlineStatus": true,
+      _id: { $ne: userId },
+    });
 
     const distance = (lat1, lon1, lat2, lon2) => {
       const R = 6371;
 
-      const dLat = ((lat2 + lat1 * -1) * Math.PI) / 180;
-      const dLon = ((lon2 + lon1 * -1) * Math.PI) / 180;
+      const dLat = ((lat2 - lat1) * Math.PI) / 180;
+      const dLon = ((lon2 - lon1) * Math.PI) / 180;
 
       const a =
         Math.sin(dLat / 2) ** 2 +
@@ -47,17 +51,30 @@ router.get("/nearest/:id", authMiddleware, async (req, res) => {
     };
 
     const nearby = allUsers
-      .filter((u) => u._id.toString() !== userId)
       .map((u) => ({
         id: u._id,
-        nickname: u.profile?.nickname,
-        avatar: u.profile?.avatar,
-        distance: distance(latitude, longitude, u.profile?.latitude, u.profile?.longitude),
+        username: u.username || "",
+        nickname: u.profile?.nickname || "",
+        avatar: u.profile?.avatar || "",
+        distance: distance(
+          latitude,
+          longitude,
+          u.profile?.latitude,
+          u.profile?.longitude
+        ),
       }))
+      .filter((u) => Number.isFinite(u.distance))
       .sort((a, b) => a.distance - b.distance)
       .slice(0, 10);
 
-    return res.json(nearby);
+    return res.json({
+      users: nearby,
+      capabilities: {
+        canPlay: !!req?.auth?.canPlay || !!req?.userId,
+        canManageVenue: !!req?.auth?.canManageVenue || !!req?.clubId,
+        actorType: req?.auth?.actorType || "user",
+      },
+    });
   } catch (err) {
     return res.status(500).json({ message: "Server error", error: String(err.message || err) });
   }

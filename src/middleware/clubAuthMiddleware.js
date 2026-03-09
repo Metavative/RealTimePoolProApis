@@ -1,5 +1,43 @@
+// src/middleware/clubAuthMiddleware.js
 import Club from "../models/club.model.js";
+import User from "../models/user.model.js";
 import { verify } from "../services/jwtService.js";
+
+async function ensureClubOwnerUser(club) {
+  if (!club) return null;
+
+  if (club.owner) {
+    const ownerUser = await User.findById(club.owner).select({
+      passwordHash: 0,
+      otp: 0,
+    });
+    if (ownerUser) return ownerUser;
+  }
+
+  let matchedUser = null;
+
+  if (club.email) {
+    matchedUser = await User.findOne({ email: club.email }).select({
+      passwordHash: 0,
+      otp: 0,
+    });
+  }
+
+  if (!matchedUser && club.phone) {
+    matchedUser = await User.findOne({ phone: club.phone }).select({
+      passwordHash: 0,
+      otp: 0,
+    });
+  }
+
+  if (matchedUser) {
+    club.owner = matchedUser._id;
+    await club.save();
+    return matchedUser;
+  }
+
+  return null;
+}
 
 export async function clubAuthMiddleware(req, res, next) {
   try {
@@ -22,7 +60,6 @@ export async function clubAuthMiddleware(req, res, next) {
       return res.status(401).json({ message: "Invalid token payload" });
     }
 
-    // Enforce club-scoped tokens
     const isClub =
       payload.typ === "club_access" ||
       payload.role === "CLUB" ||
@@ -43,11 +80,22 @@ export async function clubAuthMiddleware(req, res, next) {
       return res.status(401).json({ message: "Club not found" });
     }
 
+    const ownerUser = await ensureClubOwnerUser(club);
+
     req.clubId = club._id.toString();
     req.club = club;
 
-    // ✅ important for controllers that use requireClub()
     req.authType = "club";
+    req.ownerUser = ownerUser || null;
+    req.ownerUserId = ownerUser ? ownerUser._id.toString() : null;
+
+    req.auth = {
+      tokenRole: "CLUB",
+      tokenType: "club_access",
+      actorType: ownerUser ? "club_owner_hybrid" : "club_only",
+      canManageVenue: true,
+      canPlay: !!ownerUser,
+    };
 
     return next();
   } catch (e) {

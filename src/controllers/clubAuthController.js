@@ -1,6 +1,6 @@
 // src/controllers/clubAuthController.js
 import Club from "../models/club.model.js";
-import User from "../models/user.model.js"; // ✅ NEW (to link Club.owner)
+import User from "../models/user.model.js";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { sign } from "../services/jwtService.js";
@@ -108,14 +108,13 @@ function pickEmailOrPhone(body) {
   return {};
 }
 
-// ✅ NEW: allow linking a Club to a real organizer User
 function pickOwnerUserId(body) {
-  // accept multiple field names
   const v =
     toStr(body.ownerUserId) ||
     toStr(body.ownerId) ||
     toStr(body.userId) ||
     toStr(body.organizerUserId);
+
   return v || undefined;
 }
 
@@ -132,11 +131,26 @@ async function resolveOwnerUserIdOrThrow(ownerUserId) {
 
 function safeClub(club) {
   if (!club) return null;
-  const obj = club.toObject ? club.toObject() : club;
+  const obj = club.toObject ? club.toObject() : { ...club };
   delete obj.passwordHash;
   delete obj.password;
   delete obj.otp;
   return obj;
+}
+
+function safeUser(user) {
+  if (!user) return null;
+  const obj = user.toObject ? user.toObject() : { ...user };
+  delete obj.passwordHash;
+  delete obj.otp;
+  return {
+    _id: obj._id,
+    email: obj.email || null,
+    phone: obj.phone || null,
+    username: obj.username || null,
+    profile: obj.profile || {},
+    stats: obj.stats || {},
+  };
 }
 
 function getPasswordFromClub(club) {
@@ -148,8 +162,15 @@ function setPasswordOnClub(club, hash) {
   club.password = hash;
 }
 
-function clubToken(clubId) {
-  return sign({ id: clubId, role: "CLUB", typ: "club_access" });
+function clubToken(club, ownerUserId) {
+  return sign({
+    id: String(club._id),
+    role: "CLUB",
+    typ: "club_access",
+    ownerUserId: ownerUserId ? String(ownerUserId) : undefined,
+    canPlay: true,
+    canManageVenue: true,
+  });
 }
 
 function isRateLimited(lastOtpSent, windowMs = 60_000) {
@@ -158,6 +179,209 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
   const last = new Date(lastOtpSent).getTime();
   if (!Number.isFinite(last)) return false;
   return now - last < windowMs;
+}
+
+function makeUsernameBase({ club, email, phone }) {
+  const fromName = toStr(club?.name)
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  if (fromName && fromName.length >= 3) return fromName.slice(0, 20);
+
+  const fromEmail = toStr(email).split("@")[0]
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  if (fromEmail && fromEmail.length >= 3) return fromEmail.slice(0, 20);
+
+  const digits = toStr(phone).replace(/\D/g, "");
+  if (digits.length >= 3) return `venue_${digits.slice(-8)}`.slice(0, 20);
+
+  return `venue_${String(club?._id || "").slice(-6)}`.slice(0, 20);
+}
+
+async function generateUniqueUsername(baseInput) {
+  let base = toStr(baseInput)
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  if (!base || base.length < 3) base = "venue_player";
+  if (base.length > 20) base = base.slice(0, 20);
+
+  let candidate = base;
+  let i = 0;
+
+  while (true) {
+    const exists = await User.exists({ usernameLower: candidate.toLowerCase() });
+    if (!exists) return candidate;
+
+    i += 1;
+    const suffix = `_${i}`;
+    const trimmed = base.slice(0, Math.max(3, 20 - suffix.length));
+    candidate = `${trimmed}${suffix}`;
+  }
+}
+
+async function ensureClubOwnerUser(club, explicitOwnerUserId) {
+  if (!club) return null;
+
+  // 1) explicit owner passed from request
+  if (explicitOwnerUserId) {
+    if (!club.owner || String(club.owner) !== String(explicitOwnerUserId)) {
+      club.owner = explicitOwnerUserId;
+      await club.save();
+    }
+
+    const ownerUser = await User.findById(explicitOwnerUserId).select({ passwordHash: 0, otp: 0 });
+    if (ownerUser) {
+      let changed = false;
+
+      ownerUser.profile = ownerUser.profile || {};
+      ownerUser.profile.role = ownerUser.profile.role || "VENUE_OWNER";
+      ownerUser.profile.userType = ownerUser.profile.userType || "VENUE_OWNER";
+      ownerUser.profile.organizer = {
+        ...(ownerUser.profile.organizer || {}),
+        clubId: club._id,
+        clubName: club.name || "",
+      };
+
+      if (!ownerUser.email && club.email) {
+        ownerUser.email = club.email;
+        changed = true;
+      }
+      if (!ownerUser.phone && club.phone) {
+        ownerUser.phone = club.phone;
+        changed = true;
+      }
+      if (!ownerUser.profile.nickname && club.name) {
+        ownerUser.profile.nickname = club.name;
+        changed = true;
+      }
+
+      if (changed) await ownerUser.save();
+      return ownerUser;
+    }
+  }
+
+  // 2) already linked
+  if (club.owner) {
+    const existingOwner = await User.findById(club.owner).select({ passwordHash: 0, otp: 0 });
+    if (existingOwner) {
+      let changed = false;
+
+      existingOwner.profile = existingOwner.profile || {};
+      if (!existingOwner.profile.role) {
+        existingOwner.profile.role = "VENUE_OWNER";
+        changed = true;
+      }
+      if (!existingOwner.profile.userType) {
+        existingOwner.profile.userType = "VENUE_OWNER";
+        changed = true;
+      }
+
+      existingOwner.profile.organizer = {
+        ...(existingOwner.profile.organizer || {}),
+        clubId: club._id,
+        clubName: club.name || "",
+      };
+
+      if (!existingOwner.email && club.email) {
+        existingOwner.email = club.email;
+        changed = true;
+      }
+      if (!existingOwner.phone && club.phone) {
+        existingOwner.phone = club.phone;
+        changed = true;
+      }
+      if (!existingOwner.profile.nickname && club.name) {
+        existingOwner.profile.nickname = club.name;
+        changed = true;
+      }
+
+      if (changed) await existingOwner.save();
+      return existingOwner;
+    }
+  }
+
+  // 3) try to find an existing User by email/phone
+  let matchedUser = null;
+
+  if (club.email) {
+    matchedUser = await User.findOne({ email: club.email }).select({ passwordHash: 0, otp: 0 });
+  }
+  if (!matchedUser && club.phone) {
+    matchedUser = await User.findOne({ phone: club.phone }).select({ passwordHash: 0, otp: 0 });
+  }
+
+  if (matchedUser) {
+    club.owner = matchedUser._id;
+    await club.save();
+
+    matchedUser.profile = matchedUser.profile || {};
+    matchedUser.profile.role = matchedUser.profile.role || "VENUE_OWNER";
+    matchedUser.profile.userType = matchedUser.profile.userType || "VENUE_OWNER";
+    matchedUser.profile.organizer = {
+      ...(matchedUser.profile.organizer || {}),
+      clubId: club._id,
+      clubName: club.name || "",
+    };
+
+    if (!matchedUser.profile.nickname && club.name) {
+      matchedUser.profile.nickname = club.name;
+    }
+
+    await matchedUser.save();
+    return matchedUser;
+  }
+
+  // 4) create a new shadow player user for the venue owner
+  const usernameBase = makeUsernameBase({
+    club,
+    email: club.email,
+    phone: club.phone,
+  });
+  const username = await generateUniqueUsername(usernameBase);
+
+  const newUser = await User.create({
+    ...(club.email ? { email: club.email } : {}),
+    ...(club.phone ? { phone: club.phone } : {}),
+    emailVerified: !!club.emailVerified,
+    phoneVerified: !!club.phoneVerified,
+    username,
+    profile: {
+      nickname: club.name || username,
+      role: "VENUE_OWNER",
+      userType: "VENUE_OWNER",
+      verified: !!club.verified,
+      organizer: {
+        clubId: club._id,
+        clubName: club.name || "",
+      },
+    },
+  });
+
+  club.owner = newUser._id;
+  await club.save();
+
+  return User.findById(newUser._id).select({ passwordHash: 0, otp: 0 });
+}
+
+async function attachVenuePlayer(club, ownerUserId) {
+  const ownerUser = await ensureClubOwnerUser(club, ownerUserId);
+  const token = clubToken(club, ownerUser?._id);
+
+  return {
+    club: safeClub(club),
+    ownerUser: safeUser(ownerUser),
+    token,
+    capabilities: {
+      canManageVenue: true,
+      canPlay: true,
+    },
+  };
 }
 
 // =============================
@@ -175,12 +399,15 @@ export async function clubSignUp(req, res) {
     const name = toStr(body.name);
     const address = toStr(body.address);
 
-    // ✅ NEW: optional owner link at signup
     const ownerUserIdRaw = pickOwnerUserId(body);
     const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
 
-    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
-    if (!password) return res.status(400).json({ message: "Password required" });
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
+    }
+    if (!password) {
+      return res.status(400).json({ message: "Password required" });
+    }
 
     if (phone && !isValidE164(phone)) {
       return res
@@ -189,9 +416,10 @@ export async function clubSignUp(req, res) {
     }
 
     const queryOr = [email ? { email } : null, phone ? { phone } : null].filter(Boolean);
-
     const existing = await Club.findOne({ $or: queryOr }).select("+passwordHash +password");
-    if (existing) return res.status(409).json({ message: "Club already exists" });
+    if (existing) {
+      return res.status(409).json({ message: "Club already exists" });
+    }
 
     const hash = await bcrypt.hash(password, 10);
 
@@ -202,10 +430,7 @@ export async function clubSignUp(req, res) {
       password: hash,
       name,
       address,
-
-      // ✅ NEW
       ...(ownerUserId ? { owner: ownerUserId } : {}),
-
       status: "PENDING_VERIFICATION",
       verified: false,
       emailVerified: false,
@@ -214,16 +439,22 @@ export async function clubSignUp(req, res) {
       lastOtpChannel: null,
     });
 
-    const token = clubToken(club._id);
-    return res.json({ club: safeClub(club), token });
+    const response = await attachVenuePlayer(club, ownerUserId);
+    return res.json(response);
   } catch (error) {
     console.error("[CLUB_AUTH][SIGNUP][ERROR]", {
       requestId,
       message: error?.message,
       stack: error?.stack,
     });
-    if (error && error.code === 11000) return res.status(409).json({ message: "Club already exists" });
-    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+
+    if (error && error.code === 11000) {
+      return res.status(409).json({ message: "Club already exists" });
+    }
+
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Internal server error" });
   }
 }
 
@@ -239,7 +470,9 @@ export async function clubLogin(req, res) {
     if (!password) return res.status(400).json({ message: "Password required" });
 
     const lookup = pickEmailOrPhone(body);
-    if (!lookup.email && !lookup.phone) return res.status(400).json({ message: "Email or phone required" });
+    if (!lookup.email && !lookup.phone) {
+      return res.status(400).json({ message: "Email or phone required" });
+    }
 
     const club = await Club.findOne(lookup).select("+passwordHash +password");
     if (!club) return res.status(404).json({ message: "Club not found" });
@@ -250,26 +483,25 @@ export async function clubLogin(req, res) {
     const ok = await bcrypt.compare(password, stored);
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
-    // ✅ NEW: allow linking owner on login if missing
-    if (!club.owner) {
-      const ownerUserIdRaw = pickOwnerUserId(body);
-      if (ownerUserIdRaw) {
-        const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
-        club.owner = ownerUserId;
-        await club.save();
-      }
-    }
+    const ownerUserIdRaw = pickOwnerUserId(body);
+    const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
 
-    const token = clubToken(club._id);
-    return res.json({ club: safeClub(club), token });
+    const response = await attachVenuePlayer(club, ownerUserId);
+    return res.json(response);
   } catch (error) {
-    console.error("[CLUB_AUTH][LOGIN][ERROR]", { requestId, message: error?.message, stack: error?.stack });
-    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+    console.error("[CLUB_AUTH][LOGIN][ERROR]", {
+      requestId,
+      message: error?.message,
+      stack: error?.stack,
+    });
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Internal server error" });
   }
 }
 
 // =======================================================
-// ✅ SIGNUP OTP REQUEST (send to BOTH email + phone)
+// SIGNUP OTP REQUEST (send to BOTH email + phone)
 // =======================================================
 export async function clubRequestSignupOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -284,7 +516,6 @@ export async function clubRequestSignupOtp(req, res) {
       normalizePhone(body.phone) ||
       (!isEmailIdentifier(toStr(body.identifier)) ? normalizePhone(body.identifier) : undefined);
 
-    // ✅ NEW: optional owner link for OTP-created clubs
     const ownerUserIdRaw = pickOwnerUserId(body);
     const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
 
@@ -304,10 +535,7 @@ export async function clubRequestSignupOtp(req, res) {
       club = await Club.create({
         ...(email ? { email } : {}),
         ...(phone ? { phone } : {}),
-
-        // ✅ NEW
         ...(ownerUserId ? { owner: ownerUserId } : {}),
-
         status: "PENDING_VERIFICATION",
         verified: false,
         emailVerified: false,
@@ -315,16 +543,14 @@ export async function clubRequestSignupOtp(req, res) {
         lastOtpSent: null,
         lastOtpChannel: null,
       });
-    } else {
-      // ✅ NEW: if club exists but owner missing, allow linking here too
-      if (!club.owner && ownerUserId) {
-        club.owner = ownerUserId;
-        await club.save();
-      }
     }
 
+    await ensureClubOwnerUser(club, ownerUserId);
+
     if (isRateLimited(club.lastOtpSent, 60_000)) {
-      return res.status(429).json({ message: "Please wait 60 seconds before requesting another code." });
+      return res
+        .status(429)
+        .json({ message: "Please wait 60 seconds before requesting another code." });
     }
 
     club.lastOtpSent = new Date();
@@ -332,7 +558,6 @@ export async function clubRequestSignupOtp(req, res) {
 
     const channelsSent = [];
 
-    // Email OTP (6-digit, stored in DB)
     if (club.email) {
       const code = otpToString(generateOtp(6));
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -346,10 +571,11 @@ export async function clubRequestSignupOtp(req, res) {
       await club.save();
     }
 
-    // Phone OTP via Twilio Verify
     if (club.phone) {
       if (!isValidE164(club.phone)) {
-        return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+        return res
+          .status(400)
+          .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
       }
       await twilioSendVerifySms(club.phone);
       channelsSent.push("phone");
@@ -359,17 +585,30 @@ export async function clubRequestSignupOtp(req, res) {
       ok: true,
       message: "Signup OTP sent",
       flow: "signup",
-      target: { ...(club.email ? { email: club.email } : {}), ...(club.phone ? { phone: club.phone } : {}) },
+      target: {
+        ...(club.email ? { email: club.email } : {}),
+        ...(club.phone ? { phone: club.phone } : {}),
+      },
       channelsSent,
+      capabilities: {
+        canManageVenue: true,
+        canPlay: true,
+      },
     });
   } catch (error) {
-    console.error("[CLUB_OTP][SIGNUP_REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
-    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+    console.error("[CLUB_OTP][SIGNUP_REQUEST][ERROR]", {
+      requestId,
+      message: error?.message,
+      stack: error?.stack,
+    });
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Internal server error" });
   }
 }
 
 // =============================
-// ✅ OTP REQUEST: login (single-channel)
+// OTP REQUEST: login (single-channel)
 // =============================
 export async function clubRequestOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -379,10 +618,8 @@ export async function clubRequestOtp(req, res) {
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
-
     const flow = toStr(body.flow) || "login";
 
-    // ✅ NEW: optional owner link
     const ownerUserIdRaw = pickOwnerUserId(body);
     const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
 
@@ -393,7 +630,9 @@ export async function clubRequestOtp(req, res) {
 
     if (channel === "phone") {
       if (!isValidE164(phone)) {
-        return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+        return res
+          .status(400)
+          .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
       }
       assertTwilioConfigured();
     }
@@ -407,10 +646,7 @@ export async function clubRequestOtp(req, res) {
     if (!club) {
       club = await Club.create({
         ...query,
-
-        // ✅ NEW
         ...(ownerUserId ? { owner: ownerUserId } : {}),
-
         status: "PENDING_VERIFICATION",
         verified: false,
         emailVerified: false,
@@ -418,16 +654,14 @@ export async function clubRequestOtp(req, res) {
         lastOtpSent: null,
         lastOtpChannel: null,
       });
-    } else {
-      // ✅ NEW: link owner if missing
-      if (!club.owner && ownerUserId) {
-        club.owner = ownerUserId;
-        await club.save();
-      }
     }
 
+    await ensureClubOwnerUser(club, ownerUserId);
+
     if (isRateLimited(club.lastOtpSent, 60_000)) {
-      return res.status(429).json({ message: "Please wait 60 seconds before requesting another code." });
+      return res
+        .status(429)
+        .json({ message: "Please wait 60 seconds before requesting another code." });
     }
 
     club.lastOtpSent = new Date();
@@ -442,26 +676,49 @@ export async function clubRequestOtp(req, res) {
 
       await sendOtpEmail(email, code);
 
-      return res.json({ ok: true, message: "OTP sent", channel: "email", target: email, flow });
+      return res.json({
+        ok: true,
+        message: "OTP sent",
+        channel: "email",
+        target: email,
+        flow,
+        capabilities: {
+          canManageVenue: true,
+          canPlay: true,
+        },
+      });
     }
 
-    // phone -> Twilio Verify
     club.otp = undefined;
     await club.save();
 
     await twilioSendVerifySms(phone);
 
-    return res.json({ ok: true, message: "OTP sent", channel: "phone", target: phone, flow });
+    return res.json({
+      ok: true,
+      message: "OTP sent",
+      channel: "phone",
+      target: phone,
+      flow,
+      capabilities: {
+        canManageVenue: true,
+        canPlay: true,
+      },
+    });
   } catch (error) {
-    console.error("[CLUB_OTP][REQUEST][ERROR]", { requestId, message: error?.message, stack: error?.stack });
-    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+    console.error("[CLUB_OTP][REQUEST][ERROR]", {
+      requestId,
+      message: error?.message,
+      stack: error?.stack,
+    });
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Internal server error" });
   }
 }
 
 // =============================
-// ✅ OTP VERIFY:
-// - login => token always
-// - signup => token after ANY one channel verifies (either is fine)
+// OTP VERIFY
 // =============================
 export async function clubVerifyOtp(req, res) {
   const requestId = crypto.randomBytes(4).toString("hex");
@@ -471,11 +728,9 @@ export async function clubVerifyOtp(req, res) {
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
     const phone = lookup.phone;
-
     const flow = toStr(body.flow) || "login";
     const code = otpToString(body.code || body.otp);
 
-    // ✅ NEW: optional owner link even at verify step
     const ownerUserIdRaw = pickOwnerUserId(body);
     const ownerUserId = await resolveOwnerUserIdOrThrow(ownerUserIdRaw);
 
@@ -487,7 +742,9 @@ export async function clubVerifyOtp(req, res) {
 
     if (channel === "phone") {
       if (!isValidE164(phone)) {
-        return res.status(400).json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+        return res
+          .status(400)
+          .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
       }
       assertTwilioConfigured();
     }
@@ -495,63 +752,86 @@ export async function clubVerifyOtp(req, res) {
     const club = await Club.findOne(query);
     if (!club) return res.status(404).json({ message: "Club not found" });
 
-    // ✅ NEW: link owner if missing
-    if (!club.owner && ownerUserId) {
-      club.owner = ownerUserId;
-    }
-
     if (channel === "email") {
-      if (!club.otp || !club.otp.code) return res.status(404).json({ message: "OTP not found" });
+      if (!club.otp || !club.otp.code) {
+        return res.status(404).json({ message: "OTP not found" });
+      }
 
       if (club.otp.expiresAt && club.otp.expiresAt.getTime() < Date.now()) {
         return res.status(400).json({ message: "OTP expired" });
       }
 
-      if (otpToString(club.otp.code) !== code) return res.status(400).json({ message: "Invalid OTP" });
+      if (otpToString(club.otp.code) !== code) {
+        return res.status(400).json({ message: "Invalid OTP" });
+      }
 
       club.otp = undefined;
       club.emailVerified = true;
-
       club.lastOtpSent = null;
       club.lastOtpChannel = null;
-
       await club.save();
     } else {
       const ok = await twilioCheckVerifyCode(phone, code);
       if (!ok) return res.status(400).json({ message: "Invalid OTP" });
 
       club.phoneVerified = true;
-
       club.lastOtpSent = null;
       club.lastOtpChannel = null;
-
       await club.save();
     }
 
-    // ✅ If signup, mark as ACTIVE (either channel is enough)
     if (flow === "signup") {
       club.verified = true;
-      if (club.status === "PENDING_VERIFICATION") club.status = "ACTIVE";
+      if (club.status === "PENDING_VERIFICATION") {
+        club.status = "ACTIVE";
+      }
       await club.save();
     }
 
-    // ✅ Ensure owner link is persisted if we set it above
-    if (ownerUserId && !club.owner) {
-      club.owner = ownerUserId;
-      await club.save();
+    const ownerUser = await ensureClubOwnerUser(club, ownerUserId);
+
+    if (ownerUser) {
+      let changed = false;
+
+      if (club.emailVerified && !ownerUser.emailVerified) {
+        ownerUser.emailVerified = true;
+        changed = true;
+      }
+      if (club.phoneVerified && !ownerUser.phoneVerified) {
+        ownerUser.phoneVerified = true;
+        changed = true;
+      }
+      if (changed) {
+        await ownerUser.save();
+      }
     }
 
-    const token = clubToken(club._id);
+    const token = clubToken(club, ownerUser?._id);
+
     return res.json({
       ok: true,
       flow,
       channelVerified: channel,
-      verified: { email: !!club.emailVerified, phone: !!club.phoneVerified },
+      verified: {
+        email: !!club.emailVerified,
+        phone: !!club.phoneVerified,
+      },
       club: safeClub(club),
+      ownerUser: safeUser(ownerUser),
       token,
+      capabilities: {
+        canManageVenue: true,
+        canPlay: true,
+      },
     });
   } catch (error) {
-    console.error("[CLUB_OTP][VERIFY][ERROR]", { requestId, message: error?.message, stack: error?.stack });
-    return res.status(error?.statusCode || 500).json({ message: error?.message || "Internal server error" });
+    console.error("[CLUB_OTP][VERIFY][ERROR]", {
+      requestId,
+      message: error?.message,
+      stack: error?.stack,
+    });
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Internal server error" });
   }
 }

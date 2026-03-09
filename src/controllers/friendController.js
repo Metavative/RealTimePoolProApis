@@ -1,3 +1,4 @@
+// src/controllers/friendController.js
 import mongoose from "mongoose";
 import User from "../models/user.model.js";
 import FriendRequest from "../models/friendRequest.model.js";
@@ -17,16 +18,23 @@ function sortPair(a, b) {
 function emitToUser(io, presence, userId, event, payload) {
   const room = `user:${userId}`;
 
-  // Preferred: user room
   if (io) io.to(room).emit(event, payload);
 
-  // Optional: direct sockets if presence supports it
   if (presence?.getSocketIds) {
     const sockets = presence.getSocketIds(String(userId)) || [];
     for (const sid of sockets) io.to(sid).emit(event, payload);
   }
 }
-// ---------- searchFriends (UPDATED: supports club callers + query key variants + flutter-friendly shape) ----------
+
+function bestName(u) {
+  return u?.profile?.nickname || u?.username || "";
+}
+
+function bestAvatar(u) {
+  return u?.profile?.avatar || "";
+}
+
+// ---------- searchFriends ----------
 export async function searchFriends(req, res) {
   try {
     const q = String(
@@ -49,12 +57,12 @@ export async function searchFriends(req, res) {
 
     const query = {
       $or: [
-        { username: regex },                 // ✅ real username
-        { usernameLower: regex },            // ✅ real usernameLower
+        { username: regex },
+        { usernameLower: regex },
         { "profile.nickname": regex },
         { email: regex },
         { phone: regex },
-        { "stats.userIdTag": regex },        // ✅ searchable tag, but NOT username
+        { "stats.userIdTag": regex },
       ],
     };
 
@@ -81,14 +89,14 @@ export async function searchFriends(req, res) {
     return res.json(
       users.map((u) => ({
         id: String(u._id),
-        name: u.profile?.nickname || u.username || "",
-        username: u.username || "",                // ✅ FIXED
+        name: bestName(u),
+        username: u.username || "",
         email: u.email || "",
         phone: u.phone || "",
-        avatarUrl: u.profile?.avatar || "",
+        avatarUrl: bestAvatar(u),
         online: !!u.profile?.onlineStatus,
         rank: u.stats?.rank || "Beginner",
-        tag: u.stats?.userIdTag || "",             // ✅ keep tag
+        tag: u.stats?.userIdTag || "",
       }))
     );
   } catch (err) {
@@ -96,7 +104,6 @@ export async function searchFriends(req, res) {
     return res.status(500).json({ message: "Failed to search users" });
   }
 }
-
 
 // ---------- listRequests ----------
 export async function listRequests(req, res) {
@@ -113,11 +120,11 @@ export async function listRequests(req, res) {
       .sort({ createdAt: -1 })
       .populate(
         "from",
-        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
       )
       .populate(
         "to",
-        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
@@ -133,8 +140,9 @@ export async function listRequests(req, res) {
           from: from
             ? {
                 id: from._id,
-                nickname: from.profile?.nickname || "",
-                avatar: from.profile?.avatar || "",
+                username: from.username || "",
+                nickname: bestName(from),
+                avatar: bestAvatar(from),
                 online: !!from.profile?.onlineStatus,
                 rank: from.stats?.rank || "Beginner",
                 tag: from.stats?.userIdTag || "",
@@ -143,8 +151,9 @@ export async function listRequests(req, res) {
           to: to
             ? {
                 id: to._id,
-                nickname: to.profile?.nickname || "",
-                avatar: to.profile?.avatar || "",
+                username: to.username || "",
+                nickname: bestName(to),
+                avatar: bestAvatar(to),
                 online: !!to.profile?.onlineStatus,
                 rank: to.stats?.rank || "Beginner",
                 tag: to.stats?.userIdTag || "",
@@ -174,7 +183,7 @@ export async function listFriends(req, res, presence) {
 
     const friends = await User.find({ _id: { $in: friendIds } })
       .select(
-        "_id profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
@@ -186,8 +195,9 @@ export async function listFriends(req, res, presence) {
         .filter(Boolean)
         .map((u) => ({
           id: u._id,
-          nickname: u.profile?.nickname || "",
-          avatar: u.profile?.avatar || "",
+          username: u.username || "",
+          nickname: bestName(u),
+          avatar: bestAvatar(u),
           online: presence?.isOnline
             ? !!presence.isOnline(String(u._id))
             : !!u.profile?.onlineStatus,
@@ -207,8 +217,9 @@ export async function sendRequest(req, res, io, presence) {
     const me = toObjectId(req.userId);
     const toUserIdRaw = req.body?.toUserId;
 
-    if (!toUserIdRaw)
+    if (!toUserIdRaw) {
       return res.status(400).json({ message: "toUserId is required" });
+    }
 
     const toUserId = toObjectId(toUserIdRaw);
 
@@ -216,17 +227,15 @@ export async function sendRequest(req, res, io, presence) {
       return res.status(400).json({ message: "You cannot add yourself" });
     }
 
-    // Ensure target exists
     const target = await User.findById(toUserId).select("_id").lean();
     if (!target) return res.status(404).json({ message: "User not found" });
 
-    // Block if already friends
     const [a, b] = sortPair(me, toUserId);
     const existingFriend = await Friendship.findOne({ a, b }).lean();
-    if (existingFriend)
+    if (existingFriend) {
       return res.status(409).json({ message: "Already friends" });
+    }
 
-    // Block if ANY pending request exists either direction
     const pendingEitherWay = await FriendRequest.findOne({
       status: "pending",
       $or: [
@@ -239,14 +248,12 @@ export async function sendRequest(req, res, io, presence) {
       return res.status(409).json({ message: "Friend request already pending" });
     }
 
-    // Create request
     const request = await FriendRequest.create({
       from: me,
       to: toUserId,
       status: "pending",
     });
 
-    // Emit realtime
     emitToUser(io, presence, toUserId, "friend:request_received", {
       requestId: request._id,
       fromUserId: me,
@@ -270,7 +277,6 @@ export async function sendRequest(req, res, io, presence) {
       createdAt: request.createdAt,
     });
   } catch (err) {
-    // Handle unique partial index error cleanly
     if (err?.code === 11000) {
       return res.status(409).json({ message: "Friend request already pending" });
     }
@@ -279,42 +285,37 @@ export async function sendRequest(req, res, io, presence) {
   }
 }
 
-// ---------- respond (UPDATED: concurrency-safe + no duplicate emits) ----------
+// ---------- respond ----------
 export async function respond(req, res, io, presence) {
   try {
     const me = toObjectId(req.userId);
     const requestId = req.body?.requestId;
     const accept = !!req.body?.accept;
 
-    if (!requestId)
+    if (!requestId) {
       return res.status(400).json({ message: "requestId is required" });
+    }
 
     const fr = await FriendRequest.findById(requestId).lean();
     if (!fr) return res.status(404).json({ message: "Request not found" });
 
-    // Only receiver can respond
     if (String(fr.to) !== String(me)) {
       return res.status(403).json({ message: "Not allowed" });
     }
 
-    // Idempotency: if already processed, just return ok
     if (fr.status !== "pending") {
       return res.json({ ok: true, status: fr.status });
     }
 
     const nextStatus = accept ? "accepted" : "rejected";
 
-    // Concurrency-safe state transition
     const upd = await FriendRequest.updateOne(
       { _id: fr._id, status: "pending" },
       { $set: { status: nextStatus } }
     );
 
-    // If another request already processed it, don't emit again
     if (upd.matchedCount === 0) {
-      const latest = await FriendRequest.findById(fr._id)
-        .select("status")
-        .lean();
+      const latest = await FriendRequest.findById(fr._id).select("status").lean();
       return res.json({ ok: true, status: latest?.status || fr.status });
     }
 
@@ -334,7 +335,6 @@ export async function respond(req, res, io, presence) {
       return res.json({ ok: true, status: "rejected" });
     }
 
-    // Accept: create friendship (sorted pair, upsert)
     const [a, b] = sortPair(fr.from, fr.to);
     await Friendship.updateOne(
       { a, b },
@@ -342,7 +342,6 @@ export async function respond(req, res, io, presence) {
       { upsert: true }
     );
 
-    // Optional: reject any other pending requests between the same pair
     await FriendRequest.updateMany(
       {
         status: "pending",
@@ -355,7 +354,6 @@ export async function respond(req, res, io, presence) {
       { $set: { status: "rejected" } }
     );
 
-    // Emit
     emitToUser(io, presence, fr.from, "friend:request_accepted", {
       requestId: fr._id,
       fromUserId: fr.from,

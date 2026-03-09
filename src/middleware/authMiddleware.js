@@ -1,5 +1,34 @@
+// src/middleware/authMiddleware.js
 import User from "../models/user.model.js";
+import Club from "../models/club.model.js";
 import { verify } from "../services/jwtService.js";
+
+async function ensureClubOwnerUser(club) {
+  if (!club) return null;
+
+  if (club.owner) {
+    const ownerUser = await User.findById(club.owner).select({ passwordHash: 0, otp: 0 });
+    if (ownerUser) return ownerUser;
+  }
+
+  let matchedUser = null;
+
+  if (club.email) {
+    matchedUser = await User.findOne({ email: club.email }).select({ passwordHash: 0, otp: 0 });
+  }
+
+  if (!matchedUser && club.phone) {
+    matchedUser = await User.findOne({ phone: club.phone }).select({ passwordHash: 0, otp: 0 });
+  }
+
+  if (matchedUser) {
+    club.owner = matchedUser._id;
+    await club.save();
+    return matchedUser;
+  }
+
+  return null;
+}
 
 export async function authMiddleware(req, res, next) {
   try {
@@ -21,16 +50,65 @@ export async function authMiddleware(req, res, next) {
       return res.status(401).json({ message: "Invalid token payload" });
     }
 
+    const tokenRole = String(payload.role || "").toUpperCase();
+    const tokenType = String(payload.typ || "").toLowerCase();
+
+    // =========================================
+    // CLUB TOKEN -> MAP TO LINKED OWNER USER
+    // =========================================
+    if (tokenRole === "CLUB" || tokenType === "club_access") {
+      const club = await Club.findById(payload.id).select({ passwordHash: 0, otp: 0 });
+      if (!club) {
+        return res.status(401).json({ message: "Club not found" });
+      }
+
+      const ownerUser = await ensureClubOwnerUser(club);
+      if (!ownerUser) {
+        return res.status(403).json({
+          message: "Club is not linked to a player profile yet",
+        });
+      }
+
+      req.authType = "user"; // ✅ compatibility for older user-only controllers
+      req.auth = {
+        tokenRole: "CLUB",
+        tokenType: "club_access",
+        actorType: "club_owner_as_player",
+        canManageVenue: true,
+        canPlay: true,
+      };
+
+      req.club = club;
+      req.clubId = club._id.toString();
+
+      req.user = ownerUser;
+      req.userId = ownerUser._id.toString();
+
+      return next();
+    }
+
+    // =========================================
+    // NORMAL USER TOKEN
+    // =========================================
     const user = await User.findById(payload.id).select({ passwordHash: 0, otp: 0 });
     if (!user) {
       return res.status(401).json({ message: "User not found" });
     }
 
-    req.userId = user._id;
+    req.authType = "user";
+    req.auth = {
+      tokenRole: "USER",
+      tokenType: tokenType || "access",
+      actorType: "user",
+      canManageVenue: false,
+      canPlay: true,
+    };
+
+    req.userId = user._id.toString();
     req.user = user;
 
     return next();
   } catch (e) {
-    return res.status(401).json({ message: "Invalid or expired  token" });
+    return res.status(401).json({ message: "Invalid or expired token" });
   }
 }

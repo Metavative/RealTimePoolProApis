@@ -7,15 +7,27 @@ import User from "../models/user.model.js";
 // helpers
 // -------------------------
 function requireClub(req, res) {
-  if (req.authType !== "club" || !req.clubId || !req.club) {
+  const isClub =
+    req.authType === "club" ||
+    req.auth?.tokenRole === "CLUB" ||
+    !!req.clubId ||
+    !!req.club;
+
+  if (!isClub || !req.clubId || !req.club) {
     res.status(403).json({ message: "Club authorization required" });
     return false;
   }
   return true;
 }
 
-function requireUser(req, res) {
-  if (req.authType !== "user" || !req.userId || !req.user) {
+function requirePlayableUser(req, res) {
+  const hasUserIdentity = !!req.userId && !!req.user;
+  const canPlay =
+    req.authType === "user" ||
+    req.auth?.canPlay === true ||
+    req.auth?.actorType === "club_owner_as_player";
+
+  if (!hasUserIdentity || !canPlay) {
     res.status(403).json({ message: "User authorization required" });
     return false;
   }
@@ -39,9 +51,6 @@ function isFormatFinalised(t) {
   return normUpper(t?.formatStatus, "DRAFT") === "FINALISED";
 }
 
-/**
- * Step 2 roster lock: blocks actions that change entrants
- */
 function ensureRosterMutableOrRespond(res, tournament) {
   if (!tournament) {
     res.status(404).json({ message: "Tournament not found" });
@@ -74,7 +83,13 @@ function escapeRegExp(s = "") {
 }
 
 function bestUserDisplayName(user) {
-  return user?.profile?.nickname || user?.profile?.name || user?.name || user?.username || "";
+  return (
+    user?.profile?.nickname ||
+    user?.profile?.name ||
+    user?.name ||
+    user?.username ||
+    ""
+  );
 }
 
 function emitToUser(io, presence, userId, event, payload) {
@@ -87,6 +102,16 @@ function emitToUser(io, presence, userId, event, payload) {
     const sids = presence?.getSocketIds?.(uid) || [];
     for (const sid of sids) io?.to?.(sid)?.emit?.(event, payload);
   } catch (_) {}
+}
+
+function resolveParticipantKeyForUser(req, fallbackUserId) {
+  const uid = String(req.userId || fallbackUserId || "").trim();
+  if (!uid) return "";
+  return `uid:${uid}`;
+}
+
+function safeUsername(user) {
+  return String(user?.username || "").trim();
 }
 
 /**
@@ -103,9 +128,12 @@ export async function sendTournamentInvite(req, res, io, presence) {
     const participantKey = String(req.body.participantKey || "").trim();
     const message = String(req.body.message || "").trim();
 
-    if (!tournamentId) return res.status(400).json({ message: "tournamentId is required" });
-    if (!username) return res.status(400).json({ message: "username is required" });
-    if (!participantKey) return res.status(400).json({ message: "participantKey is required" });
+    if (!tournamentId) {
+      return res.status(400).json({ message: "tournamentId is required" });
+    }
+    if (!username) {
+      return res.status(400).json({ message: "username is required" });
+    }
 
     const tournament = await Tournament.findById(tournamentId).select(
       "clubId entriesStatus formatStatus status accessMode"
@@ -117,13 +145,14 @@ export async function sendTournamentInvite(req, res, io, presence) {
       return res.status(403).json({ message: "Not allowed for this tournament" });
     }
 
-    // ✅ Step 2: sending invite is a roster-affecting action (potential entrant)
     if (!ensureRosterMutableOrRespond(res, tournament)) return;
 
-    // Find user (case-insensitive username match)
     const rx = new RegExp(`^${escapeRegExp(username)}$`, "i");
     const toUser = await User.findOne({ username: rx });
     if (!toUser) return res.status(404).json({ message: "User not found" });
+
+    const resolvedParticipantKey =
+      participantKey || `uid:${String(toUser._id)}`;
 
     const existing = await TournamentInvite.findOne({
       tournamentId,
@@ -139,7 +168,9 @@ export async function sendTournamentInvite(req, res, io, presence) {
 
       existing.status = "pending";
       existing.message = message || existing.message;
-      existing.participantKey = participantKey || existing.participantKey;
+      existing.participantKey = resolvedParticipantKey || existing.participantKey;
+      existing.toUsername = toUser.username || existing.toUsername;
+
       await existing.save();
 
       emitToUser(io, presence, toUser._id, "tournament_invite:new", {
@@ -155,7 +186,7 @@ export async function sendTournamentInvite(req, res, io, presence) {
       organizerId: req.clubId,
       toUserId: toUser._id,
       toUsername: toUser.username,
-      participantKey,
+      participantKey: resolvedParticipantKey,
       status: "pending",
       message,
     });
@@ -209,12 +240,12 @@ export async function listTournamentInvites(req, res) {
 
 /**
  * POST /api/tournaments/:tournamentId/join
- * user-only
+ * user or playable venue-owner
  * Allows join ONLY when accessMode === OPEN
  */
 export async function joinTournamentOpen(req, res) {
   try {
-    if (!requireUser(req, res)) return;
+    if (!requirePlayableUser(req, res)) return;
 
     const { tournamentId } = req.params;
     if (!tournamentId) return res.status(400).json({ message: "tournamentId is required" });
@@ -225,23 +256,24 @@ export async function joinTournamentOpen(req, res) {
 
     if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
-    // ✅ join changes roster: must respect locks
     if (!ensureRosterMutableOrRespond(res, tournament)) return;
 
-    // ✅ enforce accessMode
     const mode = normUpper(tournament.accessMode, "INVITE_ONLY");
     if (mode !== "OPEN") {
       return res.status(403).json({ message: "This tournament is invite-only" });
     }
 
+    const userId = String(req.userId);
     const already = Array.isArray(tournament.entrants)
-      ? tournament.entrants.some((e) => String(e.entrantId) === String(req.userId))
+      ? tournament.entrants.some((e) => String(e.entrantId) === userId)
       : false;
 
-    if (already) return res.status(200).json({ ok: true, alreadyJoined: true });
+    if (already) {
+      return res.status(200).json({ ok: true, alreadyJoined: true });
+    }
 
     const displayName = bestUserDisplayName(req.user);
-    const pk = `uid:${String(req.userId)}`;
+    const pk = resolveParticipantKeyForUser(req, req.userId);
 
     await Tournament.updateOne(
       { _id: tournamentId, "entrants.entrantId": { $ne: req.userId } },
@@ -251,8 +283,8 @@ export async function joinTournamentOpen(req, res) {
             entrantId: req.userId,
             name: displayName,
             participantKey: pk,
-            username: req.user?.username || "",
-            userId: String(req.userId || ""),
+            username: safeUsername(req.user),
+            userId: userId,
             isLocal: false,
             rating: 0,
             seed: 0,
@@ -261,10 +293,11 @@ export async function joinTournamentOpen(req, res) {
       }
     );
 
-    // ✅ IMPORTANT (Step 2): do NOT reseed via svc.setEntrants here.
-    // Seeding/reseeding is organizer-driven to avoid player-triggered mutation paths.
-
-    return res.status(200).json({ ok: true, joined: true });
+    return res.status(200).json({
+      ok: true,
+      joined: true,
+      actorType: req?.auth?.actorType || "user",
+    });
   } catch (e) {
     return res.status(500).json({ message: e?.message || "Failed to join tournament" });
   }
@@ -272,11 +305,11 @@ export async function joinTournamentOpen(req, res) {
 
 /**
  * GET /api/tournament-invites/inbox
- * user-only
+ * user or playable venue-owner
  */
 export async function listMyInvites(req, res) {
   try {
-    if (!requireUser(req, res)) return;
+    if (!requirePlayableUser(req, res)) return;
 
     const invites = await TournamentInvite.find({ toUserId: req.userId })
       .sort({ createdAt: -1 })
@@ -291,12 +324,12 @@ export async function listMyInvites(req, res) {
 
 /**
  * POST /api/tournament-invites/:inviteId/respond
- * user-only
+ * user or playable venue-owner
  * body: { action: "accept" | "decline" }
  */
 export async function respondToInvite(req, res, io, presence) {
   try {
-    if (!requireUser(req, res)) return;
+    if (!requirePlayableUser(req, res)) return;
 
     const { inviteId } = req.params;
     const action = String(req.body.action || "").trim().toLowerCase();
@@ -322,18 +355,18 @@ export async function respondToInvite(req, res, io, presence) {
     );
     if (!tournament) return res.status(404).json({ message: "Tournament not found" });
 
-    // ✅ Step 2: accept changes roster -> enforce locks
-    // decline does NOT change roster -> allowed even if closed/active
     if (action === "accept") {
       if (!ensureRosterMutableOrRespond(res, tournament)) return;
 
-      // prevent double-add if already joined via some other path
       const already = Array.isArray(tournament.entrants)
         ? tournament.entrants.some((e) => String(e.entrantId) === String(req.userId))
         : false;
 
       if (!already) {
         const displayName = bestUserDisplayName(req.user);
+        const participantKey =
+          String(invite.participantKey || "").trim() ||
+          resolveParticipantKeyForUser(req, req.userId);
 
         await Tournament.updateOne(
           { _id: invite.tournamentId, "entrants.entrantId": { $ne: req.userId } },
@@ -342,8 +375,8 @@ export async function respondToInvite(req, res, io, presence) {
               entrants: {
                 entrantId: req.userId,
                 name: displayName,
-                participantKey: invite.participantKey,
-                username: req.user?.username || "",
+                participantKey,
+                username: safeUsername(req.user),
                 userId: String(req.userId || ""),
                 isLocal: false,
                 rating: 0,
@@ -394,8 +427,6 @@ export async function cancelInvite(req, res, io, presence) {
       return res.status(400).json({ message: "Only pending invites can be cancelled" });
     }
 
-    // ✅ Step 2: cancelling a pending invite does NOT mutate entrants,
-    // so allow even if entries closed / started. (It just stops a future accept.)
     invite.status = "cancelled";
     await invite.save();
 

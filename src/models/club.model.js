@@ -16,13 +16,12 @@ const ClubSchema = new mongoose.Schema({
   email: { type: String, lowercase: true, trim: true, index: true, sparse: true },
   phone: { type: String, trim: true, index: true, sparse: true },
 
-  // Support both field names (same as User)
   passwordHash: { type: String, select: false },
   password: { type: String, select: false },
 
   otp: { type: OtpSchema, default: undefined },
 
-  verified: { type: Boolean, default: false }, // OTP verified (auth-level)
+  verified: { type: Boolean, default: false },
   status: {
     type: String,
     enum: ["ACTIVE", "PENDING_VERIFICATION", "PENDING_REVIEW", "SUSPENDED"],
@@ -37,11 +36,17 @@ const ClubSchema = new mongoose.Schema({
 
   location: {
     type: { type: String, enum: ["Point"], default: "Point" },
-    coordinates: { type: [Number], default: [0, 0] }, // [lng, lat]
+    coordinates: { type: [Number], default: [0, 0] },
   },
 
-  // Legacy organizer link (keep)
+  // linked real player identity
   owner: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+
+  // explicit capability flags
+  capabilities: {
+    canManageVenue: { type: Boolean, default: true },
+    canPlay: { type: Boolean, default: true },
+  },
 
   photos: [{ type: String }],
   contactPhone: { type: String, trim: true },
@@ -53,7 +58,6 @@ const ClubSchema = new mongoose.Schema({
     },
   ],
 
-  // Verification documents (optional – safe placeholders)
   verification: {
     venueName: { type: String, trim: true },
     venueAddress: { type: String, trim: true },
@@ -65,16 +69,28 @@ const ClubSchema = new mongoose.Schema({
 });
 
 ClubSchema.index({ location: "2dsphere" });
-
-// Avoid duplicates if provided (sparse keeps nulls allowed)
 ClubSchema.index({ email: 1 }, { unique: true, sparse: true });
 ClubSchema.index({ phone: 1 }, { unique: true, sparse: true });
 
 ClubSchema.pre("save", function (next) {
   if (this.email) this.email = String(this.email).trim().toLowerCase();
   if (this.phone) this.phone = String(this.phone).trim();
+
+  if (!this.capabilities) {
+    this.capabilities = {
+      canManageVenue: true,
+      canPlay: true,
+    };
+  } else {
+    if (typeof this.capabilities.canManageVenue !== "boolean") {
+      this.capabilities.canManageVenue = true;
+    }
+    if (typeof this.capabilities.canPlay !== "boolean") {
+      this.capabilities.canPlay = true;
+    }
+  }
+
   next();
 });
 
-// ✅ nodemon-safe export (prevents OverwriteModelError)
 export default mongoose.models.Club || mongoose.model("Club", ClubSchema);
