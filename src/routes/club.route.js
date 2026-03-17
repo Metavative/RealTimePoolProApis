@@ -2,6 +2,7 @@
 import express from "express";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { clubAuthMiddleware } from "../middleware/clubAuthMiddleware.js"; // ✅ NEW
+import { clubSessionFromUser } from "../controllers/clubAuthController.js";
 import * as clubCtrl from "../controllers/clubController.js";
 import multer from "multer";
 
@@ -26,6 +27,8 @@ const upload = multer({
 router.post("/", authMiddleware, clubCtrl.createClub);
 router.get("/nearby", authMiddleware, clubCtrl.listNearby);
 router.post("/booking", authMiddleware, clubCtrl.createBooking);
+router.get("/session", authMiddleware, clubSessionFromUser);
+router.post("/session", authMiddleware, clubSessionFromUser);
 
 // ✅ NEW: Link club owner (Organizer user) to this club
 // Requires CLUB token
@@ -42,3 +45,5 @@ router.post(
 );
 
 export default router;
+
+

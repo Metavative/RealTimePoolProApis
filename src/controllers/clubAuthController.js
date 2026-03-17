@@ -12,7 +12,11 @@ import twilio from "twilio";
 // =======================================
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
+const DEFAULT_TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
+const TWILIO_VERIFY_SERVICE_SID = (
+  process.env.TWILIO_VERIFY_SERVICE_SID ||
+  DEFAULT_TWILIO_VERIFY_SERVICE_SID
+).trim();
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
@@ -28,7 +32,7 @@ function assertTwilioConfigured() {
     throw err;
   }
   if (!TWILIO_VERIFY_SERVICE_SID) {
-    const err = new Error("Twilio Verify Service SID is missing (hardcoded constant is empty)");
+    const err = new Error("Twilio Verify Service SID is missing (set TWILIO_VERIFY_SERVICE_SID)");
     err.statusCode = 500;
     throw err;
   }
@@ -382,6 +386,125 @@ async function attachVenuePlayer(club, ownerUserId) {
       canPlay: true,
     },
   };
+}
+
+function defaultClubNameFromUser(user) {
+  const profile =
+    user?.profile && typeof user.profile === "object" ? user.profile : {};
+
+  const nickname = toStr(profile.nickname);
+  if (nickname) return nickname;
+
+  const firstName = toStr(profile.firstName);
+  const lastName = toStr(profile.lastName);
+  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
+  if (fullName) return fullName;
+
+  const username = toStr(user?.username);
+  if (username) return username;
+
+  return "Organizer";
+}
+
+async function createClubForUser(user) {
+  const ownerId = toStr(user?._id);
+  if (!ownerId) throw new Error("Cannot create organizer profile without user id");
+
+  const email = normalizeEmail(user?.email);
+  const phone = normalizePhone(user?.phone);
+
+  try {
+    return await Club.create({
+      ...(email ? { email } : {}),
+      ...(phone ? { phone } : {}),
+      owner: user._id,
+      name: defaultClubNameFromUser(user),
+      status: "PENDING_REVIEW",
+      verified: false,
+      emailVerified: !!user?.emailVerified,
+      phoneVerified: !!user?.phoneVerified,
+      capabilities: {
+        canManageVenue: true,
+        canPlay: true,
+      },
+    });
+  } catch (e) {
+    if (e?.code !== 11000) throw e;
+
+    const queryOr = [
+      { owner: user._id },
+      email ? { email } : null,
+      phone ? { phone } : null,
+    ].filter(Boolean);
+
+    const existing = queryOr.length
+      ? await Club.findOne({ $or: queryOr })
+      : await Club.findOne({ owner: user._id });
+
+    if (existing) return existing;
+    throw e;
+  }
+}
+
+// =============================
+// CLUB SESSION FROM USER TOKEN
+// =============================
+export async function clubSessionFromUser(req, res) {
+  const requestId = crypto.randomBytes(4).toString("hex");
+  try {
+    const userId = toStr(req?.userId || req?.user?._id);
+    if (!userId) {
+      return res.status(401).json({ message: "User authorization required" });
+    }
+
+    const authUser =
+      req.user ||
+      (await User.findById(userId).select({ passwordHash: 0, otp: 0 }));
+
+    if (!authUser) {
+      return res.status(401).json({ message: "User not found" });
+    }
+
+    let club = await Club.findOne({ owner: authUser._id });
+
+    if (!club && authUser.email) {
+      club = await Club.findOne({ email: normalizeEmail(authUser.email) });
+    }
+
+    if (!club && authUser.phone) {
+      club = await Club.findOne({ phone: normalizePhone(authUser.phone) });
+    }
+
+    let wasProvisioned = false;
+    if (!club) {
+      club = await createClubForUser(authUser);
+      wasProvisioned = true;
+    }
+
+    const status = String(club.status || "").toUpperCase().trim();
+    if (status === "SUSPENDED") {
+      return res.status(403).json({
+        code: "CLUB_SUSPENDED",
+        message: "Organizer access is currently suspended for this account.",
+      });
+    }
+
+    const response = await attachVenuePlayer(club, authUser._id);
+    return res.json({
+      ok: true,
+      provisioned: wasProvisioned,
+      ...response,
+    });
+  } catch (error) {
+    console.error("[CLUB_AUTH][SESSION_FROM_USER][ERROR]", {
+      requestId,
+      message: error?.message,
+      stack: error?.stack,
+    });
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Internal server error" });
+  }
 }
 
 // =============================

@@ -1,4 +1,5 @@
 import User from "../models/user.model.js";
+import Club from "../models/club.model.js";
 import StoreItem from "../models/storeItem.model.js";
 import StoreOrder from "../models/storeOrder.model.js";
 import Tournament from "../models/tournament.model.js";
@@ -629,6 +630,96 @@ export async function dashboardStats(req, res) {
     return res.status(500).json({
       ok: false,
       message: e.message || "Failed to load dashboard stats",
+    });
+  }
+}
+
+// --------------------------------------------------
+// CLUBS / ORGANIZER VERIFICATION
+// --------------------------------------------------
+
+export async function listClubs(req, res) {
+  try {
+    const status = cleanString(req.query.status).toUpperCase();
+    const q = cleanString(req.query.q);
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+    const page = Math.max(1, Number(req.query.page || 1));
+    const skip = (page - 1) * limit;
+
+    const filter = {};
+    if (status) filter.status = status;
+
+    if (q) {
+      filter.$or = [
+        { email: { $regex: q, $options: "i" } },
+        { phone: { $regex: q, $options: "i" } },
+        { name: { $regex: q, $options: "i" } },
+        { "verification.venueName": { $regex: q, $options: "i" } },
+      ];
+    }
+
+    const [clubs, total] = await Promise.all([
+      Club.find(filter)
+        .populate("owner", "email username profile.nickname")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Club.countDocuments(filter),
+    ]);
+
+    return res.json({
+      ok: true,
+      clubs,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit) || 1,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to load clubs",
+    });
+  }
+}
+
+export async function updateClubStatus(req, res) {
+  try {
+    const clubId = cleanString(req.params.clubId);
+    const status = cleanString(req.body?.status).toUpperCase();
+    const verified =
+      req.body?.verified === undefined ? undefined : !!req.body.verified;
+
+    const allowed = ["ACTIVE", "PENDING_VERIFICATION", "PENDING_REVIEW", "SUSPENDED"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Invalid club status",
+      });
+    }
+
+    const patch = { status };
+    if (verified !== undefined) patch.verified = verified;
+
+    const club = await Club.findByIdAndUpdate(clubId, patch, {
+      new: true,
+      runValidators: true,
+    })
+      .populate("owner", "email username profile.nickname")
+      .lean();
+
+    if (!club) {
+      return res.status(404).json({ ok: false, message: "Club not found" });
+    }
+
+    return res.json({ ok: true, club });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to update club status",
     });
   }
 }

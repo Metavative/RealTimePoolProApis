@@ -22,6 +22,33 @@ function upper(v, fb = "") {
   return String(v ?? fb).trim().toUpperCase();
 }
 
+function normalizeFormat(value, fallback = "round_robin") {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (!raw) return fallback;
+  if (raw === "round robin" || raw === "roundrobin") return "round_robin";
+  if (raw === "group stage" || raw === "groupstage") return "group_stage";
+  if (
+    raw === "double elimination" ||
+    raw === "double-elimination" ||
+    raw === "double_elim" ||
+    raw === "double-elim"
+  ) {
+    return "double_elimination";
+  }
+  if (raw === "single_elim" || raw === "single_elimination") return "knockout";
+  if (raw === "killer") return "killer";
+  if (raw === "round_robin" || raw === "group_stage" || raw === "knockout") {
+    return raw;
+  }
+  if (raw === "double_elimination" || raw === "double_elim") {
+    return "double_elimination";
+  }
+  return fallback;
+}
+
 function getClubId(req) {
   // be defensive: depends on your clubAuthMiddleware
   return (
@@ -82,7 +109,7 @@ export async function create(req, res) {
       throw err;
     }
 
-    const format = String(req.body?.format || "round_robin").trim();
+    const format = normalizeFormat(req.body?.format, "round_robin");
     const title = String(req.body?.name || req.body?.title || "").trim();
     const defaultVenue = String(req.body?.defaultVenue || "").trim();
 

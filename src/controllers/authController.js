@@ -9,8 +9,12 @@ import { generateOtp, sendOtpEmail } from "../services/OTPService.js";
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || "").trim();
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || "").trim();
 
-// ✅ Hardcode Verify Service SID (VA...)
-const TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
+// Prefer env for environment-specific Twilio Verify service.
+const DEFAULT_TWILIO_VERIFY_SERVICE_SID = "VA5340451db0245afdf3c1515254edf2cf";
+const TWILIO_VERIFY_SERVICE_SID = (
+  process.env.TWILIO_VERIFY_SERVICE_SID ||
+  DEFAULT_TWILIO_VERIFY_SERVICE_SID
+).trim();
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
@@ -18,6 +22,11 @@ const twilioClient =
 function assertTwilioConfigured() {
   if (!twilioClient) {
     const err = new Error("Twilio is not configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
+    err.statusCode = 500;
+    throw err;
+  }
+  if (!TWILIO_VERIFY_SERVICE_SID) {
+    const err = new Error("Twilio Verify Service SID is missing (set TWILIO_VERIFY_SERVICE_SID)");
     err.statusCode = 500;
     throw err;
   }

@@ -80,6 +80,14 @@ export async function clubAuthMiddleware(req, res, next) {
       return res.status(401).json({ message: "Club not found" });
     }
 
+    const status = String(club.status || "").toUpperCase().trim();
+    if (status === "SUSPENDED") {
+      return res.status(403).json({
+        code: "CLUB_SUSPENDED",
+        message: "Organizer account is suspended. Please contact support.",
+      });
+    }
+
     const ownerUser = await ensureClubOwnerUser(club);
 
     req.clubId = club._id.toString();

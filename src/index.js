@@ -1,4 +1,4 @@
-// src/index.js
+﻿// src/index.js
 import express from "express";
 import cookieParser from "cookie-parser";
 import cors from "cors";
@@ -33,14 +33,18 @@ import adminRoutes from "./routes/admin.route.js";
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 
 dotenv.config();
+const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+const logInfo = (...args) => {
+  if (!isProd) console.log(...args);
+};
 
 // ---- Global crash logging ----
 process.on("unhandledRejection", (reason) => {
-  console.error("❌ UNHANDLED REJECTION:", reason);
+  console.error("âŒ UNHANDLED REJECTION:", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("❌ UNCAUGHT EXCEPTION:", err);
+  console.error("âŒ UNCAUGHT EXCEPTION:", err);
 });
 
 const app = express();
@@ -61,10 +65,10 @@ app.use(
   })
 );
 
-app.use(morgan("dev"));
+app.use(morgan(isProd ? "tiny" : "dev"));
 
 app.use((req, res, next) => {
-  console.log(`[REQ] ${req.method} ${req.originalUrl}`);
+  logInfo(`[REQ] ${req.method} ${req.originalUrl}`);
   next();
 });
 
@@ -94,7 +98,7 @@ app.use("/api/admin", adminRoutes);
 
 // Health check
 app.get("/api/health", (req, res) => {
-  console.log("✅ Health check endpoint hit");
+  logInfo("Health check endpoint hit");
   res.status(200).json({
     status: "ok",
     message: "Server is healthy",
@@ -108,7 +112,7 @@ app.get("/api/health", (req, res) => {
 const server = Http.createServer(app);
 
 server.on("error", (err) => {
-  console.error("❌ HTTP SERVER ERROR:", err);
+  console.error("âŒ HTTP SERVER ERROR:", err);
 });
 
 const io = new Server(server, {
@@ -198,7 +202,7 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
 // Socket.io
 // --------------------------------------------------
 io.on("connection", (socket) => {
-  console.log(`✅ Socket connected: ${socket.id}`);
+  logInfo(`Socket connected: ${socket.id}`);
 
   registerMatchHandlers(io, socket, presence);
 
@@ -294,13 +298,13 @@ io.on("connection", (socket) => {
           lastSeen: new Date(),
         });
         await emitOnlinePlayers();
-        console.log(`✅ User offline: ${uid}`);
+        logInfo(`User offline: ${uid}`);
       } catch (err) {
         console.error("Error updating user status on disconnect:", err);
       }
     }
 
-    console.log(`❌ Socket disconnected: ${socket.id}`);
+    logInfo(`Socket disconnected: ${socket.id}`);
   });
 });
 
@@ -308,7 +312,7 @@ io.on("connection", (socket) => {
 // Express error handler
 // --------------------------------------------------
 app.use((err, req, res, next) => {
-  console.error("❌ EXPRESS ERROR:");
+  console.error("âŒ EXPRESS ERROR:");
   console.error("Route:", req.method, req.originalUrl);
   console.error("Message:", err?.message);
   console.error("Stack:", err?.stack);
@@ -331,18 +335,18 @@ const PORT = process.env.PORT || 4000;
 // --------------------------------------------------
 (async () => {
   try {
-    console.log("🚀 Booting server...");
+    console.log("ðŸš€ Booting server...");
     await connectDb();
-    console.log("✅ DB connected");
+    console.log("âœ… DB connected");
 
     await connectCloudinary();
-    console.log("✅ Cloudinary connected");
+    console.log("âœ… Cloudinary connected");
 
     server.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running on port ${PORT}`.bgBrightGreen.black.bold);
     });
   } catch (err) {
-    console.error("❌ Failed to start server:", err);
+    console.error("âŒ Failed to start server:", err);
     process.exit(1);
   }
 })();
@@ -355,3 +359,6 @@ process.on("SIGINT", () => {
     process.exit(0);
   });
 });
+
+
+

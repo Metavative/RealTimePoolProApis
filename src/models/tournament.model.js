@@ -59,7 +59,14 @@ const TournamentSchema = new Schema(
     format: {
       type: String,
       default: "round_robin",
-      enum: ["round_robin", "knockout", "group_stage", "double_elim", "double_elimination"],
+      enum: [
+        "round_robin",
+        "knockout",
+        "group_stage",
+        "double_elim",
+        "double_elimination",
+        "killer",
+      ],
     },
 
     status: {

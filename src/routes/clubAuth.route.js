@@ -1,4 +1,5 @@
 import express from "express";
+import { authMiddleware } from "../middleware/authMiddleware.js";
 import {
   clubSignUp,
   clubLogin,
@@ -9,6 +10,7 @@ import {
 
   // signup (multi-channel OTP)
   clubRequestSignupOtp,
+  clubSessionFromUser,
 } from "../controllers/clubAuthController.js";
 
 const router = express.Router();
@@ -16,6 +18,8 @@ const router = express.Router();
 router.post("/signup", clubSignUp);
 router.post("/login", clubLogin);
 router.post("/signin", clubLogin);
+router.get("/session", authMiddleware, clubSessionFromUser);
+router.post("/session", authMiddleware, clubSessionFromUser);
 
 // ✅ Signup OTP (send to BOTH email + phone if available)
 router.post("/otp/request-signup", clubRequestSignupOtp);

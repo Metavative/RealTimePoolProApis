@@ -27,6 +27,33 @@ function isFormatFinalised(t) {
   return normUpper(t?.formatStatus, "DRAFT") === "FINALISED";
 }
 
+function normalizeFormat(value, fallback = "round_robin") {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (!raw) return fallback;
+  if (raw === "round robin" || raw === "roundrobin") return "round_robin";
+  if (raw === "group stage" || raw === "groupstage") return "group_stage";
+  if (
+    raw === "double elimination" ||
+    raw === "double-elimination" ||
+    raw === "double_elim" ||
+    raw === "double-elim"
+  ) {
+    return "double_elimination";
+  }
+  if (raw === "single_elim" || raw === "single_elimination") return "knockout";
+  if (raw === "killer") return "killer";
+  if (raw === "round_robin" || raw === "group_stage" || raw === "knockout") {
+    return raw;
+  }
+  if (raw === "double_elimination" || raw === "double_elim") {
+    return "double_elimination";
+  }
+  return fallback;
+}
+
 /**
  * ✅ HARD roster lock: no entrant changes once:
  * - ACTIVE/LIVE/COMPLETED
@@ -825,7 +852,7 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
     throw err;
   }
 
-  const format = String(t.format || "").trim();
+  const format = normalizeFormat(t.format, "round_robin");
 
   // Clear generated data safely
   t.groups = t.groups || [];
@@ -879,7 +906,7 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
 
     let matches = [];
     if (format === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);
-    else if (format === "knockout")
+    else if (format === "knockout" || format === "killer")
       matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
     else if (format === "double_elim" || format === "double_elimination")
       matches = generateDoubleElim(keys, venue, nameByKey);
@@ -1280,7 +1307,7 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
     entrants.map((e) => [String(e.participantKey), pickEntrantName(e)])
   );
 
-  const f = String(format || t.format || "").trim();
+  const f = normalizeFormat(format || t.format, "round_robin");
   const venue = String(defaultVenue || t.defaultVenue || t.playoffDefaultVenue || "").trim();
 
   if (f === "group_stage") {
@@ -1294,7 +1321,8 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
 
   let matches = [];
   if (f === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);
-  else if (f === "knockout") matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
+  else if (f === "knockout" || f === "killer")
+    matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
   else if (f === "double_elim" || f === "double_elimination")
     matches = generateDoubleElim(keys, venue, nameByKey);
   else matches = generateRoundRobin(keys, venue, nameByKey);

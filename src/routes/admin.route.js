@@ -23,6 +23,8 @@ import {
   listTournaments,
   getTournament,
   updateTournamentStatus,
+  listClubs,
+  updateClubStatus,
 } from "../controllers/admin.controller.js";
 
 const router = express.Router();
@@ -71,5 +73,11 @@ router.patch(
   adminMiddleware,
   updateTournamentStatus
 );
+
+// ------------------------------
+// Clubs / Organizer verification
+// ------------------------------
+router.get("/clubs", adminMiddleware, listClubs);
+router.patch("/clubs/:clubId/status", adminMiddleware, updateClubStatus);
 
 export default router;

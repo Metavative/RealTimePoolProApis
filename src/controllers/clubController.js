@@ -2,10 +2,43 @@ import mongoose from "mongoose";
 import Club from "../models/club.model.js";
 import User from "../models/user.model.js";
 import Booking from "../models/booking.modal.js";
+import { v2 as cloudinary } from "cloudinary";
 
 function toStr(v) {
   if (v === null || v === undefined) return "";
   return String(v).trim();
+}
+
+async function uploadVerificationPdfToCloudinary({
+  buffer,
+  originalName,
+  clubId,
+}) {
+  if (!buffer || !Buffer.isBuffer(buffer)) {
+    throw new Error("Verification PDF buffer missing");
+  }
+
+  const folder = `club_verification/${String(clubId || "").trim() || "unknown"}`;
+  const safeName = toStr(originalName).replace(/\.[^.]+$/, "") || "business_license";
+
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "raw",
+        folder,
+        use_filename: true,
+        unique_filename: true,
+        filename_override: safeName,
+        overwrite: false,
+      },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      }
+    );
+
+    stream.end(buffer);
+  });
 }
 
 export async function createClub(req, res) {
@@ -82,16 +115,16 @@ export async function createBooking(req, res) {
 // form-data:
 // - venue_name
 // - venue_address
-// - business_license (pdf)
+// - business_license (pdf, optional)
 export async function uploadVerificationDocuments(req, res) {
   try {
-    console.log("[VERIFY UPLOAD] content-type:", req.headers["content-type"]);
-console.log("[VERIFY UPLOAD] body keys:", Object.keys(req.body || {}));
-console.log("[VERIFY UPLOAD] file present:", !!req.file);
+    const clubId = toStr(req.clubId || req.club?._id);
+    if (!clubId) {
+      return res.status(401).json({ message: "Club authorization required" });
+    }
 
     const venueName = String(req.body.venue_name || req.body.venueName || "").trim();
-const venueAddress = String(req.body.venue_address || req.body.venueAddress || "").trim();
-
+    const venueAddress = String(req.body.venue_address || req.body.venueAddress || "").trim();
 
     if (!venueName) {
       return res.status(400).json({ message: "venue_name is required" });
@@ -99,42 +132,56 @@ const venueAddress = String(req.body.venue_address || req.body.venueAddress || "
     if (!venueAddress) {
       return res.status(400).json({ message: "venue_address is required" });
     }
-    if (!req.file) {
-      return res.status(400).json({ message: "business_license PDF is required" });
+    let fileUrl = "";
+    if (req.file) {
+      const upload = await uploadVerificationPdfToCloudinary({
+        buffer: req.file.buffer,
+        originalName: req.file.originalname,
+        clubId,
+      });
+
+      fileUrl = toStr(upload?.secure_url || upload?.url);
+      if (!fileUrl) {
+        throw new Error("Failed to persist verification document");
+      }
     }
 
-    // ✅ We received the file in memory: req.file.buffer
-    // On Railway, you should store it somewhere persistent:
-    // - Cloudinary (recommended) OR S3 OR your DB (GridFS)
-    //
-    // For now, we’ll acknowledge it and (optionally) attach metadata to a club.
-    // This avoids schema guessing and lets Flutter flow succeed immediately.
+    const club = await Club.findById(clubId);
+    if (!club) {
+      return res.status(404).json({ message: "Club not found" });
+    }
 
-    // OPTIONAL: If you want to associate to the owner's club without breaking schema:
-    // const club = await Club.findOne({ owner: req.userId }).sort({ createdAt: -1 });
-    // if (club) {
-    //   club.verification = club.verification || {};
-    //   club.verification.status = "pending";
-    //   club.verification.venueName = venueName;
-    //   club.verification.venueAddress = venueAddress;
-    //   club.verification.businessLicense = {
-    //     originalName: req.file.originalname,
-    //     mimeType: req.file.mimetype,
-    //     size: req.file.size,
-    //   };
-    //   await club.save();
-    // }
+    club.verification = club.verification || {};
+    club.verification.venueName = venueName;
+    club.verification.venueAddress = venueAddress;
+    if (fileUrl) {
+      club.verification.businessLicenseUrl = fileUrl;
+    }
+    club.verification.submittedAt = new Date();
+    if (String(club.status || "").toUpperCase() === "PENDING_VERIFICATION") {
+      club.status = "PENDING_REVIEW";
+    }
+    await club.save();
 
     return res.json({
       success: true,
-      message: "Verification documents received",
+      message: "Verification details submitted",
       venueName,
       venueAddress,
-      file: {
-        fieldname: req.file.fieldname,
-        originalname: req.file.originalname,
-        mimetype: req.file.mimetype,
-        size: req.file.size,
+      file: req.file
+          ? {
+              fieldname: req.file.fieldname,
+              originalname: req.file.originalname,
+              mimetype: req.file.mimetype,
+              size: req.file.size,
+              url: fileUrl,
+            }
+          : null,
+      club: {
+        id: club._id,
+        status: club.status,
+        verified: !!club.verified,
+        verificationSubmittedAt: club.verification?.submittedAt || null,
       },
     });
   } catch (error) {
