@@ -7,6 +7,7 @@ import mongoose from "mongoose";
 const APP_COMMISSION_RATE = 0.10;
 const WINNER_SCORE_BONUS = 25;
 const LOSER_SCORE_BONUS = 5;
+const MONTH_COUNT = 12;
 
 function toId(v) {
   if (!v) return "";
@@ -20,6 +21,34 @@ function sameId(a, b) {
 function includesPlayer(players = [], userId) {
   const uid = toId(userId);
   return players.some((p) => toId(p) === uid);
+}
+
+function asNumber(v, fallback = 0) {
+  if (v === null || v === undefined || v === "") return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeYearToDateArray(raw) {
+  const out = Array.from({ length: MONTH_COUNT }, () => 0);
+
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < Math.min(MONTH_COUNT, raw.length); i += 1) {
+      out[i] = Math.max(0, asNumber(raw[i], 0));
+    }
+    return out;
+  }
+
+  if (raw && typeof raw === "object") {
+    for (const [k, v] of Object.entries(raw)) {
+      const idx = Number(k);
+      if (!Number.isFinite(idx)) continue;
+      if (idx < 0 || idx >= MONTH_COUNT) continue;
+      out[idx] = Math.max(0, asNumber(v, 0));
+    }
+  }
+
+  return out;
 }
 
 async function ensureUserExists(userId, session = null) {
@@ -133,6 +162,18 @@ export async function acceptChallenge(req, res) {
     match.status = "ongoing";
     match.startAt = new Date();
     await match.save();
+
+    const safeEntryFee = Math.max(0, Number(match.entryFee || 0));
+    if (safeEntryFee > 0 && Array.isArray(match.players) && match.players.length) {
+      await User.updateMany(
+        { _id: { $in: match.players } },
+        {
+          $inc: {
+            "earnings.entryFeesPaid": safeEntryFee,
+          },
+        }
+      );
+    }
 
     await User.findByIdAndUpdate(actorId, {
       $inc: {
@@ -270,6 +311,23 @@ export async function finishMatch(req, res) {
       ? (loserPrevWon * 100) / loserNextTotal
       : 0;
 
+    const monthIndex = new Date().getMonth();
+    const winnerYearToDate = normalizeYearToDateArray(
+      winnerUser?.earnings?.yearToDate
+    );
+    winnerYearToDate[monthIndex] = Math.max(
+      0,
+      asNumber(winnerYearToDate[monthIndex], 0) + payoutAmount
+    );
+
+    const winnerPrevTotalEarnings = asNumber(
+      winnerUser?.earnings?.total ??
+        winnerUser?.earnings?.career ??
+        winnerUser?.stats?.totalWinnings,
+      0
+    );
+    const winnerNextTotalEarnings = winnerPrevTotalEarnings + payoutAmount;
+
     const winnerUpdate = {
       $inc: {
         "earnings.availableBalance": payoutAmount,
@@ -283,6 +341,8 @@ export async function finishMatch(req, res) {
         "stats.currentWinStreak": winnerNextCurrentStreak,
         "stats.bestWinStreak": winnerNextBestStreak,
         "stats.winRate": Math.max(0, Math.min(100, winnerNextWinRate)),
+        "earnings.yearToDate": winnerYearToDate,
+        "earnings.total": winnerNextTotalEarnings,
       },
     };
 

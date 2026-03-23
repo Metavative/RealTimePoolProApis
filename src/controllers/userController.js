@@ -391,12 +391,17 @@ function normalizeUserForClient(userLike) {
     : 0;
 
   const highestLevelAchieved = deriveHighestLevel(profile, stats);
+  const normalizedEarnings = normalizeEarnings(raw.earnings || {}, stats);
+  const normalizedTotalWinnings = Math.max(
+    round1(totalWinnings),
+    round1(normalizedEarnings.career)
+  );
 
   const metrics = {
     matches: totalMatches,
     wins: gamesWon,
     score,
-    earnings: asInt(totalWinnings, 0),
+    earnings: asInt(normalizedTotalWinnings, 0),
     streak: bestWinStreak,
     acceptance: asInt(matchAcceptancePercentage, 0),
     fair_play: asInt(fairPlayPercent, 0),
@@ -429,7 +434,7 @@ function normalizeUserForClient(userLike) {
   raw.stats = {
     ...stats,
     score,
-    totalWinnings,
+    totalWinnings: normalizedTotalWinnings,
     bestWinStreak,
     gamesWon,
     gamesLost,
@@ -447,6 +452,7 @@ function normalizeUserForClient(userLike) {
     achievementSummary,
     achievements,
   };
+  raw.earnings = normalizedEarnings;
 
   return raw;
 }
@@ -485,6 +491,111 @@ function firstNonEmpty(values = []) {
     if (s) return s;
   }
   return "";
+}
+
+const MONTH_LABELS = Object.freeze([
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+]);
+
+function monthIndexFromAny(raw) {
+  if (raw === null || raw === undefined) return -1;
+
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const n = Math.round(raw);
+    if (n >= 0 && n <= 11) return n;
+    if (n >= 1 && n <= 12) return n - 1;
+  }
+
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return -1;
+
+  const short = s.slice(0, 3);
+  const idx = MONTH_LABELS.findIndex((m) => m.toLowerCase() === short);
+  return idx >= 0 ? idx : -1;
+}
+
+function normalizeYearToDate(rawYearToDate) {
+  const out = Array.from({ length: 12 }, () => 0);
+
+  if (Array.isArray(rawYearToDate)) {
+    if (rawYearToDate.every((v) => typeof v !== "object")) {
+      for (let i = 0; i < Math.min(12, rawYearToDate.length); i += 1) {
+        out[i] = Math.max(0, asNum(rawYearToDate[i], 0));
+      }
+      return out;
+    }
+
+    for (const item of rawYearToDate) {
+      if (!item || typeof item !== "object") continue;
+      const idx = monthIndexFromAny(item.month ?? item.monthIndex ?? item.index);
+      if (idx < 0) continue;
+      out[idx] = Math.max(0, asNum(item.amount ?? item.value ?? item.total, 0));
+    }
+    return out;
+  }
+
+  if (rawYearToDate && typeof rawYearToDate === "object") {
+    for (const [k, v] of Object.entries(rawYearToDate)) {
+      const idx = monthIndexFromAny(k);
+      if (idx < 0) continue;
+      out[idx] = Math.max(0, asNum(v, 0));
+    }
+  }
+
+  return out;
+}
+
+function monthlyFromYearToDate(yearToDate = []) {
+  return MONTH_LABELS.map((month, i) => ({
+    month,
+    amount: round1(Math.max(0, asNum(yearToDate[i], 0))),
+  }));
+}
+
+function normalizeEarnings(earningsLike = {}, stats = {}) {
+  const input = earningsLike && typeof earningsLike === "object"
+    ? { ...earningsLike }
+    : {};
+
+  const yearToDate = normalizeYearToDate(input.yearToDate || input.ytd || input.monthly);
+  const ytdTotal = round1(yearToDate.reduce((sum, v) => sum + Math.max(0, asNum(v, 0)), 0));
+
+  const statsWinnings = round1(Math.max(0, asNum(stats?.totalWinnings, 0)));
+  const careerRaw = round1(Math.max(0, asNum(input.career, 0)));
+  const career = Math.max(careerRaw, statsWinnings, ytdTotal);
+
+  const totalRaw = round1(Math.max(0, asNum(input.total, 0)));
+  const total = Math.max(totalRaw, career);
+
+  const availableBalance = round1(Math.max(0, asNum(input.availableBalance, 0)));
+  const entryFeesPaid = round1(Math.max(0, asNum(input.entryFeesPaid, 0)));
+  const withdrawable =
+    typeof input.withdrawable === "boolean" ? input.withdrawable : true;
+
+  return {
+    yearToDate: yearToDate.map((v) => round1(v)),
+    monthly: monthlyFromYearToDate(yearToDate),
+    yearToDateTotal: ytdTotal,
+    career: round1(career),
+    total: round1(total),
+    availableBalance,
+    entryFeesPaid,
+    withdrawable,
+    transactionHistory: Array.isArray(input.transactionHistory)
+      ? input.transactionHistory
+      : [],
+  };
 }
 
 function clampRating(v) {
@@ -1120,6 +1231,50 @@ export async function createFeedback(req, res) {
     });
   } catch (error) {
     return res.status(500).json({ message: error.message || "Failed to submit feedback" });
+  }
+}
+
+export async function getEarnings(req, res) {
+  try {
+    const user = await User.findById(req.userId).select(
+      [
+        "_id",
+        "username",
+        "profile.nickname",
+        "profile.name",
+        "profile.firstName",
+        "profile.lastName",
+        "stats.totalWinnings",
+        "stats.score",
+        "stats.rank",
+        "earnings",
+      ].join(" ")
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const normalizedUser = normalizeUserForClient(user);
+    const earnings = normalizeEarnings(
+      normalizedUser?.earnings || {},
+      normalizedUser?.stats || {}
+    );
+
+    return res.json({
+      earnings,
+      stats: {
+        totalWinnings: asNum(normalizedUser?.stats?.totalWinnings, 0),
+        score: asInt(normalizedUser?.stats?.score, 0),
+        rank: toStr(normalizedUser?.stats?.rank),
+      },
+      meta: {
+        year: new Date().getFullYear(),
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message || "Failed to load earnings" });
   }
 }
 

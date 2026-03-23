@@ -42,6 +42,7 @@ router.get("/me", authMiddleware, useCtrl.me);
 router.get("/leaderboard", authMiddleware, useCtrl.leaderboard);
 router.get("/feedback", authMiddleware, useCtrl.listFeedback);
 router.post("/feedback", authMiddleware, useCtrl.createFeedback);
+router.get("/earnings", authMiddleware, useCtrl.getEarnings);
 
 router.patch(
   "/me",
