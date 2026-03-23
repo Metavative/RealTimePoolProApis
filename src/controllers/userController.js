@@ -273,53 +273,32 @@ function normalizeUserForClient(userLike) {
     0
   );
 
-  const rawWinRate = asNum(stats.winRate, Number.NaN);
-  const winPercentage = Number.isFinite(rawWinRate)
-    ? clampPercent(rawWinRate)
-    : totalMatches > 0
-      ? clampPercent((gamesWon * 100) / totalMatches)
-      : 0;
+  const winPercentage = totalMatches > 0
+    ? clampPercent((gamesWon * 100) / totalMatches)
+    : 0;
 
-  const rawDisputePct = asNum(profile.disputePercentage, Number.NaN);
-  const disputePercentage = Number.isFinite(rawDisputePct)
-    ? clampPercent(rawDisputePct)
-    : totalMatches > 0
-      ? clampPercent((disputes * 100) / totalMatches)
-      : 0;
+  const disputePercentage = totalMatches > 0
+    ? clampPercent((disputes * 100) / totalMatches)
+    : 0;
 
-  const rawDisputeWinPct = asNum(profile.disputeWinPercentage, Number.NaN);
-  const disputeWinPercentage = Number.isFinite(rawDisputeWinPct)
-    ? clampPercent(rawDisputeWinPct)
-    : disputes > 0
-      ? clampPercent((disputesWon * 100) / disputes)
-      : 0;
+  const disputeWinPercentage = disputes > 0
+    ? clampPercent((disputesWon * 100) / disputes)
+    : 0;
 
-  const rawAcceptance = asNum(profile.matchAcceptancePercentage, Number.NaN);
-  const rawRefusal = asNum(profile.refusalPercentage, Number.NaN);
-  let matchAcceptancePercentage = 0;
-  let refusalPercentage = 0;
-
-  if (Number.isFinite(rawAcceptance) || Number.isFinite(rawRefusal)) {
-    matchAcceptancePercentage = Number.isFinite(rawAcceptance)
-      ? clampPercent(rawAcceptance)
-      : clampPercent(100 - rawRefusal);
-    refusalPercentage = Number.isFinite(rawRefusal)
-      ? clampPercent(rawRefusal)
-      : clampPercent(100 - rawAcceptance);
-  } else {
-    const totalChallenges = acceptedChallenges + declinedChallenges;
-    matchAcceptancePercentage = totalChallenges > 0
-      ? clampPercent((acceptedChallenges * 100) / totalChallenges)
-      : 0;
-    refusalPercentage = totalChallenges > 0
-      ? clampPercent((declinedChallenges * 100) / totalChallenges)
-      : 0;
-  }
+  const totalChallenges = acceptedChallenges + declinedChallenges;
+  const matchAcceptancePercentage = totalChallenges > 0
+    ? clampPercent((acceptedChallenges * 100) / totalChallenges)
+    : 0;
+  const refusalPercentage = totalChallenges > 0
+    ? clampPercent((declinedChallenges * 100) / totalChallenges)
+    : 0;
 
   const fairPlayRaw = asNum(profile.fairPlay, 0);
-  const fairPlayPercent = fairPlayRaw <= 5
-    ? clampPercent(fairPlayRaw * 20)
-    : clampPercent(fairPlayRaw);
+  const fairPlayPercent = totalMatches > 0
+    ? (fairPlayRaw <= 5
+      ? clampPercent(fairPlayRaw * 20)
+      : clampPercent(fairPlayRaw))
+    : 0;
 
   const highestLevelAchieved = deriveHighestLevel(profile, stats);
 
@@ -342,6 +321,7 @@ function normalizeUserForClient(userLike) {
     disputeWinPercentage: round1(disputeWinPercentage),
     matchAcceptancePercentage: round1(matchAcceptancePercentage),
     refusalPercentage: round1(refusalPercentage),
+    fairPlayPercentage: round1(fairPlayPercent),
     highestLevelAchieved,
   };
 

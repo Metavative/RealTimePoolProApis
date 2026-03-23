@@ -391,6 +391,22 @@ export async function respondToInvite(req, res, io, presence) {
     invite.status = action === "accept" ? "accepted" : "declined";
     await invite.save();
 
+    if (action === "accept") {
+      await User.findByIdAndUpdate(req.userId, {
+        $inc: {
+          "stats.acceptedChallenges": 1,
+          "stats.matchesAccepted": 1,
+        },
+      });
+    } else {
+      await User.findByIdAndUpdate(req.userId, {
+        $inc: {
+          "stats.declinedChallenges": 1,
+          "stats.matchesRefused": 1,
+        },
+      });
+    }
+
     emitToUser(io, presence, req.userId, "tournament_invite:updated", {
       inviteId: invite._id,
       tournamentId: invite.tournamentId,

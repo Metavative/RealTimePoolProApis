@@ -29,7 +29,7 @@ const ProfileSchema = new mongoose.Schema({
   maxLevel: { type: Number, default: 100 },
   disputePercentage: { type: Number, default: 0 },
   disputeWinPercentage: { type: Number, default: 0 },
-  matchAcceptancePercentage: { type: Number, default: 100 },
+  matchAcceptancePercentage: { type: Number, default: 0 },
   refusalPercentage: { type: Number, default: 0 },
   fairPlay: { type: Number, default: 5.0 },
   verified: { type: Boolean, default: false },

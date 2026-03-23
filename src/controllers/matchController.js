@@ -5,6 +5,8 @@ import Transaction from "../models/transaction.model.js";
 import mongoose from "mongoose";
 
 const APP_COMMISSION_RATE = 0.10;
+const WINNER_SCORE_BONUS = 25;
+const LOSER_SCORE_BONUS = 5;
 
 function toId(v) {
   if (!v) return "";
@@ -275,6 +277,7 @@ export async function finishMatch(req, res) {
         "stats.totalWinnings": payoutAmount,
         "stats.gamesWon": 1,
         "stats.totalMatches": 1,
+        "stats.score": WINNER_SCORE_BONUS,
       },
       $set: {
         "stats.currentWinStreak": winnerNextCurrentStreak,
@@ -287,6 +290,7 @@ export async function finishMatch(req, res) {
       $inc: {
         "stats.gamesLost": 1,
         "stats.totalMatches": 1,
+        "stats.score": LOSER_SCORE_BONUS,
       },
       $set: {
         "stats.currentWinStreak": 0,
