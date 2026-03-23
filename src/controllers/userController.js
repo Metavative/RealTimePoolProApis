@@ -60,6 +60,26 @@ function toStr(v) {
   return String(v).trim();
 }
 
+function looksLikeEmail(v) {
+  const s = toStr(v);
+  return !!s && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+function looksLikePhone(v) {
+  const s = toStr(v);
+  if (!s) return false;
+  const digits = s.replace(/[^0-9]/g, "");
+  if (digits.length < 7 || digits.length > 15) return false;
+  return /^[+0-9()\-\s.]+$/.test(s);
+}
+
+function cleanPublicName(v) {
+  const s = toStr(v);
+  if (!s) return "";
+  if (looksLikeEmail(s) || looksLikePhone(s)) return "";
+  return s;
+}
+
 function normalizeName(v) {
   const s = toStr(v);
   return s ? s.replace(/\s+/g, " ").trim() : "";
@@ -436,11 +456,15 @@ function resolveRegion(u = {}) {
 
 function displayName(u = {}) {
   const p = u.profile || {};
+  const firstLast = cleanPublicName(
+    `${toStr(p.firstName)} ${toStr(p.lastName)}`.trim()
+  );
+
   return firstNonEmpty([
-    p.nickname,
-    p.name,
-    u.username,
-    `${toStr(p.firstName)} ${toStr(p.lastName)}`.trim(),
+    cleanPublicName(u.username),
+    cleanPublicName(p.nickname),
+    cleanPublicName(p.name),
+    firstLast,
     "Player",
   ]);
 }
