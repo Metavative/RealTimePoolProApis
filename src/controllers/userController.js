@@ -517,6 +517,8 @@ export async function leaderboard(req, res) {
           "profile.firstName",
           "profile.lastName",
           "profile.avatar",
+          "profile.avatarUrl",
+          "profile.photo",
           "profile.gender",
           "profile.dateOfBirth",
           "profile.country",
@@ -560,13 +562,19 @@ export async function leaderboard(req, res) {
       const winnings = Number(u?.stats?.totalWinnings || 0);
       const country = resolveCountry(u);
       const region = resolveRegion(u);
+      const avatarUrl = firstNonEmpty([
+        u?.profile?.avatar,
+        u?.profile?.avatarUrl,
+        u?.profile?.photo,
+      ]);
 
       return {
         rank: idx + 1,
         userId: String(u._id),
         name: displayName(u),
         username: toStr(u.username),
-        avatar: toStr(u?.profile?.avatar),
+        avatar: toStr(avatarUrl),
+        avatarUrl: toStr(avatarUrl),
         points,
         score: points,
         totalWinnings: winnings,
