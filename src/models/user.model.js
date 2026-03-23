@@ -1,10 +1,20 @@
 import mongoose from "mongoose";
 
 const FeedbackSchema = new mongoose.Schema({
-  avatar: String,
-  name: String,
-  feedback: String,
+  fromUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  matchId: { type: String, default: "" },
+  avatar: { type: String, default: "" },
+  avatarUrl: { type: String, default: "" },
+  avatarUpdatedAt: { type: Date, default: null },
+  name: { type: String, default: "" },
+  feedback: { type: String, default: "" },
+  message: { type: String, default: "" },
+  text: { type: String, default: "" },
+  comment: { type: String, default: "" },
+  review: { type: String, default: "" },
+  rating: { type: Number, default: 0, min: 0, max: 5 },
   createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
 });
 
 const ProfileSchema = new mongoose.Schema({

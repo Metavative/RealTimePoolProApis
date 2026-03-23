@@ -487,6 +487,94 @@ function firstNonEmpty(values = []) {
   return "";
 }
 
+function clampRating(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 5) return 5;
+  return Math.round(n * 10) / 10;
+}
+
+function resolveFeedbackText(row = {}) {
+  return firstNonEmpty([
+    row.feedback,
+    row.message,
+    row.text,
+    row.comment,
+    row.review,
+  ]);
+}
+
+function feedbackCreatedAt(row = {}) {
+  const raw = row.createdAt || row.updatedAt || null;
+  if (!raw) return null;
+  const dt = new Date(raw);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt.toISOString();
+}
+
+function feedbackFromUserSlim(u = null) {
+  if (!u || typeof u !== "object") return null;
+  const normalized = normalizeUserForClient(u);
+  const profile = normalized?.profile || {};
+  const stats = normalized?.stats || {};
+
+  return {
+    _id: toStr(normalized?._id),
+    username: toStr(normalized?.username),
+    avatar: toStr(resolveAvatarUrl(normalized)),
+    avatarUrl: toStr(resolveAvatarUrl(normalized)),
+    avatarUpdatedAt: toStr(profile?.avatarUpdatedAt),
+    profile: {
+      nickname: toStr(profile?.nickname),
+      name: toStr(profile?.name),
+      avatar: toStr(resolveAvatarUrl(normalized)),
+      avatarUrl: toStr(resolveAvatarUrl(normalized)),
+      avatarUpdatedAt: toStr(profile?.avatarUpdatedAt),
+      highestLevelAchieved: asInt(
+        profile?.highestLevelAchieved ?? stats?.highestLevelAchieved,
+        0
+      ),
+    },
+    stats: {
+      score: asInt(stats?.score, 0),
+      highestLevelAchieved: asInt(stats?.highestLevelAchieved, 0),
+      rank: toStr(stats?.rank),
+    },
+  };
+}
+
+function normalizeFeedbackRow(row = {}, fromUser = null) {
+  const text = resolveFeedbackText(row);
+  const fromUserSlim = feedbackFromUserSlim(fromUser);
+  const fallbackName = cleanPublicName(row?.name) || "Player";
+  const name = fromUserSlim
+    ? displayName(fromUserSlim)
+    : fallbackName;
+
+  const avatar = fromUserSlim?.avatar || toStr(row?.avatar) || toStr(row?.avatarUrl);
+  const avatarUpdatedAt =
+    toStr(fromUserSlim?.avatarUpdatedAt) || toStr(row?.avatarUpdatedAt);
+
+  return {
+    _id: toStr(row?._id),
+    fromUserId: toStr(row?.fromUserId),
+    matchId: toStr(row?.matchId),
+    name,
+    feedback: text,
+    message: text,
+    text,
+    comment: text,
+    review: text,
+    rating: clampRating(row?.rating),
+    avatar,
+    avatarUrl: avatar,
+    avatarUpdatedAt,
+    createdAt: feedbackCreatedAt(row),
+    fromUser: fromUserSlim,
+  };
+}
+
 function resolveCountry(u = {}) {
   const p = u.profile || {};
   const loc = u.location || {};
@@ -791,10 +879,6 @@ export async function updateProfile(req, res) {
     nextProfile = normalizeAvatarProfile(nextProfile, { stampNow: false });
     user.profile = nextProfile;
 
-    if (payload.feedbacks !== undefined && Array.isArray(payload.feedbacks)) {
-      user.feedbacks = payload.feedbacks;
-    }
-
     if (payload.earnings !== undefined && payload.earnings && typeof payload.earnings === "object") {
       user.earnings = mergePlainObject(user.earnings || {}, payload.earnings || {});
     }
@@ -870,6 +954,172 @@ export async function updateProfile(req, res) {
 
     console.log("Error in updateProfile", error.message);
     return res.status(500).json({ message: error.message });
+  }
+}
+
+export async function listFeedback(req, res) {
+  try {
+    const targetId = toStr(req.query?.userId || req.userId);
+    if (!targetId) {
+      return res.status(400).json({ message: "userId is required" });
+    }
+
+    const target = await User.findById(targetId).select("feedbacks");
+    if (!target) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const rows = Array.isArray(target.feedbacks)
+      ? target.feedbacks.map((f) =>
+          f && typeof f.toObject === "function" ? f.toObject() : { ...(f || {}) }
+        )
+      : [];
+
+    const fromIds = rows
+      .map((f) => toStr(f?.fromUserId))
+      .filter((v) => v.length > 0);
+
+    const uniqueFromIds = Array.from(new Set(fromIds));
+    const fromUsers = uniqueFromIds.length
+      ? await User.find({ _id: { $in: uniqueFromIds } })
+          .select(
+            [
+              "_id",
+              "username",
+              "profile.nickname",
+              "profile.name",
+              "profile.avatar",
+              "profile.avatarUrl",
+              "profile.photo",
+              "profile.profileImage",
+              "profile.avatarUpdatedAt",
+              "profile.highestLevelAchieved",
+              "stats.score",
+              "stats.rank",
+              "stats.highestLevelAchieved",
+            ].join(" ")
+          )
+          .lean()
+      : [];
+
+    const fromMap = new Map(fromUsers.map((u) => [toStr(u?._id), u]));
+
+    const feedbacks = rows
+      .map((row) => {
+        const fromUser = fromMap.get(toStr(row?.fromUserId)) || null;
+        return normalizeFeedbackRow(row, fromUser);
+      })
+      .sort((a, b) => {
+        const at = new Date(a.createdAt || 0).getTime();
+        const bt = new Date(b.createdAt || 0).getTime();
+        return bt - at;
+      });
+
+    const ratings = feedbacks
+      .map((f) => Number(f.rating || 0))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const avgRating = ratings.length
+      ? Math.round((ratings.reduce((sum, n) => sum + n, 0) / ratings.length) * 10) / 10
+      : 0;
+
+    return res.json({
+      feedbacks,
+      meta: {
+        count: feedbacks.length,
+        ratingCount: ratings.length,
+        avgRating,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message || "Failed to load feedback" });
+  }
+}
+
+export async function createFeedback(req, res) {
+  try {
+    const payload = req.body || {};
+    const targetId = toStr(
+      payload.toUserId ||
+        payload.userId ||
+        payload.targetUserId ||
+        payload.playerId
+    );
+
+    if (!targetId) {
+      return res.status(400).json({ message: "toUserId is required" });
+    }
+
+    if (toStr(req.userId) && toStr(req.userId) === targetId) {
+      return res.status(400).json({ message: "You cannot review yourself" });
+    }
+
+    const text = resolveFeedbackText(payload);
+    if (!text) {
+      return res.status(400).json({ message: "Feedback text is required" });
+    }
+
+    const target = await User.findById(targetId);
+    if (!target) {
+      return res.status(404).json({ message: "Target user not found" });
+    }
+
+    const author = req.userId
+      ? await User.findById(req.userId)
+          .select(
+            [
+              "_id",
+              "username",
+              "profile.nickname",
+              "profile.name",
+              "profile.avatar",
+              "profile.avatarUrl",
+              "profile.photo",
+              "profile.profileImage",
+              "profile.avatarUpdatedAt",
+              "profile.highestLevelAchieved",
+              "stats.score",
+              "stats.rank",
+              "stats.highestLevelAchieved",
+            ].join(" ")
+          )
+      : null;
+
+    const authorName = author
+      ? displayName(author)
+      : firstNonEmpty([toStr(payload.name), "Player"]);
+    const authorAvatar = author
+      ? toStr(resolveAvatarUrl(author))
+      : firstNonEmpty([toStr(payload.avatar), toStr(payload.avatarUrl)]);
+
+    const now = new Date();
+    const row = {
+      fromUserId: author?._id || null,
+      matchId: toStr(payload.matchId),
+      name: authorName,
+      avatar: authorAvatar,
+      avatarUrl: authorAvatar,
+      avatarUpdatedAt: author?.profile?.avatarUpdatedAt || null,
+      feedback: text,
+      message: text,
+      text,
+      comment: text,
+      review: text,
+      rating: clampRating(payload.rating),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    target.feedbacks = Array.isArray(target.feedbacks) ? target.feedbacks : [];
+    target.feedbacks.push(row);
+    await target.save();
+
+    return res.status(201).json({
+      message: "Feedback submitted",
+      feedback: normalizeFeedbackRow(row, author),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message || "Failed to submit feedback" });
   }
 }
 
