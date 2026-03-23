@@ -57,7 +57,7 @@ function isAvatarUrlLike(v) {
 
 function resolveAvatarUrl(u = {}) {
   const p = u?.profile || {};
-  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  const candidates = [p.avatarUrl, p.photo, p.profileImage, p.avatar];
   for (const candidate of candidates) {
     const s = toStr(candidate);
     if (s && isAvatarUrlLike(s)) return s;
@@ -72,6 +72,7 @@ function normalizeRealtimeUser(u = {}) {
     profile.avatar = avatar;
     profile.avatarUrl = avatar;
     profile.photo = avatar;
+    profile.profileImage = avatar;
   } else {
     profile.avatarUrl = "";
   }
@@ -203,7 +204,7 @@ async function emitOnlinePlayers() {
 
   const users = await User.find({ _id: { $in: ids } })
     .select(
-      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag"
+      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag"
     )
     .lean();
 
@@ -234,7 +235,7 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
     },
   })
     .select(
-      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location"
+      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location"
     )
     .lean();
 

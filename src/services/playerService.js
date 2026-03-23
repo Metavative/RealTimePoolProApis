@@ -20,7 +20,7 @@ function isAvatarUrlLike(v) {
 
 function resolveAvatarUrl(u = {}) {
   const p = u?.profile || {};
-  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  const candidates = [p.avatarUrl, p.photo, p.profileImage, p.avatar];
   for (const candidate of candidates) {
     const s = toStr(candidate);
     if (s && isAvatarUrlLike(s)) return s;
@@ -46,7 +46,7 @@ export async function getNearbyPlayers(userId, radiusKm = 5) {
         $maxDistance: radiusKm * 1000 // meters
       }
     }
-  }).select("username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt stats.totalWinnings profile.verified location");
+  }).select("username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt stats.totalWinnings profile.verified location");
 
   return players.map((player) => {
     const row = player.toObject ? player.toObject() : { ...player };
@@ -56,6 +56,7 @@ export async function getNearbyPlayers(userId, radiusKm = 5) {
       row.profile.avatar = avatar;
       row.profile.avatarUrl = avatar;
       row.profile.photo = avatar;
+      row.profile.profileImage = avatar;
     } else {
       row.profile.avatarUrl = "";
     }

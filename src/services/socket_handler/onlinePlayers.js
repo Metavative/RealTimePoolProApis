@@ -20,7 +20,7 @@ function isAvatarUrlLike(v) {
 
 function resolveAvatarUrl(u = {}) {
   const p = u?.profile || {};
-  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  const candidates = [p.avatarUrl, p.photo, p.profileImage, p.avatar];
   for (const candidate of candidates) {
     const s = toStr(candidate);
     if (s && isAvatarUrlLike(s)) return s;
@@ -35,6 +35,7 @@ function normalizeRealtimeUser(u = {}) {
     profile.avatar = avatar;
     profile.avatarUrl = avatar;
     profile.photo = avatar;
+    profile.profileImage = avatar;
   } else {
     profile.avatarUrl = "";
   }
@@ -63,7 +64,7 @@ async function getNearbyPlayers(userId, radiusKm = 5) {
       },
     },
   })
-    .select("username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt stats.totalWinnings profile.verified location")
+    .select("username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt stats.totalWinnings profile.verified location")
     .lean()
     .then((rows) => rows.map((row) => normalizeRealtimeUser(row)));
 }

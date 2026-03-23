@@ -80,9 +80,11 @@ function resolveAvatarUrl(source = {}) {
   const candidates = [
     profile?.avatarUrl,
     profile?.photo,
+    profile?.profileImage,
     profile?.avatar,
     source?.avatarUrl,
     source?.photo,
+    source?.profileImage,
     source?.avatar,
   ];
 
@@ -101,12 +103,14 @@ function normalizeAvatarProfile(profileLike = {}, { stampNow = false } = {}) {
     profile.avatar = avatarUrl;
     profile.avatarUrl = avatarUrl;
     profile.photo = avatarUrl;
+    profile.profileImage = avatarUrl;
     if (stampNow || !profile.avatarUpdatedAt) {
       profile.avatarUpdatedAt = new Date();
     }
   } else {
     profile.avatarUrl = "";
     if (isAvatarUrlLike(profile.photo)) profile.photo = "";
+    if (isAvatarUrlLike(profile.profileImage)) profile.profileImage = "";
   }
 
   return profile;
@@ -607,6 +611,7 @@ export async function leaderboard(req, res) {
           "profile.avatar",
           "profile.avatarUrl",
           "profile.photo",
+          "profile.profileImage",
           "profile.avatarUpdatedAt",
           "profile.gender",
           "profile.dateOfBirth",
@@ -838,6 +843,7 @@ export async function updateProfile(req, res) {
       user.profile.avatar = result.secure_url;
       user.profile.avatarUrl = result.secure_url;
       user.profile.photo = result.secure_url;
+      user.profile.profileImage = result.secure_url;
       user.profile.avatarUpdatedAt = new Date();
     }
 

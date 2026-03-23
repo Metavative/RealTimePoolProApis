@@ -25,7 +25,12 @@ function isAvatarUrlLike(v) {
 }
 
 function resolveAvatarUrl(profile = {}) {
-  const candidates = [profile.avatarUrl, profile.photo, profile.avatar];
+  const candidates = [
+    profile.avatarUrl,
+    profile.photo,
+    profile.profileImage,
+    profile.avatar,
+  ];
   for (const candidate of candidates) {
     const value = toStr(candidate);
     if (value && isAvatarUrlLike(value)) return value;

@@ -32,6 +32,7 @@ const ProfileSchema = new mongoose.Schema({
   avatar: { type: String, default: "" },
   avatarUrl: { type: String, default: "" },
   photo: { type: String, default: "" },
+  profileImage: { type: String, default: "" },
   avatarUpdatedAt: { type: Date, default: null },
   highestLevelAchieve: String,
   highestLevelAchieved: { type: Number, default: 1 },
@@ -128,7 +129,12 @@ function isAvatarUrlLike(v) {
 }
 
 function resolveProfileAvatarUrl(profile = {}) {
-  const candidates = [profile.avatarUrl, profile.photo, profile.avatar];
+  const candidates = [
+    profile.avatarUrl,
+    profile.photo,
+    profile.profileImage,
+    profile.avatar,
+  ];
   for (const candidate of candidates) {
     const value = cleanText(candidate);
     if (value && isAvatarUrlLike(value)) return value;
@@ -241,6 +247,7 @@ UserSchema.pre("save", function (next) {
       this.profile.avatar = resolvedAvatarUrl;
       this.profile.avatarUrl = resolvedAvatarUrl;
       this.profile.photo = resolvedAvatarUrl;
+      this.profile.profileImage = resolvedAvatarUrl;
       if (!this.profile.avatarUpdatedAt) {
         this.profile.avatarUpdatedAt = new Date();
       }
@@ -248,6 +255,9 @@ UserSchema.pre("save", function (next) {
       this.profile.avatarUrl = "";
       if (isAvatarUrlLike(this.profile.photo)) {
         this.profile.photo = "";
+      }
+      if (isAvatarUrlLike(this.profile.profileImage)) {
+        this.profile.profileImage = "";
       }
     }
   }

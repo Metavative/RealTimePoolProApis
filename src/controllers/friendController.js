@@ -49,7 +49,7 @@ function bestName(u) {
 
 function bestAvatar(u) {
   const p = u?.profile || {};
-  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  const candidates = [p.avatarUrl, p.photo, p.profileImage, p.avatar];
   for (const c of candidates) {
     const s = toStr(c);
     if (s && isAvatarUrlLike(s)) return s;
@@ -107,6 +107,7 @@ export async function searchFriends(req, res) {
           "profile.avatar",
           "profile.avatarUrl",
           "profile.photo",
+          "profile.profileImage",
           "profile.avatarUpdatedAt",
           "profile.onlineStatus",
           "stats.rank",
@@ -151,11 +152,11 @@ export async function listRequests(req, res) {
       .sort({ createdAt: -1 })
       .populate(
         "from",
-        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
       )
       .populate(
         "to",
-        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
@@ -216,7 +217,7 @@ export async function listFriends(req, res, presence) {
 
     const friends = await User.find({ _id: { $in: friendIds } })
       .select(
-        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.profileImage profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
