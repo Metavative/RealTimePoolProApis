@@ -132,6 +132,13 @@ export async function acceptChallenge(req, res) {
     match.startAt = new Date();
     await match.save();
 
+    await User.findByIdAndUpdate(actorId, {
+      $inc: {
+        "stats.acceptedChallenges": 1,
+        "stats.matchesAccepted": 1,
+      },
+    });
+
     return res.json({ match });
   } catch (error) {
     return res.status(500).json({
@@ -218,18 +225,72 @@ export async function finishMatch(req, res) {
     };
     await match.save({ session });
 
+    const [winnerUser, loserUser] = await Promise.all([
+      User.findById(winnerId)
+        .select("stats earnings")
+        .session(session),
+      User.findById(loserId)
+        .select("stats")
+        .session(session),
+    ]);
+
+    const winnerPrevWon = Number(winnerUser?.stats?.gamesWon || 0);
+    const winnerPrevLost = Number(winnerUser?.stats?.gamesLost || 0);
+    const winnerPrevDraw = Number(winnerUser?.stats?.gamesDrawn || 0);
+    const winnerPrevTotal = Number(
+      winnerUser?.stats?.totalMatches ||
+      winnerPrevWon + winnerPrevLost + winnerPrevDraw
+    );
+    const winnerPrevCurrentStreak = Number(winnerUser?.stats?.currentWinStreak || 0);
+    const winnerPrevBestStreak = Number(winnerUser?.stats?.bestWinStreak || 0);
+
+    const winnerNextWon = winnerPrevWon + 1;
+    const winnerNextTotal = winnerPrevTotal + 1;
+    const winnerNextCurrentStreak = winnerPrevCurrentStreak + 1;
+    const winnerNextBestStreak = Math.max(
+      winnerPrevBestStreak,
+      winnerNextCurrentStreak
+    );
+    const winnerNextWinRate = winnerNextTotal > 0
+      ? (winnerNextWon * 100) / winnerNextTotal
+      : 0;
+
+    const loserPrevWon = Number(loserUser?.stats?.gamesWon || 0);
+    const loserPrevLost = Number(loserUser?.stats?.gamesLost || 0);
+    const loserPrevDraw = Number(loserUser?.stats?.gamesDrawn || 0);
+    const loserPrevTotal = Number(
+      loserUser?.stats?.totalMatches ||
+      loserPrevWon + loserPrevLost + loserPrevDraw
+    );
+    const loserNextLost = loserPrevLost + 1;
+    const loserNextTotal = loserPrevTotal + 1;
+    const loserNextWinRate = loserNextTotal > 0
+      ? (loserPrevWon * 100) / loserNextTotal
+      : 0;
+
     const winnerUpdate = {
       $inc: {
         "earnings.availableBalance": payoutAmount,
         "earnings.career": payoutAmount,
         "stats.totalWinnings": payoutAmount,
         "stats.gamesWon": 1,
+        "stats.totalMatches": 1,
+      },
+      $set: {
+        "stats.currentWinStreak": winnerNextCurrentStreak,
+        "stats.bestWinStreak": winnerNextBestStreak,
+        "stats.winRate": Math.max(0, Math.min(100, winnerNextWinRate)),
       },
     };
 
     const loserUpdate = {
       $inc: {
         "stats.gamesLost": 1,
+        "stats.totalMatches": 1,
+      },
+      $set: {
+        "stats.currentWinStreak": 0,
+        "stats.winRate": Math.max(0, Math.min(100, loserNextWinRate)),
       },
     };
 
@@ -334,8 +395,23 @@ export async function cancelMatch(req, res) {
       return res.status(409).json({ message: "Match is already cancelled" });
     }
 
+    const wasPending = match.status === "pending";
+
     match.status = "cancelled";
     await match.save({ session });
+
+    if (wasPending) {
+      await User.findByIdAndUpdate(
+        actorId,
+        {
+          $inc: {
+            "stats.declinedChallenges": 1,
+            "stats.matchesRefused": 1,
+          },
+        },
+        { session }
+      );
+    }
 
     const entryFee = Math.max(0, Number(match.entryFee || 0));
 

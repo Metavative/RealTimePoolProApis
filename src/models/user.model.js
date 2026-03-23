@@ -9,6 +9,7 @@ const FeedbackSchema = new mongoose.Schema({
 
 const ProfileSchema = new mongoose.Schema({
   nickname: String,
+  name: { type: String, default: "" },
 
   // ✅ KYC-ready identity fields
   firstName: { type: String, default: "" },
@@ -21,6 +22,7 @@ const ProfileSchema = new mongoose.Schema({
 
   avatar: { type: String, default: "" },
   highestLevelAchieve: String,
+  highestLevelAchieved: { type: Number, default: 1 },
   musicPlayer: { type: Boolean, default: true },
   homeTable: String,
   minLevel: { type: Number, default: 1 },
@@ -63,9 +65,19 @@ const StatsSchema = new mongoose.Schema({
   gamesWon: { type: Number, default: 0 },
   gamesLost: { type: Number, default: 0 },
   gamesDrawn: { type: Number, default: 0 },
+  totalMatches: { type: Number, default: 0 },
   avgMatchDurationMinutes: { type: Number, default: 0 },
   tournaments: { type: Number, default: 0 },
   disputeHistoryCount: { type: Number, default: 0 },
+  disputesWon: { type: Number, default: 0 },
+  disputeWins: { type: Number, default: 0 },
+  acceptedChallenges: { type: Number, default: 0 },
+  declinedChallenges: { type: Number, default: 0 },
+  matchesAccepted: { type: Number, default: 0 },
+  matchesRefused: { type: Number, default: 0 },
+  highestLevelAchieved: { type: Number, default: 1 },
+  achievementSummary: { type: mongoose.Schema.Types.Mixed, default: {} },
+  achievements: { type: [mongoose.Schema.Types.Mixed], default: [] },
 });
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
