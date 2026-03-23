@@ -8,6 +8,7 @@ import User from "../models/user.model.js";
 const router = express.Router();
 
 router.get("/me", authMiddleware, useCtrl.me);
+router.get("/leaderboard", authMiddleware, useCtrl.leaderboard);
 
 router.patch(
   "/me",

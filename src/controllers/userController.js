@@ -85,6 +85,10 @@ function normalizeUsername(raw) {
   return { username, lower };
 }
 
+function norm(v) {
+  return String(v ?? "").trim().toLowerCase();
+}
+
 function validateUsername(username) {
   if (!username) return "Username is required";
   if (!USERNAME_REGEX.test(username)) {
@@ -357,6 +361,239 @@ function normalizeUserForClient(userLike) {
   };
 
   return raw;
+}
+
+function normalizeCategory(raw) {
+  const k = norm(raw);
+  if (k === "youth") return "youth";
+  if (k === "ladies" || k === "women" || k === "female") return "ladies";
+  if (k === "seniors" || k === "senior") return "seniors";
+  if (k === "masters" || k === "master") return "masters";
+  return "global";
+}
+
+function normalizeScope(raw) {
+  const k = norm(raw);
+  if (k === "country") return "country";
+  if (k === "region" || k === "state" || k === "county") return "region";
+  return "global";
+}
+
+function ageFromDob(dobLike) {
+  if (!dobLike) return -1;
+  const dt = new Date(dobLike);
+  if (Number.isNaN(dt.getTime())) return -1;
+
+  const now = new Date();
+  let age = now.getFullYear() - dt.getFullYear();
+  const m = now.getMonth() - dt.getMonth();
+  if (m < 0 || (m === 0 && now.getDate() < dt.getDate())) age -= 1;
+  return age >= 0 ? age : -1;
+}
+
+function firstNonEmpty(values = []) {
+  for (const v of values) {
+    const s = toStr(v);
+    if (s) return s;
+  }
+  return "";
+}
+
+function resolveCountry(u = {}) {
+  const p = u.profile || {};
+  const loc = u.location || {};
+  return firstNonEmpty([
+    p.country,
+    p.countryName,
+    p.countryCode,
+    u.country,
+    u.countryName,
+    u.countryCode,
+    loc.country,
+    loc.countryName,
+    loc.countryCode,
+  ]);
+}
+
+function resolveRegion(u = {}) {
+  const p = u.profile || {};
+  const loc = u.location || {};
+  return firstNonEmpty([
+    p.region,
+    p.state,
+    p.county,
+    p.province,
+    u.region,
+    u.state,
+    u.county,
+    u.province,
+    loc.region,
+    loc.state,
+    loc.county,
+    loc.province,
+  ]);
+}
+
+function displayName(u = {}) {
+  const p = u.profile || {};
+  return firstNonEmpty([
+    p.nickname,
+    p.name,
+    u.username,
+    `${toStr(p.firstName)} ${toStr(p.lastName)}`.trim(),
+    "Player",
+  ]);
+}
+
+function includeByCategory(u = {}, category = "global") {
+  if (category === "global") return true;
+  const p = u.profile || {};
+  const age = ageFromDob(p.dateOfBirth || p.dob || p.birthDate);
+
+  if (category === "youth") return age >= 0 && age < 18;
+  if (category === "seniors") return age >= 40;
+  if (category === "masters") return age >= 50;
+  if (category === "ladies") {
+    const g = norm(p.gender);
+    return ["f", "female", "woman", "women", "lady", "girl"].includes(g);
+  }
+  return true;
+}
+
+function includeByScope(u = {}, scope = "global", viewerCountry = "", viewerRegion = "") {
+  if (scope === "global") return true;
+
+  const rowCountry = norm(resolveCountry(u));
+  const rowRegion = norm(resolveRegion(u));
+  const vc = norm(viewerCountry);
+  const vr = norm(viewerRegion);
+
+  if (scope === "country") {
+    if (!vc) return true;
+    return !!rowCountry && rowCountry === vc;
+  }
+
+  // region scope
+  if (vc && rowCountry && rowCountry !== vc) return false;
+  if (!vr) return true;
+  return !!rowRegion && rowRegion === vr;
+}
+
+export async function leaderboard(req, res) {
+  try {
+    const q = req.query || {};
+    const category = normalizeCategory(q.filter || q.category || q.group);
+    const scope = normalizeScope(q.scope || q.geoScope || q.locationScope);
+    const limitRaw = Number(q.limit || 100);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(500, Math.round(limitRaw)))
+      : 100;
+
+    const viewerProfile = req?.user?.profile || {};
+    const viewerCountry = firstNonEmpty([
+      q.country,
+      q.countryCode,
+      viewerProfile.country,
+      viewerProfile.countryCode,
+      viewerProfile.countryName,
+    ]);
+    const viewerRegion = firstNonEmpty([
+      q.region,
+      q.state,
+      q.county,
+      viewerProfile.region,
+      viewerProfile.state,
+      viewerProfile.county,
+      viewerProfile.province,
+    ]);
+
+    const users = await User.find({})
+      .select(
+        [
+          "_id",
+          "username",
+          "profile.nickname",
+          "profile.name",
+          "profile.firstName",
+          "profile.lastName",
+          "profile.avatar",
+          "profile.gender",
+          "profile.dateOfBirth",
+          "profile.country",
+          "profile.countryCode",
+          "profile.countryName",
+          "profile.region",
+          "profile.state",
+          "profile.county",
+          "profile.province",
+          "stats.score",
+          "stats.totalWinnings",
+          "stats.gamesWon",
+          "stats.rank",
+          "stats.userIdTag",
+        ].join(" ")
+      )
+      .lean();
+
+    const filtered = users
+      .filter((u) => includeByCategory(u, category))
+      .filter((u) => includeByScope(u, scope, viewerCountry, viewerRegion));
+
+    filtered.sort((a, b) => {
+      const as = Number(a?.stats?.score || 0);
+      const bs = Number(b?.stats?.score || 0);
+      if (bs !== as) return bs - as;
+
+      const aw = Number(a?.stats?.totalWinnings || 0);
+      const bw = Number(b?.stats?.totalWinnings || 0);
+      if (bw !== aw) return bw - aw;
+
+      const ag = Number(a?.stats?.gamesWon || 0);
+      const bg = Number(b?.stats?.gamesWon || 0);
+      if (bg !== ag) return bg - ag;
+
+      return displayName(a).localeCompare(displayName(b));
+    });
+
+    const leaderboard = filtered.slice(0, limit).map((u, idx) => {
+      const points = Number(u?.stats?.score || 0);
+      const winnings = Number(u?.stats?.totalWinnings || 0);
+      const country = resolveCountry(u);
+      const region = resolveRegion(u);
+
+      return {
+        rank: idx + 1,
+        userId: String(u._id),
+        name: displayName(u),
+        username: toStr(u.username),
+        avatar: toStr(u?.profile?.avatar),
+        points,
+        score: points,
+        totalWinnings: winnings,
+        winnings,
+        country,
+        region,
+        stats: {
+          score: points,
+          totalWinnings: winnings,
+          rank: toStr(u?.stats?.rank),
+          userIdTag: toStr(u?.stats?.userIdTag),
+        },
+      };
+    });
+
+    return res.json({
+      leaderboard,
+      meta: {
+        category,
+        scope,
+        count: leaderboard.length,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message || "Failed to load leaderboard" });
+  }
 }
 
 export async function me(req, res) {

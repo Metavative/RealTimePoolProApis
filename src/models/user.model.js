@@ -19,6 +19,15 @@ const ProfileSchema = new mongoose.Schema({
   // ✅ Good to explicitly define (your authController writes these)
   role: { type: String, default: "" },
   userType: { type: String, default: "" },
+  gender: { type: String, default: "" },
+  dateOfBirth: { type: Date, default: null },
+  country: { type: String, default: "" },
+  countryCode: { type: String, default: "" },
+  countryName: { type: String, default: "" },
+  region: { type: String, default: "" },
+  state: { type: String, default: "" },
+  county: { type: String, default: "" },
+  province: { type: String, default: "" },
 
   avatar: { type: String, default: "" },
   highestLevelAchieve: String,
