@@ -155,6 +155,47 @@ function isRateLimited(lastOtpSent, windowMs = 60_000) {
   return now - last < windowMs;
 }
 
+function duplicateIdentityResponse({ email, phone, existing }) {
+  const existingEmail = normalizeEmail(existing?.email);
+  const existingPhone = normalizePhone(existing?.phone);
+
+  if (email && existingEmail && email === existingEmail) {
+    return { code: "EMAIL_TAKEN", message: "Email already registered" };
+  }
+  if (phone && existingPhone && phone === existingPhone) {
+    return { code: "PHONE_TAKEN", message: "Phone number already registered" };
+  }
+  return {
+    code: "ACCOUNT_EXISTS",
+    message: "An account with this email or phone already exists",
+  };
+}
+
+function duplicateKeyErrorResponse(error) {
+  const keyPattern = error?.keyPattern || {};
+  const keyValue = error?.keyValue || {};
+
+  if (keyPattern.email || Object.prototype.hasOwnProperty.call(keyValue, "email")) {
+    return { code: "EMAIL_TAKEN", message: "Email already registered" };
+  }
+  if (keyPattern.phone || Object.prototype.hasOwnProperty.call(keyValue, "phone")) {
+    return { code: "PHONE_TAKEN", message: "Phone number already registered" };
+  }
+  if (
+    keyPattern.username ||
+    keyPattern.usernameLower ||
+    Object.prototype.hasOwnProperty.call(keyValue, "username") ||
+    Object.prototype.hasOwnProperty.call(keyValue, "usernameLower")
+  ) {
+    return { code: "USERNAME_TAKEN", message: "Username already taken" };
+  }
+
+  return {
+    code: "DUPLICATE_VALUE",
+    message: "Duplicate value (email/phone/username) already exists",
+  };
+}
+
 // =========================
 // Name helpers
 // =========================
@@ -264,6 +305,13 @@ export const signUp = async (req, res) => {
 
     // ✅ If existing user present, handle upgrade/signup completion
     if (existing) {
+      const existingPass = getPasswordFromUser(existing);
+
+      if (existingPass) {
+        const conflict = duplicateIdentityResponse({ email, phone, existing });
+        return res.status(409).json(conflict);
+      }
+
       // If username differs:
       if (existing.usernameLower && existing.usernameLower !== usernameLower) {
         // If account is final, block
@@ -286,13 +334,6 @@ export const signUp = async (req, res) => {
         existing.username = username; // pre-save sets usernameLower
       } else if (!existing.username) {
         existing.username = username;
-      }
-
-      const existingPass = getPasswordFromUser(existing);
-
-      // If user exists and already has a password -> it's a real account
-      if (existingPass) {
-        return res.status(409).json({ message: "User exists" });
       }
 
       // Upgrade placeholder: set password + fill profile
@@ -361,7 +402,7 @@ export const signUp = async (req, res) => {
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
 
     if (error && error.code === 11000) {
-      return res.status(409).json({ message: "Duplicate value (email/phone/username) already exists" });
+      return res.status(409).json(duplicateKeyErrorResponse(error));
     }
     return res.status(500).json({ message: error?.message || "Internal server error" });
   }
