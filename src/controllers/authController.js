@@ -246,6 +246,11 @@ function validateUsernameOrThrow(username) {
     err.statusCode = 400;
     throw err;
   }
+  if (/^error\d*$/i.test(raw)) {
+    const err = new Error("This username is reserved. Please choose another.");
+    err.statusCode = 400;
+    throw err;
+  }
   if (RESERVED_USERNAMES.has(lower)) {
     const err = new Error("This username is reserved. Please choose another.");
     err.statusCode = 400;
@@ -281,6 +286,7 @@ export const signUp = async (req, res) => {
     const organizer = body.organizer && typeof body.organizer === "object" ? body.organizer : null;
 
     const nickname = pickNickname(body, email, phone);
+    const preferredNickname = username || nickname;
 
     // ✅ player fields
     const firstName = normalizeName(body.firstName);
@@ -341,7 +347,9 @@ export const signUp = async (req, res) => {
       setPasswordOnUser(existing, hash);
 
       existing.profile = existing.profile || {};
-      if (!existing.profile.nickname && nickname) existing.profile.nickname = nickname;
+      if (!existing.profile.nickname && preferredNickname) {
+        existing.profile.nickname = preferredNickname;
+      }
 
       if (isPlayer) {
         existing.profile.firstName = existing.profile.firstName || firstName;
@@ -378,7 +386,7 @@ export const signUp = async (req, res) => {
       phone,
       username,
       profile: {
-        ...(nickname ? { nickname } : {}),
+        ...(preferredNickname ? { nickname: preferredNickname } : {}),
         ...(role ? { role, userType: role } : {}),
         ...(organizer ? { organizer } : {}),
         ...(isPlayer
@@ -514,7 +522,7 @@ export async function requestSignupOtp(req, res) {
         emailVerified: false,
         lastOtpSent: null,
         lastOtpChannel: null,
-        profile: { ...(email ? { nickname: email.split("@")[0] } : phone ? { nickname: phone } : {}) },
+        profile: { ...(username ? { nickname: username } : {}) },
         stats: { userIdTag: await createUniqueTag() },
       });
     }
@@ -601,7 +609,12 @@ export async function requestOtp(req, res) {
 
     let requestedUsername = null;
     if (flow === "signup") {
-      requestedUsername = validateUsernameOrThrow(body.username).raw;
+      const usernameInput =
+        toStr(body.username) ||
+        toStr(body.userName) ||
+        toStr(body.nickname) ||
+        toStr(body.handle);
+      requestedUsername = validateUsernameOrThrow(usernameInput).raw;
     }
 
     const channel = email ? "email" : "phone";
@@ -625,7 +638,7 @@ export async function requestOtp(req, res) {
         emailVerified: false,
         lastOtpSent: null,
         lastOtpChannel: null,
-        profile: { ...(email ? { nickname: email.split("@")[0] } : phone ? { nickname: phone } : {}) },
+        profile: { ...(requestedUsername ? { nickname: requestedUsername } : {}) },
         stats: { userIdTag: await createUniqueTag() },
       });
     }
@@ -804,7 +817,13 @@ export async function clerkLogin(req, res) {
 
 // ✅ Backward-compatible exports for old routes (so imports won’t crash)
 export async function phoneRegisterRequestOtp(req, res) {
-  req.body = { ...(req.body || {}), phone: req.body?.phone || req.body?.phoneNumber, flow: "signup" };
+  const body = req.body || {};
+  req.body = {
+    ...body,
+    phone: body.phone || body.phoneNumber,
+    username: body.username || body.userName || body.nickname || body.handle,
+    flow: "signup",
+  };
   return requestOtp(req, res);
 }
 export async function phoneRegisterVerifyOtp(req, res) {

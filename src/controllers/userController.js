@@ -73,10 +73,17 @@ function looksLikePhone(v) {
   return /^[+0-9()\-\s.]+$/.test(s);
 }
 
+function looksLikePlaceholderName(v) {
+  const s = toStr(v).toLowerCase();
+  if (!s) return false;
+  if (/^error\d*$/.test(s)) return true;
+  return ["unknown", "undefined", "null", "n/a", "na"].includes(s);
+}
+
 function cleanPublicName(v) {
   const s = toStr(v);
   if (!s) return "";
-  if (looksLikeEmail(s) || looksLikePhone(s)) return "";
+  if (looksLikeEmail(s) || looksLikePhone(s) || looksLikePlaceholderName(s)) return "";
   return s;
 }
 
@@ -113,6 +120,9 @@ function validateUsername(username) {
   if (!username) return "Username is required";
   if (!USERNAME_REGEX.test(username)) {
     return "Invalid username. Use 3-20 characters: letters, numbers, underscore.";
+  }
+  if (/^error\d*$/i.test(username)) {
+    return "This username is reserved. Please choose another.";
   }
   if (RESERVED_USERNAMES.has(username.toLowerCase())) {
     return "This username is reserved. Please choose another.";

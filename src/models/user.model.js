@@ -170,6 +170,9 @@ UserSchema.pre("save", function (next) {
     if (!USERNAME_REGEX.test(raw)) {
       return next(new Error("Invalid username. Use 3-20 characters: letters, numbers, underscore."));
     }
+    if (/^error\d*$/i.test(raw)) {
+      return next(new Error("This username is reserved. Please choose another."));
+    }
 
     const lower = raw.toLowerCase();
     if (RESERVED_USERNAMES.has(lower)) {
