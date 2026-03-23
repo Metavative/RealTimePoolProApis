@@ -38,6 +38,49 @@ const logInfo = (...args) => {
   if (!isProd) console.log(...args);
 };
 
+function toStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
+
+function isAvatarUrlLike(v) {
+  const s = toStr(v);
+  if (!s) return false;
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("/") ||
+    s.startsWith("uploads/") ||
+    s.startsWith("data:image/")
+  );
+}
+
+function resolveAvatarUrl(u = {}) {
+  const p = u?.profile || {};
+  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  for (const candidate of candidates) {
+    const s = toStr(candidate);
+    if (s && isAvatarUrlLike(s)) return s;
+  }
+  return "";
+}
+
+function normalizeRealtimeUser(u = {}) {
+  const avatar = resolveAvatarUrl(u);
+  const profile = { ...(u.profile || {}) };
+  if (avatar) {
+    profile.avatar = avatar;
+    profile.avatarUrl = avatar;
+    profile.photo = avatar;
+  } else {
+    profile.avatarUrl = "";
+  }
+  return {
+    ...u,
+    profile,
+  };
+}
+
 // ---- Global crash logging ----
 process.on("unhandledRejection", (reason) => {
   console.error("âŒ UNHANDLED REJECTION:", reason);
@@ -160,11 +203,11 @@ async function emitOnlinePlayers() {
 
   const users = await User.find({ _id: { $in: ids } })
     .select(
-      "profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag"
+      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag"
     )
     .lean();
 
-  io.emit("presence:update", users);
+  io.emit("presence:update", users.map((row) => normalizeRealtimeUser(row)));
 }
 
 async function getNearbyPlayersForUser(userId, radiusKm = 5) {
@@ -191,11 +234,11 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
     },
   })
     .select(
-      "profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location"
+      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location"
     )
     .lean();
 
-  return nearby;
+  return nearby.map((row) => normalizeRealtimeUser(row));
 }
 
 // --------------------------------------------------

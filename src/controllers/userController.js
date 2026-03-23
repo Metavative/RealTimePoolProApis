@@ -60,6 +60,58 @@ function toStr(v) {
   return String(v).trim();
 }
 
+function isAvatarUrlLike(v) {
+  const s = toStr(v);
+  if (!s) return false;
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("/") ||
+    s.startsWith("uploads/") ||
+    s.startsWith("data:image/")
+  );
+}
+
+function resolveAvatarUrl(source = {}) {
+  const profile = source?.profile && typeof source.profile === "object"
+    ? source.profile
+    : source;
+
+  const candidates = [
+    profile?.avatarUrl,
+    profile?.photo,
+    profile?.avatar,
+    source?.avatarUrl,
+    source?.photo,
+    source?.avatar,
+  ];
+
+  for (const candidate of candidates) {
+    const value = toStr(candidate);
+    if (value && isAvatarUrlLike(value)) return value;
+  }
+  return "";
+}
+
+function normalizeAvatarProfile(profileLike = {}, { stampNow = false } = {}) {
+  const profile = { ...(profileLike || {}) };
+  const avatarUrl = resolveAvatarUrl(profile);
+
+  if (avatarUrl) {
+    profile.avatar = avatarUrl;
+    profile.avatarUrl = avatarUrl;
+    profile.photo = avatarUrl;
+    if (stampNow || !profile.avatarUpdatedAt) {
+      profile.avatarUpdatedAt = new Date();
+    }
+  } else {
+    profile.avatarUrl = "";
+    if (isAvatarUrlLike(profile.photo)) profile.photo = "";
+  }
+
+  return profile;
+}
+
 function looksLikeEmail(v) {
   const s = toStr(v);
   return !!s && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
@@ -359,8 +411,10 @@ function normalizeUserForClient(userLike) {
     highestLevelAchieved,
   };
 
+  const normalizedProfile = normalizeAvatarProfile(profile, { stampNow: false });
+
   raw.profile = {
-    ...profile,
+    ...normalizedProfile,
     disputePercentage: achievementSummary.disputePercentage,
     disputeWinPercentage: achievementSummary.disputeWinPercentage,
     matchAcceptancePercentage: achievementSummary.matchAcceptancePercentage,
@@ -553,6 +607,7 @@ export async function leaderboard(req, res) {
           "profile.avatar",
           "profile.avatarUrl",
           "profile.photo",
+          "profile.avatarUpdatedAt",
           "profile.gender",
           "profile.dateOfBirth",
           "profile.country",
@@ -596,11 +651,8 @@ export async function leaderboard(req, res) {
       const winnings = Number(u?.stats?.totalWinnings || 0);
       const country = resolveCountry(u);
       const region = resolveRegion(u);
-      const avatarUrl = firstNonEmpty([
-        u?.profile?.avatar,
-        u?.profile?.avatarUrl,
-        u?.profile?.photo,
-      ]);
+      const avatarUrl = resolveAvatarUrl(u);
+      const avatarUpdatedAt = toStr(u?.profile?.avatarUpdatedAt);
 
       return {
         rank: idx + 1,
@@ -609,6 +661,7 @@ export async function leaderboard(req, res) {
         username: toStr(u.username),
         avatar: toStr(avatarUrl),
         avatarUrl: toStr(avatarUrl),
+        avatarUpdatedAt,
         points,
         score: points,
         totalWinnings: winnings,
@@ -730,6 +783,7 @@ export async function updateProfile(req, res) {
       nextProfile.name = directName;
     }
 
+    nextProfile = normalizeAvatarProfile(nextProfile, { stampNow: false });
     user.profile = nextProfile;
 
     if (payload.feedbacks !== undefined && Array.isArray(payload.feedbacks)) {
@@ -782,6 +836,9 @@ export async function updateProfile(req, res) {
 
       user.profile = user.profile || {};
       user.profile.avatar = result.secure_url;
+      user.profile.avatarUrl = result.secure_url;
+      user.profile.photo = result.secure_url;
+      user.profile.avatarUpdatedAt = new Date();
     }
 
     const normalizedForSave = normalizeUserForClient(user);
@@ -820,7 +877,7 @@ export async function nearestPlayers(req, res) {
       .limit(50);
 
     return res.json({
-      users,
+      users: users.map((u) => normalizeUserForClient(u)),
       capabilities: buildCapabilities(req),
     });
   } catch (error) {

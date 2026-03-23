@@ -30,6 +30,9 @@ const ProfileSchema = new mongoose.Schema({
   province: { type: String, default: "" },
 
   avatar: { type: String, default: "" },
+  avatarUrl: { type: String, default: "" },
+  photo: { type: String, default: "" },
+  avatarUpdatedAt: { type: Date, default: null },
   highestLevelAchieve: String,
   highestLevelAchieved: { type: Number, default: 1 },
   musicPlayer: { type: Boolean, default: true },
@@ -106,6 +109,31 @@ const RESERVED_USERNAMES = new Set([
 function cleanName(v) {
   const s = (v ?? "").toString().trim().replace(/\s+/g, " ");
   return s;
+}
+
+function cleanText(v) {
+  return (v ?? "").toString().trim();
+}
+
+function isAvatarUrlLike(v) {
+  const s = cleanText(v);
+  if (!s) return false;
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("/") ||
+    s.startsWith("uploads/") ||
+    s.startsWith("data:image/")
+  );
+}
+
+function resolveProfileAvatarUrl(profile = {}) {
+  const candidates = [profile.avatarUrl, profile.photo, profile.avatar];
+  for (const candidate of candidates) {
+    const value = cleanText(candidate);
+    if (value && isAvatarUrlLike(value)) return value;
+  }
+  return "";
 }
 
 const UserSchema = new mongoose.Schema({
@@ -205,6 +233,21 @@ UserSchema.pre("save", function (next) {
         this.profile.avatar = this.profile.firstName[0].toUpperCase();
       } else {
         this.profile.avatar = "?";
+      }
+    }
+
+    const resolvedAvatarUrl = resolveProfileAvatarUrl(this.profile);
+    if (resolvedAvatarUrl) {
+      this.profile.avatar = resolvedAvatarUrl;
+      this.profile.avatarUrl = resolvedAvatarUrl;
+      this.profile.photo = resolvedAvatarUrl;
+      if (!this.profile.avatarUpdatedAt) {
+        this.profile.avatarUpdatedAt = new Date();
+      }
+    } else {
+      this.profile.avatarUrl = "";
+      if (isAvatarUrlLike(this.profile.photo)) {
+        this.profile.photo = "";
       }
     }
   }

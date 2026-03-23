@@ -2,18 +2,65 @@ import User from "../../models/user.model.js";
 
 const DASH = String.fromCharCode(45);
 
+function toStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
+
+function isAvatarUrlLike(v) {
+  const s = toStr(v);
+  if (!s) return false;
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("/") ||
+    s.startsWith("uploads/") ||
+    s.startsWith("data:image/")
+  );
+}
+
+function resolveAvatarUrl(u = {}) {
+  const p = u?.profile || {};
+  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  for (const candidate of candidates) {
+    const s = toStr(candidate);
+    if (s && isAvatarUrlLike(s)) return s;
+  }
+  return "";
+}
+
+function normalizeRealtimeUser(u = {}) {
+  const avatar = resolveAvatarUrl(u);
+  const profile = { ...(u.profile || {}) };
+  if (avatar) {
+    profile.avatar = avatar;
+    profile.avatarUrl = avatar;
+    profile.photo = avatar;
+  } else {
+    profile.avatarUrl = "";
+  }
+
+  return {
+    ...u,
+    profile,
+  };
+}
+
 async function getOnlineUsersFromPresence(presence) {
   const ids = Array.from(presence.keys());
-  if (ids.isEmpty) return [];
+  if (ids.length === 0) return [];
 
   const users = await User.find({ _id: { $in: ids } })
     .select(
-      "profile.nickname profile.avatar profile.onlineStatus profile.verified stats.userIdTag stats.rank stats.totalWinnings"
+      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus profile.verified stats.userIdTag stats.rank stats.totalWinnings"
     )
     .lean();
 
   const map = new Map(users.map((u) => [String(u._id), u]));
-  return ids.map((id) => map.get(String(id))).filter(Boolean);
+  return ids
+    .map((id) => map.get(String(id)))
+    .filter(Boolean)
+    .map((row) => normalizeRealtimeUser(row));
 }
 
 async function getNearbyPlayersByCoords(userId, lng, lat, radiusKm = 5) {
@@ -32,9 +79,10 @@ async function getNearbyPlayersByCoords(userId, lng, lat, radiusKm = 5) {
     },
   })
     .select(
-      "profile.nickname profile.avatar profile.onlineStatus profile.verified stats.userIdTag stats.rank stats.totalWinnings location"
+      "username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus profile.verified stats.userIdTag stats.rank stats.totalWinnings location"
     )
-    .lean();
+    .lean()
+    .then((rows) => rows.map((row) => normalizeRealtimeUser(row)));
 }
 
 function pickLngLat(location) {

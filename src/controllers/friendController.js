@@ -26,12 +26,39 @@ function emitToUser(io, presence, userId, event, payload) {
   }
 }
 
+function toStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
+
+function isAvatarUrlLike(v) {
+  const s = toStr(v);
+  if (!s) return false;
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("/") ||
+    s.startsWith("uploads/") ||
+    s.startsWith("data:image/")
+  );
+}
+
 function bestName(u) {
-  return u?.profile?.nickname || u?.username || "";
+  return u?.username || u?.profile?.nickname || "";
 }
 
 function bestAvatar(u) {
-  return u?.profile?.avatar || "";
+  const p = u?.profile || {};
+  const candidates = [p.avatarUrl, p.photo, p.avatar];
+  for (const c of candidates) {
+    const s = toStr(c);
+    if (s && isAvatarUrlLike(s)) return s;
+  }
+  return "";
+}
+
+function bestAvatarUpdatedAt(u) {
+  return toStr(u?.profile?.avatarUpdatedAt);
 }
 
 // ---------- searchFriends ----------
@@ -78,6 +105,9 @@ export async function searchFriends(req, res) {
           "phone",
           "profile.nickname",
           "profile.avatar",
+          "profile.avatarUrl",
+          "profile.photo",
+          "profile.avatarUpdatedAt",
           "profile.onlineStatus",
           "stats.rank",
           "stats.userIdTag",
@@ -94,6 +124,7 @@ export async function searchFriends(req, res) {
         email: u.email || "",
         phone: u.phone || "",
         avatarUrl: bestAvatar(u),
+        avatarUpdatedAt: bestAvatarUpdatedAt(u),
         online: !!u.profile?.onlineStatus,
         rank: u.stats?.rank || "Beginner",
         tag: u.stats?.userIdTag || "",
@@ -120,11 +151,11 @@ export async function listRequests(req, res) {
       .sort({ createdAt: -1 })
       .populate(
         "from",
-        "_id username profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
       )
       .populate(
         "to",
-        "_id username profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
@@ -143,6 +174,7 @@ export async function listRequests(req, res) {
                 username: from.username || "",
                 nickname: bestName(from),
                 avatar: bestAvatar(from),
+                avatarUpdatedAt: bestAvatarUpdatedAt(from),
                 online: !!from.profile?.onlineStatus,
                 rank: from.stats?.rank || "Beginner",
                 tag: from.stats?.userIdTag || "",
@@ -154,6 +186,7 @@ export async function listRequests(req, res) {
                 username: to.username || "",
                 nickname: bestName(to),
                 avatar: bestAvatar(to),
+                avatarUpdatedAt: bestAvatarUpdatedAt(to),
                 online: !!to.profile?.onlineStatus,
                 rank: to.stats?.rank || "Beginner",
                 tag: to.stats?.userIdTag || "",
@@ -183,7 +216,7 @@ export async function listFriends(req, res, presence) {
 
     const friends = await User.find({ _id: { $in: friendIds } })
       .select(
-        "_id username profile.nickname profile.avatar profile.onlineStatus stats.rank stats.userIdTag"
+        "_id username profile.nickname profile.avatar profile.avatarUrl profile.photo profile.avatarUpdatedAt profile.onlineStatus stats.rank stats.userIdTag"
       )
       .lean();
 
@@ -198,6 +231,7 @@ export async function listFriends(req, res, presence) {
           username: u.username || "",
           nickname: bestName(u),
           avatar: bestAvatar(u),
+          avatarUpdatedAt: bestAvatarUpdatedAt(u),
           online: presence?.isOnline
             ? !!presence.isOnline(String(u._id))
             : !!u.profile?.onlineStatus,

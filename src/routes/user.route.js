@@ -7,6 +7,32 @@ import User from "../models/user.model.js";
 
 const router = express.Router();
 
+function toStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
+
+function isAvatarUrlLike(v) {
+  const s = toStr(v);
+  if (!s) return false;
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("/") ||
+    s.startsWith("uploads/") ||
+    s.startsWith("data:image/")
+  );
+}
+
+function resolveAvatarUrl(profile = {}) {
+  const candidates = [profile.avatarUrl, profile.photo, profile.avatar];
+  for (const candidate of candidates) {
+    const value = toStr(candidate);
+    if (value && isAvatarUrlLike(value)) return value;
+  }
+  return "";
+}
+
 router.get("/me", authMiddleware, useCtrl.me);
 router.get("/leaderboard", authMiddleware, useCtrl.leaderboard);
 
@@ -56,7 +82,9 @@ router.get("/nearest/:id", authMiddleware, async (req, res) => {
         id: u._id,
         username: u.username || "",
         nickname: u.profile?.nickname || "",
-        avatar: u.profile?.avatar || "",
+        avatar: resolveAvatarUrl(u.profile || {}),
+        avatarUrl: resolveAvatarUrl(u.profile || {}),
+        avatarUpdatedAt: toStr(u.profile?.avatarUpdatedAt),
         distance: distance(
           latitude,
           longitude,
