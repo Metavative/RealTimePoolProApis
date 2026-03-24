@@ -486,6 +486,32 @@ function ageFromDob(dobLike) {
   return age >= 0 ? age : -1;
 }
 
+function ageFromRaw(ageLike) {
+  if (ageLike === null || ageLike === undefined || ageLike === "") return -1;
+  const n = Number(ageLike);
+  if (!Number.isFinite(n)) return -1;
+  const age = Math.round(n);
+  if (age < 0 || age > 130) return -1;
+  return age;
+}
+
+function ageFromProfile(profile = {}) {
+  const dobCandidate =
+    profile?.dateOfBirth ??
+    profile?.dob ??
+    profile?.birthDate ??
+    profile?.birth_date;
+
+  const fromDob = ageFromDob(dobCandidate);
+  if (fromDob >= 0) return fromDob;
+
+  return ageFromRaw(
+    profile?.age ??
+      profile?.ageYears ??
+      profile?.userAge
+  );
+}
+
 function dateOfBirthFromAge(ageRaw) {
   const ageNum = Number(ageRaw);
   if (!Number.isFinite(ageNum)) return null;
@@ -759,7 +785,22 @@ function displayName(u = {}) {
 function includeByCategory(u = {}, category = "global") {
   if (category === "global") return true;
   const p = u.profile || {};
-  const age = ageFromDob(p.dateOfBirth || p.dob || p.birthDate);
+  let age = ageFromProfile(p);
+  if (age < 0) {
+    age = ageFromDob(
+      u?.dateOfBirth ??
+      u?.dob ??
+      u?.birthDate ??
+      u?.birth_date
+    );
+  }
+  if (age < 0) {
+    age = ageFromRaw(
+      u?.age ??
+      u?.ageYears ??
+      u?.userAge
+    );
+  }
 
   if (category === "youth") return age >= 0 && age < 18;
   if (category === "seniors") return age >= 40;
@@ -773,6 +814,26 @@ function includeByCategory(u = {}, category = "global") {
     return ["m", "male", "man", "men", "boy"].includes(g);
   }
   return true;
+}
+
+function resolveAgeForUser(u = {}) {
+  const p = u.profile || {};
+  let age = ageFromProfile(p);
+  if (age >= 0) return age;
+
+  age = ageFromDob(
+    u?.dateOfBirth ??
+    u?.dob ??
+    u?.birthDate ??
+    u?.birth_date
+  );
+  if (age >= 0) return age;
+
+  return ageFromRaw(
+    u?.age ??
+    u?.ageYears ??
+    u?.userAge
+  );
 }
 
 function includeByScope(u = {}, scope = "global", viewerCountry = "", viewerRegion = "") {
@@ -827,6 +888,13 @@ export async function leaderboard(req, res) {
         [
           "_id",
           "username",
+          "dateOfBirth",
+          "dob",
+          "birthDate",
+          "birth_date",
+          "age",
+          "ageYears",
+          "userAge",
           "profile.nickname",
           "profile.name",
           "profile.firstName",
@@ -838,6 +906,12 @@ export async function leaderboard(req, res) {
           "profile.avatarUpdatedAt",
           "profile.gender",
           "profile.dateOfBirth",
+          "profile.dob",
+          "profile.birthDate",
+          "profile.birth_date",
+          "profile.age",
+          "profile.ageYears",
+          "profile.userAge",
           "profile.country",
           "profile.countryCode",
           "profile.countryName",
@@ -881,12 +955,14 @@ export async function leaderboard(req, res) {
       const region = resolveRegion(u);
       const avatarUrl = resolveAvatarUrl(u);
       const avatarUpdatedAt = toStr(u?.profile?.avatarUpdatedAt);
+      const age = resolveAgeForUser(u);
 
       return {
         rank: idx + 1,
         userId: String(u._id),
         name: displayName(u),
         username: toStr(u.username),
+        age: age >= 0 ? age : null,
         avatar: toStr(avatarUrl),
         avatarUrl: toStr(avatarUrl),
         avatarUpdatedAt,
