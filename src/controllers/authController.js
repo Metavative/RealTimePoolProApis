@@ -208,7 +208,27 @@ function isLikelyHumanName(v) {
   const s = normalizeName(v);
   if (!s) return false;
   if (s.length < 2) return false;
-  return /^[a-zA-ZÀ-ÿ\s'\-]+$/.test(s);
+  return /^[a-zA-Z?-?s'-]+$/.test(s);
+}
+
+function normalizeGender(v) {
+  const s = toStr(v).toLowerCase();
+  if (!s) return "";
+  if (["male", "m", "man", "boy"].includes(s)) return "male";
+  if (["female", "f", "woman", "women", "girl", "lady"].includes(s)) {
+    return "female";
+  }
+  return "other";
+}
+
+function dateOfBirthFromAge(ageRaw) {
+  const ageNum = Number(ageRaw);
+  if (!Number.isFinite(ageNum)) return null;
+  const age = Math.round(ageNum);
+  if (age < 13 || age > 120) return null;
+
+  const now = new Date();
+  return new Date(now.getFullYear() - age, now.getMonth(), now.getDate());
 }
 
 // =========================
@@ -291,6 +311,8 @@ export const signUp = async (req, res) => {
     // ✅ player fields
     const firstName = normalizeName(body.firstName);
     const lastName = normalizeName(body.lastName);
+    const gender = normalizeGender(body.gender);
+    const dateOfBirth = dateOfBirthFromAge(body.age);
     const isPlayer = (role || "").toLowerCase() === "player";
 
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
@@ -302,6 +324,12 @@ export const signUp = async (req, res) => {
       }
       if (!isLikelyHumanName(firstName) || !isLikelyHumanName(lastName)) {
         return res.status(400).json({ message: "Invalid first/last name" });
+      }
+      if (!gender) {
+        return res.status(400).json({ message: "Gender is required" });
+      }
+      if (!dateOfBirth) {
+        return res.status(400).json({ message: "Valid age is required (13-120)" });
       }
     }
 
@@ -355,6 +383,8 @@ export const signUp = async (req, res) => {
         existing.profile.firstName = existing.profile.firstName || firstName;
         existing.profile.lastName = existing.profile.lastName || lastName;
         existing.profile.legalName = existing.profile.legalName || `${firstName} ${lastName}`.trim();
+        if (gender) existing.profile.gender = gender;
+        if (dateOfBirth) existing.profile.dateOfBirth = dateOfBirth;
       }
 
       existing.stats = existing.stats || {};
@@ -390,7 +420,13 @@ export const signUp = async (req, res) => {
         ...(role ? { role, userType: role } : {}),
         ...(organizer ? { organizer } : {}),
         ...(isPlayer
-          ? { firstName, lastName, legalName: `${firstName} ${lastName}`.trim() }
+          ? {
+              firstName,
+              lastName,
+              legalName: `${firstName} ${lastName}`.trim(),
+              gender,
+              dateOfBirth,
+            }
           : {}),
       },
       stats: { userIdTag: tag },

@@ -461,6 +461,7 @@ function normalizeCategory(raw) {
   const k = norm(raw);
   if (k === "youth") return "youth";
   if (k === "ladies" || k === "women" || k === "female") return "ladies";
+  if (k === "men" || k === "male" || k === "boys") return "men";
   if (k === "seniors" || k === "senior") return "seniors";
   if (k === "masters" || k === "master") return "masters";
   return "global";
@@ -483,6 +484,25 @@ function ageFromDob(dobLike) {
   const m = now.getMonth() - dt.getMonth();
   if (m < 0 || (m === 0 && now.getDate() < dt.getDate())) age -= 1;
   return age >= 0 ? age : -1;
+}
+
+function dateOfBirthFromAge(ageRaw) {
+  const ageNum = Number(ageRaw);
+  if (!Number.isFinite(ageNum)) return null;
+  const age = Math.round(ageNum);
+  if (age < 13 || age > 120) return null;
+  const now = new Date();
+  return new Date(now.getFullYear() - age, now.getMonth(), now.getDate());
+}
+
+function normalizeGender(v) {
+  const s = norm(v);
+  if (!s) return "";
+  if (["m", "male", "man", "men", "boy"].includes(s)) return "male";
+  if (["f", "female", "woman", "women", "lady", "girl"].includes(s)) {
+    return "female";
+  }
+  return "other";
 }
 
 function firstNonEmpty(values = []) {
@@ -748,6 +768,10 @@ function includeByCategory(u = {}, category = "global") {
     const g = norm(p.gender);
     return ["f", "female", "woman", "women", "lady", "girl"].includes(g);
   }
+  if (category === "men") {
+    const g = norm(p.gender);
+    return ["m", "male", "man", "men", "boy"].includes(g);
+  }
   return true;
 }
 
@@ -932,6 +956,30 @@ export async function updateProfile(req, res) {
 
     if (payload.musicPlayer !== undefined) {
       nextProfile.musicPlayer = !!payload.musicPlayer;
+    }
+
+    if (payload.gender !== undefined) {
+      const normalizedGender = normalizeGender(payload.gender);
+      if (!normalizedGender) {
+        return res.status(400).json({ message: "Invalid gender" });
+      }
+      nextProfile.gender = normalizedGender;
+    }
+
+    if (payload.dateOfBirth !== undefined) {
+      const dob = new Date(payload.dateOfBirth);
+      if (Number.isNaN(dob.getTime())) {
+        return res.status(400).json({ message: "Invalid dateOfBirth" });
+      }
+      nextProfile.dateOfBirth = dob;
+    }
+
+    if (payload.age !== undefined) {
+      const dob = dateOfBirthFromAge(payload.age);
+      if (!dob) {
+        return res.status(400).json({ message: "Invalid age (13-120)" });
+      }
+      nextProfile.dateOfBirth = dob;
     }
 
     if (directNickname) {
