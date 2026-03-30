@@ -244,13 +244,31 @@ async function ensureClubOwnerUser(club, explicitOwnerUserId) {
       let changed = false;
 
       ownerUser.profile = ownerUser.profile || {};
-      ownerUser.profile.role = ownerUser.profile.role || "VENUE_OWNER";
-      ownerUser.profile.userType = ownerUser.profile.userType || "VENUE_OWNER";
-      ownerUser.profile.organizer = {
-        ...(ownerUser.profile.organizer || {}),
+      if (String(ownerUser.profile.role || "").toUpperCase() !== "VENUE_OWNER") {
+        ownerUser.profile.role = "VENUE_OWNER";
+        changed = true;
+      }
+      if (
+        String(ownerUser.profile.userType || "").toUpperCase() !== "VENUE_OWNER"
+      ) {
+        ownerUser.profile.userType = "VENUE_OWNER";
+        changed = true;
+      }
+      const ownerOrganizer = ownerUser.profile.organizer || {};
+      const nextOwnerOrganizer = {
+        ...ownerOrganizer,
         clubId: club._id,
         clubName: club.name || "",
       };
+      if (
+        String(ownerOrganizer.clubId || "") !==
+          String(nextOwnerOrganizer.clubId || "") ||
+        String(ownerOrganizer.clubName || "") !==
+          String(nextOwnerOrganizer.clubName || "")
+      ) {
+        ownerUser.profile.organizer = nextOwnerOrganizer;
+        changed = true;
+      }
 
       if (!ownerUser.email && club.email) {
         ownerUser.email = club.email;
@@ -277,20 +295,34 @@ async function ensureClubOwnerUser(club, explicitOwnerUserId) {
       let changed = false;
 
       existingOwner.profile = existingOwner.profile || {};
-      if (!existingOwner.profile.role) {
+      if (
+        String(existingOwner.profile.role || "").toUpperCase() !== "VENUE_OWNER"
+      ) {
         existingOwner.profile.role = "VENUE_OWNER";
         changed = true;
       }
-      if (!existingOwner.profile.userType) {
+      if (
+        String(existingOwner.profile.userType || "").toUpperCase() !== "VENUE_OWNER"
+      ) {
         existingOwner.profile.userType = "VENUE_OWNER";
         changed = true;
       }
 
-      existingOwner.profile.organizer = {
-        ...(existingOwner.profile.organizer || {}),
+      const existingOrganizer = existingOwner.profile.organizer || {};
+      const nextExistingOrganizer = {
+        ...existingOrganizer,
         clubId: club._id,
         clubName: club.name || "",
       };
+      if (
+        String(existingOrganizer.clubId || "") !==
+          String(nextExistingOrganizer.clubId || "") ||
+        String(existingOrganizer.clubName || "") !==
+          String(nextExistingOrganizer.clubName || "")
+      ) {
+        existingOwner.profile.organizer = nextExistingOrganizer;
+        changed = true;
+      }
 
       if (!existingOwner.email && club.email) {
         existingOwner.email = club.email;
@@ -325,8 +357,8 @@ async function ensureClubOwnerUser(club, explicitOwnerUserId) {
     await club.save();
 
     matchedUser.profile = matchedUser.profile || {};
-    matchedUser.profile.role = matchedUser.profile.role || "VENUE_OWNER";
-    matchedUser.profile.userType = matchedUser.profile.userType || "VENUE_OWNER";
+    matchedUser.profile.role = "VENUE_OWNER";
+    matchedUser.profile.userType = "VENUE_OWNER";
     matchedUser.profile.organizer = {
       ...(matchedUser.profile.organizer || {}),
       clubId: club._id,

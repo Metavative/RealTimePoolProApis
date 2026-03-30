@@ -1,5 +1,6 @@
 import StoreItem from "../models/storeItem.model.js";
 import StoreOrder from "../models/storeOrder.model.js";
+import { v2 as cloudinary } from "cloudinary";
 
 function userIdFromReq(req) {
   return req.user?.id || req.user?._id || null;
@@ -23,6 +24,13 @@ function roleFromReq(req) {
 }
 
 function isAdmin(req) {
+  if (req?.auth?.canManageVenue === true) return true;
+  if (req?.clubId || req?.club?._id) return true;
+
+  const actorType = String(req?.auth?.actorType || "").toLowerCase();
+  const tokenRole = String(req?.auth?.tokenRole || "").toLowerCase();
+  if (actorType.includes("club") || tokenRole === "club") return true;
+
   const role = roleFromReq(req);
   return (
     role.includes("admin") ||
@@ -42,6 +50,36 @@ function normalizeSku(v) {
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
+}
+
+async function uploadStoreImageToCloudinary({ file, ownerRef }) {
+  if (!file || !Buffer.isBuffer(file.buffer)) {
+    throw new Error("Image file is required");
+  }
+
+  const folder = `store_items/${cleanString(ownerRef, "unknown") || "unknown"}`;
+  const safeName =
+    cleanString(file.originalname).replace(/\.[^.]+$/, "") || `store_item_${Date.now()}`;
+
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "image",
+        folder,
+        use_filename: true,
+        unique_filename: true,
+        filename_override: safeName,
+        overwrite: false,
+        transformation: [{ width: 1280, height: 1280, crop: "limit" }],
+      },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      }
+    );
+
+    stream.end(file.buffer);
+  });
 }
 
 // --------------------------------------------------
@@ -276,6 +314,48 @@ export async function adminCreateItem(req, res) {
     return res
       .status(500)
       .json({ ok: false, message: e.message || "Failed to create item" });
+  }
+}
+
+export async function adminUploadItemImage(req, res) {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({ ok: false, message: "Forbidden" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ ok: false, message: "Image file is required" });
+    }
+
+    const mime = cleanString(req.file.mimetype).toLowerCase();
+    if (!mime.startsWith("image/")) {
+      return res.status(400).json({ ok: false, message: "Only image files are allowed" });
+    }
+
+    const ownerRef = cleanString(req.clubId || req.club?._id || userIdFromReq(req) || "unknown");
+    const uploaded = await uploadStoreImageToCloudinary({
+      file: req.file,
+      ownerRef,
+    });
+
+    const url = cleanString(uploaded?.secure_url || uploaded?.url);
+    if (!url) {
+      throw new Error("Upload succeeded but image URL was not returned");
+    }
+
+    return res.status(201).json({
+      ok: true,
+      image: {
+        url,
+        publicId: cleanString(uploaded?.public_id),
+        width: Number(uploaded?.width || 0),
+        height: Number(uploaded?.height || 0),
+      },
+    });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ ok: false, message: e.message || "Failed to upload image" });
   }
 }
 

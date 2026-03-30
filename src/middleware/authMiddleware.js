@@ -6,9 +6,45 @@ import { verify } from "../services/jwtService.js";
 async function ensureClubOwnerUser(club) {
   if (!club) return null;
 
+  const normalizeVenueOwnerProfile = async (user) => {
+    if (!user) return null;
+
+    let changed = false;
+    user.profile = user.profile || {};
+
+    if (String(user.profile.role || "").toUpperCase() !== "VENUE_OWNER") {
+      user.profile.role = "VENUE_OWNER";
+      changed = true;
+    }
+    if (String(user.profile.userType || "").toUpperCase() !== "VENUE_OWNER") {
+      user.profile.userType = "VENUE_OWNER";
+      changed = true;
+    }
+
+    const organizer = user.profile.organizer || {};
+    const nextOrganizer = {
+      ...organizer,
+      clubId: club._id,
+      clubName: club.name || "",
+    };
+
+    if (
+      String(organizer.clubId || "") !== String(nextOrganizer.clubId || "") ||
+      String(organizer.clubName || "") !== String(nextOrganizer.clubName || "")
+    ) {
+      user.profile.organizer = nextOrganizer;
+      changed = true;
+    }
+
+    if (changed) {
+      await user.save();
+    }
+    return user;
+  };
+
   if (club.owner) {
     const ownerUser = await User.findById(club.owner).select({ passwordHash: 0, otp: 0 });
-    if (ownerUser) return ownerUser;
+    if (ownerUser) return normalizeVenueOwnerProfile(ownerUser);
   }
 
   let matchedUser = null;
@@ -24,7 +60,7 @@ async function ensureClubOwnerUser(club) {
   if (matchedUser) {
     club.owner = matchedUser._id;
     await club.save();
-    return matchedUser;
+    return normalizeVenueOwnerProfile(matchedUser);
   }
 
   return null;
