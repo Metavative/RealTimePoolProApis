@@ -63,6 +63,13 @@ function toStr(v) {
 function isAvatarUrlLike(v) {
   const s = toStr(v);
   if (!s) return false;
+  if (/^file:\/\//i.test(s)) return false;
+  if (/^[a-zA-Z]:[\\/]/.test(s)) return false;
+  if (s.startsWith('/storage/') || s.startsWith('/data/')) return false;
+  if (s.startsWith("assets/")) return true;
+  if (s.startsWith("//")) return true;
+  if (s.startsWith("www.")) return true;
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(s)) return true;
   return (
     s.startsWith("http://") ||
     s.startsWith("https://") ||
@@ -73,6 +80,43 @@ function isAvatarUrlLike(v) {
 }
 
 function resolveAvatarUrl(source = {}) {
+  const pickFromUnknown = (candidate) => {
+    if (candidate === null || candidate === undefined) return "";
+    if (typeof candidate === "string") return toStr(candidate);
+    if (Array.isArray(candidate)) {
+      for (const inner of candidate) {
+        const picked = pickFromUnknown(inner);
+        if (picked) return picked;
+      }
+      return "";
+    }
+    if (typeof candidate === "object") {
+      const keys = [
+        "url",
+        "secure_url",
+        "src",
+        "avatar",
+        "avatarUrl",
+        "profileImage",
+        "profilePic",
+        "photo",
+        "photoUrl",
+        "image",
+        "imageUrl",
+        "userAvatar",
+        "avatarPath",
+        "path",
+        "file",
+        "value",
+      ];
+      for (const key of keys) {
+        const picked = pickFromUnknown(candidate[key]);
+        if (picked) return picked;
+      }
+    }
+    return toStr(candidate);
+  };
+
   const profile = source?.profile && typeof source.profile === "object"
     ? source.profile
     : source;
@@ -81,16 +125,32 @@ function resolveAvatarUrl(source = {}) {
     profile?.avatarUrl,
     profile?.photo,
     profile?.profileImage,
+    profile?.profilePic,
     profile?.avatar,
+    profile?.photoUrl,
+    profile?.imageUrl,
+    profile?.image,
+    profile?.userAvatar,
+    profile?.avatarPath,
     source?.avatarUrl,
     source?.photo,
     source?.profileImage,
+    source?.profilePic,
     source?.avatar,
+    source?.photoUrl,
+    source?.imageUrl,
+    source?.image,
+    source?.userAvatar,
+    source?.avatarPath,
   ];
 
   for (const candidate of candidates) {
-    const value = toStr(candidate);
-    if (value && isAvatarUrlLike(value)) return value;
+    const value = pickFromUnknown(candidate);
+    if (!value || !isAvatarUrlLike(value)) continue;
+    if (value.startsWith("//")) return `https:${value}`;
+    if (value.startsWith("www.")) return `https://${value}`;
+    if (/^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(value)) return `https://${value}`;
+    return value;
   }
   return "";
 }
@@ -899,13 +959,19 @@ export async function leaderboard(req, res) {
           "profile.name",
           "profile.firstName",
           "profile.lastName",
-          "profile.avatar",
-          "profile.avatarUrl",
-          "profile.photo",
-          "profile.profileImage",
-          "profile.avatarUpdatedAt",
-          "profile.gender",
-          "profile.dateOfBirth",
+            "profile.avatar",
+            "profile.avatarUrl",
+            "profile.photo",
+            "profile.profileImage",
+            "profile.profilePic",
+            "profile.photoUrl",
+            "profile.imageUrl",
+            "profile.image",
+            "profile.userAvatar",
+            "profile.avatarPath",
+            "profile.avatarUpdatedAt",
+            "profile.gender",
+            "profile.dateOfBirth",
           "profile.dob",
           "profile.birthDate",
           "profile.birth_date",
@@ -921,9 +987,19 @@ export async function leaderboard(req, res) {
           "profile.province",
           "stats.score",
           "stats.totalWinnings",
-          "stats.gamesWon",
-          "stats.rank",
-          "stats.userIdTag",
+            "stats.gamesWon",
+            "stats.rank",
+            "stats.userIdTag",
+            "avatar",
+            "avatarUrl",
+            "photo",
+            "profileImage",
+            "profilePic",
+            "photoUrl",
+            "image",
+            "imageUrl",
+            "userAvatar",
+            "avatarPath",
         ].join(" ")
       )
       .lean();

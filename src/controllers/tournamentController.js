@@ -198,6 +198,32 @@ export async function patch(req, res) {
   }
 }
 
+export async function removeDraft(req, res) {
+  try {
+    const id = String(req.params.id || "").trim();
+    const t = await Tournament.findById(id);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
+
+    assertSameClub(req, t);
+
+    const status = upper(t.status, "DRAFT");
+    if (status !== "DRAFT") {
+      const err = new Error("Only draft tournaments can be deleted");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    await Tournament.deleteOne({ _id: t._id });
+    return ok(res, { deleted: true, id: String(t._id) });
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
 // -------------------------
 // Step 2: access mode
 // -------------------------

@@ -129,6 +129,13 @@ function cleanText(v) {
 function isAvatarUrlLike(v) {
   const s = cleanText(v);
   if (!s) return false;
+  if (/^file:\/\//i.test(s)) return false;
+  if (/^[a-zA-Z]:[\\/]/.test(s)) return false;
+  if (s.startsWith("/storage/") || s.startsWith("/data/")) return false;
+  if (s.startsWith("assets/")) return true;
+  if (s.startsWith("//")) return true;
+  if (s.startsWith("www.")) return true;
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(s)) return true;
   return (
     s.startsWith("http://") ||
     s.startsWith("https://") ||
@@ -143,6 +150,12 @@ function resolveProfileAvatarUrl(profile = {}) {
     profile.avatarUrl,
     profile.photo,
     profile.profileImage,
+    profile.profilePic,
+    profile.photoUrl,
+    profile.imageUrl,
+    profile.image,
+    profile.userAvatar,
+    profile.avatarPath,
     profile.avatar,
   ];
   for (const candidate of candidates) {

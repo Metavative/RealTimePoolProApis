@@ -151,6 +151,26 @@ export async function sendTournamentInvite(req, res, io, presence) {
     const toUser = await User.findOne({ username: rx });
     if (!toUser) return res.status(404).json({ message: "User not found" });
 
+    const requesterUserId = String(req.userId || "").trim();
+    const requesterUsername = String(req.user?.username || "")
+      .trim()
+      .toLowerCase();
+    const targetUserId = String(toUser._id || "").trim();
+    const targetUsername = String(toUser.username || "")
+      .trim()
+      .toLowerCase();
+
+    if (
+      (requesterUserId && targetUserId && requesterUserId === targetUserId) ||
+      (requesterUsername &&
+        targetUsername &&
+        requesterUsername === targetUsername)
+    ) {
+      return res
+        .status(400)
+        .json({ message: "You cannot send a tournament invite to yourself" });
+    }
+
     const resolvedParticipantKey =
       participantKey || `uid:${String(toUser._id)}`;
 

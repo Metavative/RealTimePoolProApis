@@ -17,6 +17,7 @@ router.get("/my", clubAuthMiddleware, c.listMine);
 // get / update tournament
 router.get("/:id", clubAuthMiddleware, c.getOne);
 router.patch("/:id", clubAuthMiddleware, c.patch);
+router.delete("/:id", clubAuthMiddleware, c.removeDraft);
 router.patch("/:id/settings", clubAuthMiddleware, c.patchSettings);
 
 // Step endpoints

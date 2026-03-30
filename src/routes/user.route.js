@@ -15,9 +15,15 @@ function toStr(v) {
 function isAvatarUrlLike(v) {
   const s = toStr(v);
   if (!s) return false;
+  if (/^file:\/\//i.test(s)) return false;
+  if (/^[a-zA-Z]:[\\/]/.test(s)) return false;
+  if (s.startsWith('/storage/') || s.startsWith('/data/')) return false;
   return (
     s.startsWith("http://") ||
     s.startsWith("https://") ||
+    s.startsWith("//") ||
+    s.startsWith("www.") ||
+    /^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(s) ||
     s.startsWith("/") ||
     s.startsWith("uploads/") ||
     s.startsWith("data:image/")
@@ -29,11 +35,21 @@ function resolveAvatarUrl(profile = {}) {
     profile.avatarUrl,
     profile.photo,
     profile.profileImage,
+    profile.profilePic,
+    profile.photoUrl,
+    profile.imageUrl,
+    profile.image,
+    profile.userAvatar,
+    profile.avatarPath,
     profile.avatar,
   ];
   for (const candidate of candidates) {
     const value = toStr(candidate);
-    if (value && isAvatarUrlLike(value)) return value;
+    if (!value || !isAvatarUrlLike(value)) continue;
+    if (value.startsWith("//")) return `https:${value}`;
+    if (value.startsWith("www.")) return `https://${value}`;
+    if (/^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(value)) return `https://${value}`;
+    return value;
   }
   return "";
 }
