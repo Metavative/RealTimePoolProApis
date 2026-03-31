@@ -29,6 +29,8 @@ import tournamentInviteRoutes from "./routes/tournamentInvite.routes.js";
 import clubOwnerRoutes from "./routes/clubOwner.route.js";
 import storeRoutes from "./routes/store.route.js";
 import adminRoutes from "./routes/admin.route.js";
+import paymentsRoutes from "./routes/payments.route.js";
+import tournamentEconomyRoutes from "./routes/tournamentEconomy.route.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 
@@ -139,6 +141,8 @@ app.use("/api/zego", zegoRoutes);
 app.use("/api/tournaments", tournamentRoutes);
 app.use("/api/store", storeRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/payments/v2", paymentsRoutes);
+app.use("/api/tournament-economy/v2", tournamentEconomyRoutes);
 
 // Health check
 app.get("/api/health", (req, res) => {

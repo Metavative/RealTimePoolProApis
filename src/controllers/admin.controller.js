@@ -314,7 +314,7 @@ export async function createStoreItem(req, res) {
         widthCm: Number(body.dimensions?.widthCm || 0),
         heightCm: Number(body.dimensions?.heightCm || 0),
       },
-      active: body.active !== false,
+      active: stockQty > 0 ? body.active !== false : false,
       sortOrder: Number(body.sortOrder || 0),
     });
 
@@ -342,6 +342,11 @@ export async function updateStoreItem(req, res) {
 
     if (!sku) {
       return res.status(400).json({ ok: false, message: "Missing sku" });
+    }
+
+    const current = await StoreItem.findOne({ sku }).lean();
+    if (!current) {
+      return res.status(404).json({ ok: false, message: "Item not found" });
     }
 
     if (body.type != null) patch.type = normalizeType(body.type);
@@ -372,6 +377,12 @@ export async function updateStoreItem(req, res) {
 
     if (Array.isArray(body.tags)) {
       patch.tags = body.tags.map((x) => cleanString(x)).filter(Boolean);
+    }
+
+    const nextStockQty =
+      patch.stockQty != null ? Number(patch.stockQty) : Number(current.stockQty || 0);
+    if (nextStockQty <= 0) {
+      patch.active = false;
     }
 
     const item = await StoreItem.findOneAndUpdate({ sku }, patch, {

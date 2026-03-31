@@ -87,6 +87,15 @@ const StoreItemSchema = new mongoose.Schema(
       index: true,
     },
 
+    visibility: {
+      type: String,
+      default: "GLOBAL",
+      enum: ["GLOBAL", "PRIVATE"],
+      uppercase: true,
+      trim: true,
+      index: true,
+    },
+
     sortOrder: {
       type: Number,
       default: 0,

@@ -110,6 +110,18 @@ const TournamentSchema = new Schema(
     groups: { type: [GroupSchema], default: [] },
     matches: { type: [MatchSchema], default: [] },
 
+    // economy v2
+    economy: {
+      enabled: { type: Boolean, default: false },
+      currency: { type: String, default: "GBP", trim: true, uppercase: true },
+      entryFeeMinor: { type: Number, default: 100, min: 1 },
+      organizerShareBps: { type: Number, default: 5000, min: 0, max: 10000 },
+      prizePoolBps: { type: Number, default: 5000, min: 0, max: 10000 },
+      platformFeeBps: { type: Number, default: 0, min: 0, max: 10000 },
+      autoAddEntrantOnPayment: { type: Boolean, default: true },
+      updatedAt: { type: Date, default: null },
+    },
+
     // champion
     championName: { type: String, default: "" }, // stores participantKey
 

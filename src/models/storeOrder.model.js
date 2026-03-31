@@ -62,6 +62,15 @@ const StoreOrderSchema = new mongoose.Schema(
       index: true,
     },
 
+    buyerSnapshot: {
+      username: { type: String, default: "", trim: true },
+      nickname: { type: String, default: "", trim: true },
+      name: { type: String, default: "", trim: true },
+      firstName: { type: String, default: "", trim: true },
+      lastName: { type: String, default: "", trim: true },
+      email: { type: String, default: "", trim: true, lowercase: true },
+    },
+
     items: {
       type: [StoreOrderItemSchema],
       required: true,
@@ -105,6 +114,58 @@ const StoreOrderSchema = new mongoose.Schema(
       default: "",
       index: true,
       sparse: true,
+    },
+
+    paymentFlowVersion: {
+      type: String,
+      default: "LEGACY",
+      enum: ["LEGACY", "V2"],
+      trim: true,
+      uppercase: true,
+      index: true,
+    },
+
+    paymentIntentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PaymentIntent",
+      default: null,
+      index: true,
+    },
+
+    paymentIntentRef: {
+      type: String,
+      default: "",
+      trim: true,
+      uppercase: true,
+      sparse: true,
+      index: true,
+    },
+
+    reservationStatus: {
+      type: String,
+      default: "NONE",
+      enum: ["NONE", "RESERVED", "CONSUMED", "RELEASED"],
+      trim: true,
+      uppercase: true,
+      index: true,
+    },
+
+    reservationExpiresAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
+    reservedStockQty: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    paymentUpdatedAt: {
+      type: Date,
+      default: null,
+      index: true,
     },
 
     shippingAddress: {
