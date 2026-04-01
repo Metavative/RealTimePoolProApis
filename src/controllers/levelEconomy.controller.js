@@ -7,6 +7,8 @@ import WalletHold from "../models/walletHold.model.js";
 import Settlement from "../models/settlement.model.js";
 import LevelMatchSession from "../models/levelMatchSession.model.js";
 import LevelMatchmakingState from "../models/levelMatchmakingState.model.js";
+import { postReferralCommission } from "../services/referral.service.js";
+import { evaluateAndAwardMilestones } from "../services/achievement.service.js";
 
 const WINNER_SCORE_BONUS = 25;
 const LOSER_SCORE_BONUS = 5;
@@ -1072,6 +1074,52 @@ export async function settleLevelMatch(req, res) {
 
     await session.commitTransaction();
     session.endSession();
+
+    try {
+      if (commissionMinor > 0) {
+        const c0 = Math.floor(commissionMinor / 2);
+        const c1 = commissionMinor - c0;
+        await Promise.all([
+          postReferralCommission({
+            referredUserId: locked.challengerUserId,
+            sourceModule: "LEVEL_MATCH",
+            sourceRefId: `${locked.sessionId}:CHALLENGER`,
+            sourceCommissionMinor: c0,
+            currency: locked.currency,
+            metadata: { levelSessionId: locked.sessionId, level: locked.level },
+          }),
+          postReferralCommission({
+            referredUserId: locked.opponentUserId,
+            sourceModule: "LEVEL_MATCH",
+            sourceRefId: `${locked.sessionId}:OPPONENT`,
+            sourceCommissionMinor: c1,
+            currency: locked.currency,
+            metadata: { levelSessionId: locked.sessionId, level: locked.level },
+          }),
+        ]);
+      }
+    } catch (refErr) {
+      console.error("Referral posting failed for level settlement:", refErr?.message || refErr);
+    }
+
+    try {
+      await Promise.all([
+        evaluateAndAwardMilestones({
+          userId: winnerUserId,
+          trigger: "LEVEL_MATCH_SETTLED",
+          sourceModule: "LEVEL_MATCH",
+          sourceRefId: locked.sessionId,
+        }),
+        evaluateAndAwardMilestones({
+          userId: loserUserId,
+          trigger: "LEVEL_MATCH_SETTLED",
+          sourceModule: "LEVEL_MATCH",
+          sourceRefId: locked.sessionId,
+        }),
+      ]);
+    } catch (awardErr) {
+      console.error("Achievement evaluation failed for level settlement:", awardErr?.message || awardErr);
+    }
 
     return res.json({
       ok: true,

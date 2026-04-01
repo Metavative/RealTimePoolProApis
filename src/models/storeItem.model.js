@@ -34,6 +34,7 @@ const StoreItemSchema = new mongoose.Schema(
     images: {
       thumbUrl: { type: String, default: "" },
       previewUrl: { type: String, default: "" },
+      gallery: { type: [String], default: [] },
     },
 
     currency: {

@@ -15,18 +15,18 @@ Policy: Additive changes only. Do not break existing app flow.
 - No destructive schema changes or silent behavior changes.
 
 ## Remaining Modules (Pinned)
-- [ ] 1. Real Payment Gateway Module (myPOS-ready abstraction)
-- [ ] 2. Wallet Funding and Withdrawal Module
-- [ ] 3. Unified Financial Ledger Module
-- [ ] 4. Level Economy Engine Module
-- [ ] 5. Automated Matchmaking Module
-- [ ] 6. Referral Commission Module
-- [ ] 7. Tournament Economy Module
-- [ ] 8. Dispute Case Management Module
-- [ ] 9. Cups, Prizes, and Achievement History Module
-- [ ] 10. Organizer Revenue Dashboard Module
-- [ ] 11. Advanced Leaderboards Module
-- [ ] 12. Production Reliability Module
+- [x] 1. Real Payment Gateway Module (myPOS-ready abstraction)
+- [x] 2. Wallet Funding and Withdrawal Module
+- [x] 3. Unified Financial Ledger Module
+- [x] 4. Level Economy Engine Module
+- [x] 5. Automated Matchmaking Module
+- [x] 6. Referral Commission Module
+- [x] 7. Tournament Economy Module
+- [x] 8. Dispute Case Management Module
+- [x] 9. Cups, Prizes, and Achievement History Module
+- [x] 10. Organizer Revenue Dashboard Module
+- [x] 11. Advanced Leaderboards Module
+- [x] 12. Production Reliability Module
 
 ## Execution Order (Pinned)
 - [x] Step 1. Finance foundation scaffold (models + route contracts + safe toggles)
@@ -38,9 +38,9 @@ Policy: Additive changes only. Do not break existing app flow.
 - [x] Step 7. Level progression, stake doubling, and settlement enforcement
 - [x] Step 8. Matchmaking automation by level, location, and availability
 - [x] Step 9. Tournament/league fee distribution + organizer share
-- [ ] Step 10. Referral commission posting and history
-- [ ] Step 11. Dispute workflow with payout impact rules
-- [ ] Step 12. Achievements, dashboards, leaderboards, and reliability hardening
+- [x] Step 10. Referral commission posting and history
+- [x] Step 11. Dispute workflow with payout impact rules
+- [x] Step 12. Achievements, dashboards, leaderboards, and reliability hardening
 
 ## myPOS Credentials Needed Later (When Available)
 - Partner Client ID (`client_*`)

@@ -31,6 +31,11 @@ import storeRoutes from "./routes/store.route.js";
 import adminRoutes from "./routes/admin.route.js";
 import paymentsRoutes from "./routes/payments.route.js";
 import tournamentEconomyRoutes from "./routes/tournamentEconomy.route.js";
+import referralRoutes from "./routes/referral.route.js";
+import disputeRoutes from "./routes/dispute.route.js";
+import insightsRoutes from "./routes/insights.route.js";
+import featureRoutes from "./routes/features.route.js";
+import { requestContextMiddleware, notFoundHandler } from "./middleware/reliability.middleware.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
 
@@ -112,6 +117,7 @@ app.use(
 );
 
 app.use(morgan(isProd ? "tiny" : "dev"));
+app.use(requestContextMiddleware);
 
 app.use((req, res, next) => {
   logInfo(`[REQ] ${req.method} ${req.originalUrl}`);
@@ -143,6 +149,10 @@ app.use("/api/store", storeRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/payments/v2", paymentsRoutes);
 app.use("/api/tournament-economy/v2", tournamentEconomyRoutes);
+app.use("/api/referrals/v2", referralRoutes);
+app.use("/api/disputes/v2", disputeRoutes);
+app.use("/api/insights/v2", insightsRoutes);
+app.use("/api/features/v2", featureRoutes);
 
 // Health check
 app.get("/api/health", (req, res) => {
@@ -359,6 +369,8 @@ io.on("connection", (socket) => {
 // --------------------------------------------------
 // Express error handler
 // --------------------------------------------------
+app.use(notFoundHandler);
+
 app.use((err, req, res, next) => {
   console.error("âŒ EXPRESS ERROR:");
   console.error("Route:", req.method, req.originalUrl);
@@ -373,6 +385,7 @@ app.use((err, req, res, next) => {
     success: false,
     message: "Internal Server Error",
     error: err?.message || "Unknown error",
+    requestId: toStr(req.requestId),
   });
 });
 

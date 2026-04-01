@@ -77,6 +77,13 @@ const EarningsSchema = new mongoose.Schema({
   transactionHistory: [{ type: mongoose.Schema.Types.ObjectId, ref: "Transaction" }],
 });
 
+const ReferralSchema = new mongoose.Schema({
+  referredByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
+  referredByCode: { type: String, default: "", trim: true, uppercase: true },
+  referredAt: { type: Date, default: null },
+  totalReferralEarnings: { type: Number, default: 0 },
+});
+
 const StatsSchema = new mongoose.Schema({
   userIdTag: { type: String, unique: true, sparse: true },
   rank: { type: String, default: "Beginner" },
@@ -197,6 +204,7 @@ const UserSchema = new mongoose.Schema({
   profile: ProfileSchema,
   feedbacks: [FeedbackSchema],
   earnings: EarningsSchema,
+  referral: ReferralSchema,
   stats: StatsSchema,
   friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   createdAt: { type: Date, default: Date.now },

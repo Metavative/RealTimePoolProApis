@@ -196,6 +196,18 @@ function duplicateKeyErrorResponse(error) {
   };
 }
 
+async function resolveReferrerByCode(referralCode, { excludeUserId = null } = {}) {
+  const code = toStr(referralCode).toUpperCase();
+  if (!code) return null;
+  const query = {
+    $or: [{ "stats.userIdTag": code }, { usernameLower: code.toLowerCase() }],
+  };
+  if (excludeUserId) {
+    query._id = { $ne: excludeUserId };
+  }
+  return User.findOne(query).select("_id stats.userIdTag username profile.nickname").lean();
+}
+
 // =========================
 // Name helpers
 // =========================
@@ -304,6 +316,9 @@ export const signUp = async (req, res) => {
 
     const role = toStr(body.role) || toStr(body.userType) || "";
     const organizer = body.organizer && typeof body.organizer === "object" ? body.organizer : null;
+    const referralCodeInput = toStr(
+      body.referralCode || body.refCode || body.inviteCode || body.referredByCode
+    ).toUpperCase();
 
     const nickname = pickNickname(body, email, phone);
     const preferredNickname = username || nickname;
@@ -378,6 +393,7 @@ export const signUp = async (req, res) => {
       if (!existing.profile.nickname && preferredNickname) {
         existing.profile.nickname = preferredNickname;
       }
+      existing.referral = existing.referral || {};
 
       if (isPlayer) {
         existing.profile.firstName = existing.profile.firstName || firstName;
@@ -396,6 +412,17 @@ export const signUp = async (req, res) => {
       }
       if (organizer) existing.profile.organizer = organizer;
 
+      if (!existing.referral.referredByUserId && referralCodeInput) {
+        const referrer = await resolveReferrerByCode(referralCodeInput, {
+          excludeUserId: existing._id,
+        });
+        if (referrer?._id) {
+          existing.referral.referredByUserId = referrer._id;
+          existing.referral.referredByCode = toStr(referrer?.stats?.userIdTag || referralCodeInput).toUpperCase();
+          existing.referral.referredAt = new Date();
+        }
+      }
+
       await existing.save();
 
       const token = sign({ id: existing._id });
@@ -410,6 +437,9 @@ export const signUp = async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
     const tag = await createUniqueTag();
+    const referrerForNew = referralCodeInput
+      ? await resolveReferrerByCode(referralCodeInput)
+      : null;
 
     const user = await User.create({
       email,
@@ -429,6 +459,14 @@ export const signUp = async (req, res) => {
             }
           : {}),
       },
+      referral:
+        referrerForNew?._id
+          ? {
+              referredByUserId: referrerForNew._id,
+              referredByCode: toStr(referrerForNew?.stats?.userIdTag || referralCodeInput).toUpperCase(),
+              referredAt: new Date(),
+            }
+          : undefined,
       stats: { userIdTag: tag },
       emailVerified: false,
       phoneVerified: false,
@@ -494,6 +532,9 @@ export async function requestSignupOtp(req, res) {
     const body = getBody(req);
 
     const { raw: username, lower: usernameLower } = validateUsernameOrThrow(body.username);
+    const referralCodeInput = toStr(
+      body.referralCode || body.refCode || body.inviteCode || body.referredByCode
+    ).toUpperCase();
 
     const email =
       normalizeEmail(body.email) ||
@@ -542,6 +583,18 @@ export async function requestSignupOtp(req, res) {
 
       user.stats = user.stats || {};
       if (!user.stats.userIdTag) user.stats.userIdTag = await createUniqueTag();
+      user.referral = user.referral || {};
+
+      if (!user.referral.referredByUserId && referralCodeInput) {
+        const referrer = await resolveReferrerByCode(referralCodeInput, {
+          excludeUserId: user._id,
+        });
+        if (referrer?._id) {
+          user.referral.referredByUserId = referrer._id;
+          user.referral.referredByCode = toStr(referrer?.stats?.userIdTag || referralCodeInput).toUpperCase();
+          user.referral.referredAt = user.referral.referredAt || new Date();
+        }
+      }
     } else {
       // No user exists yet -> ensure username is free
       const usernameTaken = await User.findOne({ usernameLower }).select("_id username");
@@ -550,6 +603,9 @@ export async function requestSignupOtp(req, res) {
       }
 
       log("USER_NOT_FOUND_CREATING");
+      const referrerForNew = referralCodeInput
+        ? await resolveReferrerByCode(referralCodeInput)
+        : null;
       user = await User.create({
         ...(email ? { email } : {}),
         ...(phone ? { phone } : {}),
@@ -559,6 +615,14 @@ export async function requestSignupOtp(req, res) {
         lastOtpSent: null,
         lastOtpChannel: null,
         profile: { ...(username ? { nickname: username } : {}) },
+        referral:
+          referrerForNew?._id
+            ? {
+                referredByUserId: referrerForNew._id,
+                referredByCode: toStr(referrerForNew?.stats?.userIdTag || referralCodeInput).toUpperCase(),
+                referredAt: new Date(),
+              }
+            : undefined,
         stats: { userIdTag: await createUniqueTag() },
       });
     }
@@ -644,6 +708,9 @@ export async function requestOtp(req, res) {
     if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
 
     let requestedUsername = null;
+    const referralCodeInput = toStr(
+      body.referralCode || body.refCode || body.inviteCode || body.referredByCode
+    ).toUpperCase();
     if (flow === "signup") {
       const usernameInput =
         toStr(body.username) ||
@@ -667,6 +734,9 @@ export async function requestOtp(req, res) {
     }
 
     if (!user) {
+      const referrerForNew = flow === "signup" && referralCodeInput
+        ? await resolveReferrerByCode(referralCodeInput)
+        : null;
       user = await User.create({
         ...query,
         ...(requestedUsername ? { username: requestedUsername } : {}),
@@ -675,8 +745,29 @@ export async function requestOtp(req, res) {
         lastOtpSent: null,
         lastOtpChannel: null,
         profile: { ...(requestedUsername ? { nickname: requestedUsername } : {}) },
+        referral:
+          referrerForNew?._id
+            ? {
+                referredByUserId: referrerForNew._id,
+                referredByCode: toStr(referrerForNew?.stats?.userIdTag || referralCodeInput).toUpperCase(),
+                referredAt: new Date(),
+              }
+            : undefined,
         stats: { userIdTag: await createUniqueTag() },
       });
+    } else if (flow === "signup" && referralCodeInput) {
+      user.referral = user.referral || {};
+      if (!user.referral.referredByUserId) {
+        const referrer = await resolveReferrerByCode(referralCodeInput, {
+          excludeUserId: user._id,
+        });
+        if (referrer?._id) {
+          user.referral.referredByUserId = referrer._id;
+          user.referral.referredByCode = toStr(referrer?.stats?.userIdTag || referralCodeInput).toUpperCase();
+          user.referral.referredAt = user.referral.referredAt || new Date();
+          await user.save();
+        }
+      }
     }
 
     if (isRateLimited(user.lastOtpSent, 60_000)) {

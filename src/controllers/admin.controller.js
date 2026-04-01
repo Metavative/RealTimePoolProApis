@@ -277,6 +277,13 @@ export async function createStoreItem(req, res) {
     const price = Number(body.price || 0);
     const stockQty = Math.max(0, Number(body.stockQty || 0));
     const rarity = normalizeType(body.rarity || "COMMON");
+    const gallery =
+      Array.isArray(body.images?.gallery)
+        ? body.images.gallery.map((x) => cleanString(x)).filter(Boolean)
+        : [];
+    const thumbUrl = cleanString(body.images?.thumbUrl) || gallery[0] || "";
+    const previewUrl =
+      cleanString(body.images?.previewUrl) || gallery[1] || thumbUrl;
 
     if (!sku || !type || !name) {
       return res.status(400).json({
@@ -298,8 +305,9 @@ export async function createStoreItem(req, res) {
       name,
       description,
       images: {
-        thumbUrl: cleanString(body.images?.thumbUrl),
-        previewUrl: cleanString(body.images?.previewUrl),
+        thumbUrl,
+        previewUrl,
+        gallery,
       },
       currency,
       price,
@@ -361,9 +369,31 @@ export async function updateStoreItem(req, res) {
     if (body.weightKg != null) patch.weightKg = Number(body.weightKg);
 
     if (body.images) {
+      const existingGallery = Array.isArray(current.images?.gallery)
+        ? current.images.gallery.map((x) => cleanString(x)).filter(Boolean)
+        : [];
+      const hasGallery =
+        Object.prototype.hasOwnProperty.call(body.images, "gallery");
+      const nextGallery = hasGallery
+        ? Array.isArray(body.images.gallery)
+          ? body.images.gallery.map((x) => cleanString(x)).filter(Boolean)
+          : []
+        : existingGallery;
+
+      const nextThumb =
+        cleanString(body.images.thumbUrl) ||
+        nextGallery[0] ||
+        cleanString(current.images?.thumbUrl);
+      const nextPreview =
+        cleanString(body.images.previewUrl) ||
+        nextGallery[1] ||
+        nextThumb ||
+        cleanString(current.images?.previewUrl);
+
       patch.images = {
-        thumbUrl: cleanString(body.images.thumbUrl),
-        previewUrl: cleanString(body.images.previewUrl),
+        thumbUrl: nextThumb,
+        previewUrl: nextPreview,
+        gallery: nextGallery,
       };
     }
 

@@ -3,6 +3,8 @@ import Match from "../models/match.model.js";
 import User from "../models/user.model.js";
 import Transaction from "../models/transaction.model.js";
 import mongoose from "mongoose";
+import { postReferralCommission } from "../services/referral.service.js";
+import { evaluateAndAwardMilestones } from "../services/achievement.service.js";
 
 const APP_COMMISSION_RATE = 0.10;
 const WINNER_SCORE_BONUS = 25;
@@ -393,6 +395,56 @@ export async function finishMatch(req, res) {
 
     await session.commitTransaction();
     session.endSession();
+
+    try {
+      const totalCommissionMinor = Math.max(0, Math.round(Number(appCommission || 0) * 100));
+      if (totalCommissionMinor > 0 && Array.isArray(match.players) && match.players.length >= 2) {
+        const p0 = toId(match.players[0]);
+        const p1 = toId(match.players[1]);
+        const p0Minor = Math.floor(totalCommissionMinor / 2);
+        const p1Minor = totalCommissionMinor - p0Minor;
+
+        await Promise.all([
+          postReferralCommission({
+            referredUserId: p0,
+            sourceModule: "MATCH",
+            sourceRefId: `${match._id}:P0`,
+            sourceCommissionMinor: p0Minor,
+            currency: "GBP",
+            metadata: { matchId: toId(match._id), winnerId: toId(winnerId) },
+          }),
+          postReferralCommission({
+            referredUserId: p1,
+            sourceModule: "MATCH",
+            sourceRefId: `${match._id}:P1`,
+            sourceCommissionMinor: p1Minor,
+            currency: "GBP",
+            metadata: { matchId: toId(match._id), winnerId: toId(winnerId) },
+          }),
+        ]);
+      }
+    } catch (refErr) {
+      console.error("Referral posting failed for match settlement:", refErr?.message || refErr);
+    }
+
+    try {
+      await Promise.all([
+        evaluateAndAwardMilestones({
+          userId: winnerId,
+          trigger: "MATCH_SETTLED",
+          sourceModule: "MATCH",
+          sourceRefId: toId(match._id),
+        }),
+        evaluateAndAwardMilestones({
+          userId: loserId,
+          trigger: "MATCH_SETTLED",
+          sourceModule: "MATCH",
+          sourceRefId: toId(match._id),
+        }),
+      ]);
+    } catch (awardErr) {
+      console.error("Achievement evaluation failed for match settlement:", awardErr?.message || awardErr);
+    }
 
     return res.json({
       message: "Match finished and funds settled successfully",

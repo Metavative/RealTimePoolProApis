@@ -55,6 +55,7 @@ function resolveAvatarUrl(profile = {}) {
 }
 
 router.get("/me", authMiddleware, useCtrl.me);
+router.delete("/me", authMiddleware, useCtrl.deleteMyAccount);
 router.get("/leaderboard", authMiddleware, useCtrl.leaderboard);
 router.get("/feedback", authMiddleware, useCtrl.listFeedback);
 router.post("/feedback", authMiddleware, useCtrl.createFeedback);

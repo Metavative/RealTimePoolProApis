@@ -1,5 +1,6 @@
 // src/controllers/userController.js
 import User from "../models/user.model.js";
+import Club from "../models/club.model.js";
 import { v2 as cloudinary } from "cloudinary";
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
@@ -1090,6 +1091,34 @@ export async function me(req, res) {
     });
   } catch (error) {
     return res.status(500).json({ message: error.message });
+  }
+}
+
+export async function deleteMyAccount(req, res) {
+  try {
+    const userId = String(req.userId || req.user?._id || "").trim();
+    if (!userId) {
+      return res.status(401).json({ ok: false, message: "Unauthorized" });
+    }
+
+    const user = await User.findById(userId).select("_id");
+    if (!user) {
+      return res.status(404).json({ ok: false, message: "User not found" });
+    }
+
+    await Promise.all([
+      User.updateMany({ friends: user._id }, { $pull: { friends: user._id } }),
+      Club.updateMany({ owner: user._id }, { $unset: { owner: "" } }),
+    ]);
+
+    await User.deleteOne({ _id: user._id });
+
+    return res.json({ ok: true, message: "Account deleted" });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      message: error.message || "Failed to delete account",
+    });
   }
 }
 
