@@ -9,6 +9,8 @@ import LevelMatchSession from "../models/levelMatchSession.model.js";
 import LevelMatchmakingState from "../models/levelMatchmakingState.model.js";
 import { postReferralCommission } from "../services/referral.service.js";
 import { evaluateAndAwardMilestones } from "../services/achievement.service.js";
+import { requireTransactions } from "../utils/dbTransactions.js";
+import { getSpendableBalanceMinor } from "../services/ledgerUnification.service.js";
 
 const WINNER_SCORE_BONUS = 25;
 const LOSER_SCORE_BONUS = 5;
@@ -370,12 +372,13 @@ async function hasActiveLevelSessionForUser(userId) {
 
 async function walletBalanceMinorForUser(user, currency = "GBP") {
   const userId = toId(user?._id);
-  const ledgerBalance = await getAccountBalanceMinor({
-    accountType: "USER_WALLET",
-    accountId: walletAccountId(userId),
+  // U1: single spendable-balance read. Flag ON → ledger only; OFF → legacy
+  // max(ledger, earnings cache) so behaviour is unchanged until we flip.
+  return getSpendableBalanceMinor({
+    userId,
     currency,
+    fallbackMinor: userFallbackWalletMinor(user),
   });
-  return Math.max(ledgerBalance, userFallbackWalletMinor(user));
 }
 
 function normalizePreferredRange({ minLevel, maxLevel, preferredLevel, fallbackLevel }) {
@@ -530,12 +533,11 @@ export async function myLevelEconomySummary(req, res) {
       .lean();
     if (!user) return res.status(404).json({ ok: false, message: "User not found" });
 
-    const ledgerBalance = await getAccountBalanceMinor({
-      accountType: "USER_WALLET",
-      accountId: walletAccountId(userId),
+    const effectiveWalletMinor = await getSpendableBalanceMinor({
+      userId,
       currency: levelCurrency(),
+      fallbackMinor: userFallbackWalletMinor(user),
     });
-    const effectiveWalletMinor = Math.max(ledgerBalance, userFallbackWalletMinor(user));
 
     const activeSessions = await LevelMatchSession.countDocuments({
       participants: { $in: [new mongoose.Types.ObjectId(userId)] },
@@ -559,6 +561,7 @@ export async function myLevelEconomySummary(req, res) {
 
 export async function createLevelChallenge(req, res) {
   if (!levelEconomyEnabled()) return serviceUnavailable(res);
+  if (!requireTransactions(res)) return;
 
   const actorId = toId(req.userId);
   const opponentId = toId(req.body?.opponentUserId || req.body?.opponentId);
@@ -612,19 +615,16 @@ export async function createLevelChallenge(req, res) {
   const totalPotMinor = stakeMinor * 2;
   const currency = levelCurrency();
 
-  const challengerLedgerBalance = await getAccountBalanceMinor({
-    accountType: "USER_WALLET",
-    accountId: walletAccountId(actorId),
+  const challengerWalletMinor = await getSpendableBalanceMinor({
+    userId: actorId,
     currency,
+    fallbackMinor: userFallbackWalletMinor(challenger),
   });
-  const opponentLedgerBalance = await getAccountBalanceMinor({
-    accountType: "USER_WALLET",
-    accountId: walletAccountId(opponentId),
+  const opponentWalletMinor = await getSpendableBalanceMinor({
+    userId: opponentId,
     currency,
+    fallbackMinor: userFallbackWalletMinor(opponent),
   });
-
-  const challengerWalletMinor = Math.max(challengerLedgerBalance, userFallbackWalletMinor(challenger));
-  const opponentWalletMinor = Math.max(opponentLedgerBalance, userFallbackWalletMinor(opponent));
   if (challengerWalletMinor < stakeMinor || opponentWalletMinor < stakeMinor) {
     return res.status(400).json({
       ok: false,
@@ -807,6 +807,7 @@ export async function startLevelMatch(req, res) {
 
 export async function settleLevelMatch(req, res) {
   if (!levelEconomyEnabled()) return serviceUnavailable(res);
+  if (!requireTransactions(res)) return;
 
   const actorId = toId(req.userId);
   const sessionId = upper(req.params.sessionId || req.body?.sessionId);
@@ -1136,6 +1137,7 @@ export async function settleLevelMatch(req, res) {
 
 export async function cancelLevelMatch(req, res) {
   if (!levelEconomyEnabled()) return serviceUnavailable(res);
+  if (!requireTransactions(res)) return;
 
   const actorId = toId(req.userId);
   const sessionId = upper(req.params.sessionId || req.body?.sessionId);

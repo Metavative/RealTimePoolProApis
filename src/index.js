@@ -12,6 +12,7 @@ import colors from "colors";
 
 import connectDb from "./config/db.js";
 import connectCloudinary from "./config/cloudinary.config.js";
+import { assertAuthConfig } from "./services/jwtService.js";
 
 import User from "./models/user.model.js";
 
@@ -38,6 +39,11 @@ import featureRoutes from "./routes/features.route.js";
 import { requestContextMiddleware, notFoundHandler } from "./middleware/reliability.middleware.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
+import registerMatchLiveHandlers from "./services/socket_handler/matchLiveHandler.js";
+import {
+  socketAuthMiddleware,
+  resolveUserId,
+} from "./services/socket_handler/socketAuth.js";
 
 dotenv.config();
 const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
@@ -105,7 +111,17 @@ app.set("trust proxy", 1);
 
 // Middleware
 app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
+// Capture the raw request body (Phase C) so webhook signatures can be verified
+// against the exact bytes the provider signed. Additive: the `verify` hook does
+// not change JSON parsing behaviour.
+app.use(
+  express.json({
+    limit: "2mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf && buf.length ? buf.toString("utf8") : "";
+    },
+  })
+);
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
@@ -180,16 +196,45 @@ const io = new Server(server, {
   },
 });
 
-// Presence map
+// Presence map: userId -> Set<socketId>.
+// Phase B2: track ALL of a user's sockets (multi-device) instead of overwriting
+// a single socket id. A user is "online" while at least one socket is connected,
+// and match/presence events are delivered to every device via the user room.
 const presence = new Map();
 
+presence.addSocket = (userId, socketId) => {
+  const uid = String(userId);
+  let set = presence.get(uid);
+  if (!set) {
+    set = new Set();
+    presence.set(uid, set);
+  }
+  set.add(socketId);
+  return set.size;
+};
+
+// Removes one socket; returns true only when the user has NO sockets left
+// (i.e. they are now fully offline and should be flagged offline in the DB).
+presence.removeSocket = (userId, socketId) => {
+  const uid = String(userId);
+  const set = presence.get(uid);
+  if (!set) return true;
+  set.delete(socketId);
+  if (set.size === 0) {
+    presence.delete(uid);
+    return true;
+  }
+  return false;
+};
+
 presence.isOnline = (userId) => {
-  return presence.has(String(userId));
+  const set = presence.get(String(userId));
+  return !!set && set.size > 0;
 };
 
 presence.getSocketIds = (userId) => {
-  const sid = presence.get(String(userId));
-  return sid ? [sid] : [];
+  const set = presence.get(String(userId));
+  return set ? Array.from(set) : [];
 };
 
 // --------------------------------------------------
@@ -259,19 +304,27 @@ async function getNearbyPlayersForUser(userId, radiusKm = 5) {
 // --------------------------------------------------
 // Socket.io
 // --------------------------------------------------
+// Verify the JWT on the handshake (non-breaking: clients already send it).
+// When a token is present, socket.authUserId is pinned and always wins over a
+// client-supplied id. Enforcement is controlled by SOCKET_AUTH_REQUIRED.
+io.use(socketAuthMiddleware);
+
 io.on("connection", (socket) => {
   logInfo(`Socket connected: ${socket.id}`);
 
   registerMatchHandlers(io, socket, presence);
+  registerMatchLiveHandlers(io, socket);
 
   const setPresence = async (userId) => {
-    const uid = String(userId || "");
+    // Prefer the authenticated identity; ignore a spoofed/claimed id when the
+    // socket is authenticated. Returns null if auth is required but missing.
+    const uid = String(resolveUserId(socket, userId) || "");
     if (!uid) return;
 
     socket.userId = uid;
     socket.join(`user:${uid}`);
 
-    presence.set(uid, socket.id);
+    presence.addSocket(uid, socket.id);
 
     try {
       await User.findByIdAndUpdate(uid, {
@@ -289,9 +342,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("player:online", async (payload) => {
-    if (!payload || !payload.userId || !payload.location) return;
+    if (!payload || !payload.location) return;
 
-    const { userId, location } = payload;
+    const userId = resolveUserId(socket, payload.userId);
+    if (!userId) return;
+
+    const { location } = payload;
     const lat = location.lat;
     const lng = location.lng;
 
@@ -319,7 +375,6 @@ io.on("connection", (socket) => {
   socket.on("updateLocation", async (payload) => {
     if (
       !payload ||
-      !payload.userId ||
       typeof payload.lat !== "number" ||
       typeof payload.lng !== "number"
     ) {
@@ -327,7 +382,10 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const { userId, lat, lng } = payload;
+    const userId = resolveUserId(socket, payload.userId);
+    if (!userId) return;
+
+    const { lat, lng } = payload;
 
     try {
       await User.findByIdAndUpdate(userId, {
@@ -348,17 +406,21 @@ io.on("connection", (socket) => {
     const uid = socket.userId ? String(socket.userId) : "";
 
     if (uid) {
-      presence.delete(uid);
+      const fullyOffline = presence.removeSocket(uid, socket.id);
 
-      try {
-        await User.findByIdAndUpdate(uid, {
-          "profile.onlineStatus": false,
-          lastSeen: new Date(),
-        });
-        await emitOnlinePlayers();
-        logInfo(`User offline: ${uid}`);
-      } catch (err) {
-        console.error("Error updating user status on disconnect:", err);
+      // Only flag the user offline once their LAST device disconnects; if they
+      // still have another socket open, keep them online.
+      if (fullyOffline) {
+        try {
+          await User.findByIdAndUpdate(uid, {
+            "profile.onlineStatus": false,
+            lastSeen: new Date(),
+          });
+          await emitOnlinePlayers();
+          logInfo(`User offline: ${uid}`);
+        } catch (err) {
+          console.error("Error updating user status on disconnect:", err);
+        }
       }
     }
 
@@ -397,6 +459,7 @@ const PORT = process.env.PORT || 4000;
 (async () => {
   try {
     console.log("ðŸš€ Booting server...");
+    assertAuthConfig();
     await connectDb();
     console.log("âœ… DB connected");
 

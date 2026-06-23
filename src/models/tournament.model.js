@@ -105,6 +105,10 @@ const TournamentSchema = new Schema(
     defaultVenue: { type: String, default: "" },
     playoffDefaultVenue: { type: String, default: "" },
 
+    // optional capacity cap for entrants (0 = unlimited; preserves prior
+    // behaviour where there was no cap). Enforced on player self-entry/payment.
+    maxPlayers: { type: Number, default: 0, min: 0 },
+
     // core arrays
     entrants: { type: [EntrantSchema], default: [] },
     groups: { type: [GroupSchema], default: [] },
@@ -124,6 +128,29 @@ const TournamentSchema = new Schema(
 
     // champion
     championName: { type: String, default: "" }, // stores participantKey
+
+    // Phase B money sub-phase: prize distribution settlement record.
+    // Idempotency: `settled` is claimed atomically before any payout so the
+    // pool can never be paid out twice. Feature-gated by FEATURE_TOURNAMENT_PAYOUTS.
+    prizeSettlement: {
+      settled: { type: Boolean, default: false },
+      settledAt: { type: Date, default: null },
+      totalMinor: { type: Number, default: 0 },
+      currency: { type: String, default: "GBP" },
+      payouts: {
+        type: [
+          {
+            userId: { type: String, default: "" },
+            participantKey: { type: String, default: "" },
+            placement: { type: Number, default: 0 },
+            amountMinor: { type: Number, default: 0 },
+            credited: { type: Boolean, default: false },
+          },
+        ],
+        default: [],
+      },
+      note: { type: String, default: "" },
+    },
 
     // playoffs metadata (Step 4/5)
     playoffs: {

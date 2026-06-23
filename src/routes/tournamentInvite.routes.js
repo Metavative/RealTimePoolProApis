@@ -8,6 +8,7 @@ import {
   respondToInvite,
   cancelInvite,
   joinTournamentOpen, // ✅ NEW
+  leaveTournamentOpen, // ✅ Phase B: safe self-withdraw
 } from "../controllers/tournamentInvite.controller.js";
 
 export default function tournamentInviteRoutes(io, presence) {
@@ -26,6 +27,11 @@ export default function tournamentInviteRoutes(io, presence) {
   // ✅ NEW: Player join (user token) when accessMode === OPEN
   router.post("/tournaments/:tournamentId/join", authAny, (req, res) =>
     joinTournamentOpen(req, res)
+  );
+
+  // ✅ Phase B: Player safe self-withdraw (user token)
+  router.post("/tournaments/:tournamentId/leave", authAny, (req, res) =>
+    leaveTournamentOpen(req, res)
   );
 
   // Player inbox (user token)

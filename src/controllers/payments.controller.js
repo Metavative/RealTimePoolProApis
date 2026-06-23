@@ -6,6 +6,7 @@ import PaymentWebhookEvent from "../models/paymentWebhookEvent.model.js";
 import WalletHold from "../models/walletHold.model.js";
 import Settlement from "../models/settlement.model.js";
 import { resolvePaymentProvider } from "../services/payments/paymentProvider.factory.js";
+import { hasPlatformAdminAccess, strictWalletEnabled } from "../utils/authz.js";
 
 const OPEN_INTENT_STATUSES = ["CREATED", "PENDING_PAYMENT", "PROCESSING"];
 const TERMINAL_INTENT_STATUSES = [
@@ -49,6 +50,22 @@ function requestUserId(req) {
 
 function requestClubId(req) {
   return req.clubId || req.club?._id || null;
+}
+
+// Privileged wallet operations (settlement-side refunds, withdrawal payout
+// approval) must be performed by a platform admin, never self-service. Returns
+// true if the request may proceed; otherwise writes a 403 and returns false.
+// Honours AUTHZ_STRICT_WALLET so the legacy behaviour can be restored if a
+// flow genuinely needs it during later phases.
+function ensureWalletAdmin(req, res) {
+  if (!strictWalletEnabled()) return true;
+  if (hasPlatformAdminAccess(req.user)) return true;
+  res.status(403).json({
+    ok: false,
+    code: "ADMIN_REQUIRED",
+    message: "This wallet operation requires administrator privileges.",
+  });
+  return false;
 }
 
 function toMinorFromBody(rawAmount, rawAmountMinor) {
@@ -134,26 +151,74 @@ function providerWebhookSecret(provider) {
   return cleanString(process.env.PAYMENTS_WEBHOOK_SECRET);
 }
 
-function verifyWebhookSignature({ provider, payload, signature }) {
+function webhookEnvFlag(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return defaultValue;
+  const v = String(raw).trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function paymentsEnvIsProduction() {
+  const env = upper(process.env.PAYMENTS_ENVIRONMENT || process.env.NODE_ENV || "");
+  return env === "PRODUCTION" || env === "PROD" || env === "LIVE";
+}
+
+// Phase C: the MOCK provider has no secret and otherwise bypasses signature
+// verification. That is fine for sandbox/dev but a forgery hole in production
+// (anyone could POST /webhooks/MOCK to inject a "PAID" event). Allow the bypass
+// only outside production, or when explicitly opted in. Exported for testing.
+export function mockWebhookBypassAllowed() {
+  if (webhookEnvFlag("ALLOW_MOCK_WEBHOOKS", false)) return true;
+  return !paymentsEnvIsProduction();
+}
+
+// Phase C: only accept webhooks from known providers. Prevents an attacker from
+// selecting an arbitrary provider in the URL to influence secret selection or
+// trip the MOCK bypass. Exported for testing.
+export function isKnownWebhookProvider(provider) {
+  const p = upper(provider, "UNKNOWN");
+  const base = new Set(["MOCK", "MYPOS"]);
+  for (const extra of cleanString(process.env.WEBHOOK_PROVIDERS).split(",")) {
+    const e = upper(extra);
+    if (e) base.add(e);
+  }
+  return base.has(p);
+}
+
+// Verify a webhook signature. Prefers the exact raw request bytes (so real
+// providers' signatures verify against what they actually signed); falls back
+// to the canonical JSON form for backward compatibility with existing signers.
+// Exported for testing.
+export function verifyWebhookSignature({ provider, payload, signature, rawBody }) {
   const p = upper(provider, "UNKNOWN");
   const secret = providerWebhookSecret(p);
   if (!secret) {
+    const allowMock = p === "MOCK" && mockWebhookBypassAllowed();
     return {
-      verified: p === "MOCK",
-      reason:
-        p === "MOCK"
-          ? "mock_provider_signature_bypass"
-          : "webhook_secret_not_configured",
+      verified: allowMock,
+      reason: allowMock
+        ? "mock_provider_signature_bypass"
+        : p === "MOCK"
+        ? "mock_bypass_disabled_in_production"
+        : "webhook_secret_not_configured",
     };
   }
 
+  const raw = typeof rawBody === "string" ? rawBody : "";
   const canonical = canonicalPayloadString(payload || {});
-  const expected = hmacSha256Hex(secret, canonical);
-  return {
-    verified: timingSafeHexEqual(signature, expected),
-    expected,
-    reason: "hmac_sha256",
-  };
+
+  // Try raw bytes first (exact provider signature), then canonical fallback.
+  let expected = hmacSha256Hex(secret, raw || canonical);
+  let verified = timingSafeHexEqual(signature, expected);
+  if (!verified && raw) {
+    const expectedCanonical = hmacSha256Hex(secret, canonical);
+    if (timingSafeHexEqual(signature, expectedCanonical)) {
+      verified = true;
+      expected = expectedCanonical;
+    }
+  }
+
+  return { verified, expected, reason: "hmac_sha256" };
 }
 
 function buildWebhookDedupeKey({ provider, providerEventId, eventType, payload, signature }) {
@@ -965,6 +1030,152 @@ export async function applyLedgerRulesForIntent(intent, { trigger = "manual", ac
     sourceId,
     settlementId,
   };
+}
+
+// Phase C2: flip a set of balanced ledger lines to their reversal. Pure +
+// exported for testing. A balanced set stays balanced after flipping.
+export function reverseLedgerLines(lines = []) {
+  return (Array.isArray(lines) ? lines : []).map((l) => ({
+    ...l,
+    direction: upper(l?.direction) === "DEBIT" ? "CREDIT" : "DEBIT",
+  }));
+}
+
+// Phase C2: reverse a previously-posted intent settlement (refund). Idempotent
+// via the deterministic REFUND_<intentId> sourceId. No-op (reversed:false) if
+// the original settlement was never posted (e.g. mock/neutral mode), so callers
+// can always invoke it safely. Marks the intent REFUNDED on success.
+export async function reverseIntentSettlement(intent, { trigger = "refund", actor = "api" } = {}) {
+  if (!intent) return { reversed: false, reason: "intent_not_found" };
+
+  const meta = intentMeta(intent);
+  const originalSourceId = cleanString(
+    meta.ledgerPosting?.sourceId || intentSourceId(intent)
+  );
+  const refundSourceId = upper(`REFUND_${cleanString(intent.intentId)}`);
+
+  // Already reversed? Idempotent.
+  const existingRefund = await LedgerEntry.find({
+    sourceType: "REFUND",
+    sourceId: refundSourceId,
+    status: "POSTED",
+  })
+    .select({ _id: 1 })
+    .lean();
+  if (existingRefund.length > 0) {
+    return { reversed: true, reused: true, sourceId: refundSourceId };
+  }
+
+  // Only reverse if the original settlement actually posted ledger entries.
+  const originalEntries = await LedgerEntry.find({
+    sourceType: "SETTLEMENT",
+    sourceId: originalSourceId,
+    status: "POSTED",
+  })
+    .select({ _id: 1 })
+    .lean();
+  if (meta.ledgerPosting?.posted !== true && originalEntries.length === 0) {
+    return { reversed: false, reason: "not_settled" };
+  }
+
+  const plan = computeIntentLedgerLines(intent);
+  await postBalancedLedgerEntries({
+    intentId: intent._id,
+    currency: plan.currency,
+    sourceType: "REFUND",
+    sourceId: refundSourceId,
+    metadata: { operation: "INTENT_REFUND_REVERSAL", module: intentModule(intent), trigger },
+    lines: reverseLedgerLines(plan.lines),
+  });
+
+  intent.status = "REFUNDED";
+  intent.metadata = {
+    ...meta,
+    refund: {
+      reversed: true,
+      reversedAt: new Date().toISOString(),
+      sourceId: refundSourceId,
+      trigger,
+    },
+  };
+  appendTimeline(intent, "REFUNDED", "Settlement reversed (refund)", actor);
+  await intent.save();
+
+  return { reversed: true, reused: false, sourceId: refundSourceId };
+}
+
+// Phase C2: draw down a tournament's prize-pool ledger account when a prize is
+// paid out, so PRIZE_TOURN_<id> doesn't keep a phantom balance. The winner's
+// spendable money is credited via the earnings fields (in tournamentPayout
+// service, consistent with match payouts); here we only zero out the pool by
+// moving the paid amount to the gateway-out clearing account. This keeps the
+// ledger internally balanced without double-crediting the winner.
+//
+// Idempotent (deterministic TPAYOUT_<id> sourceId) and capped at the pool's
+// actual balance so it can never drive the account negative. No-op when
+// FEATURE_PAYMENTS_V2 is off (no ledger to draw down).
+export async function drawDownTournamentPrizePool({
+  tournamentId,
+  amountMinor,
+  currency = "GBP",
+  trigger = "tournament_payout",
+}) {
+  if (!paymentsEnabled()) return { drawn: false, reason: "payments_disabled" };
+
+  const amt = normalizeMinor(amountMinor);
+  if (amt <= 0) return { drawn: false, reason: "zero_amount" };
+
+  const poolAccountId = `PRIZE_TOURN_${cleanString(tournamentId)}`;
+  const sourceId = upper(`TPAYOUT_${cleanString(tournamentId)}`);
+  const cur = upper(currency, "GBP");
+
+  // Idempotency: don't draw down twice for the same tournament.
+  const existing = await LedgerEntry.find({
+    sourceType: "PAYOUT",
+    sourceId,
+    status: "POSTED",
+  })
+    .select({ _id: 1 })
+    .lean();
+  if (existing.length > 0) {
+    return { drawn: true, reused: true, sourceId };
+  }
+
+  // Cap at the pool's actual balance so we never overdraw it negative.
+  const poolBalance = await getLedgerAccountBalanceMinor({
+    accountType: "PRIZE_POOL",
+    accountId: poolAccountId,
+    currency: cur,
+  });
+  const drawAmt = Math.min(amt, Math.max(0, poolBalance));
+  if (drawAmt <= 0) return { drawn: false, reason: "empty_pool", poolBalance };
+
+  await postBalancedLedgerEntries({
+    currency: cur,
+    sourceType: "PAYOUT",
+    sourceId,
+    metadata: {
+      operation: "TOURNAMENT_PRIZE_DRAWDOWN",
+      tournamentId: cleanString(tournamentId),
+      trigger,
+    },
+    lines: [
+      {
+        direction: "DEBIT",
+        accountType: "PRIZE_POOL",
+        accountId: poolAccountId,
+        amountMinor: drawAmt,
+      },
+      {
+        direction: "CREDIT",
+        accountType: "SYSTEM_ADJUSTMENT",
+        accountId: "EXTERNAL_GATEWAY_OUT",
+        amountMinor: drawAmt,
+      },
+    ],
+  });
+
+  return { drawn: true, reused: false, sourceId, amountMinor: drawAmt };
 }
 
 
@@ -1783,6 +1994,44 @@ export async function createWalletHold(req, res) {
       currency,
     });
 
+    // Phase C2: the balance check above and the debit are not a single atomic
+    // op, so a concurrent hold could race us below zero. Detect that here
+    // (act-then-verify) and compensate: reverse the debit and drop the hold so
+    // the wallet can never be left negative.
+    if (nextWalletBalanceMinor < 0) {
+      await postBalancedLedgerEntries({
+        currency,
+        sourceType: "HOLD",
+        sourceId: `${hold.holdId}_RACE_REVERSAL`,
+        metadata: { operation: "WALLET_HOLD_RACE_REVERSAL", reason },
+        lines: [
+          {
+            direction: "CREDIT",
+            accountType: "USER_WALLET",
+            accountId: walletAccountId(userId),
+            amountMinor,
+          },
+          {
+            direction: "DEBIT",
+            accountType: "HOLD_BALANCE",
+            accountId: hold.holdId,
+            amountMinor,
+          },
+        ],
+      }).catch(() => {});
+      await WalletHold.deleteOne({ _id: hold._id }).catch(() => {});
+      return res.status(409).json({
+        ok: false,
+        code: "INSUFFICIENT_WALLET_BALANCE_RACE",
+        message:
+          "Wallet balance was insufficient due to a concurrent operation. Please retry.",
+        wallet: {
+          currency,
+          balanceMinor: nextWalletBalanceMinor + amountMinor,
+        },
+      });
+    }
+
     return res.status(201).json({
       ok: true,
       hold: holdResponse(hold),
@@ -1872,38 +2121,87 @@ export async function captureWalletHold(req, res) {
       });
     }
 
-    await postBalancedLedgerEntries({
-      currency: hold.currency,
-      sourceType: "HOLD",
-      sourceId: hold.holdId,
-      metadata: {
-        operation: "WALLET_HOLD_CAPTURE",
+    // Atomically claim the hold (HELD -> CAPTURED) so two concurrent capture
+    // (or capture+release) calls cannot both post ledger entries and
+    // double-spend the held funds. The compare-and-set on `status` is the
+    // single point of serialization.
+    const now = new Date();
+    const claimed = await WalletHold.findOneAndUpdate(
+      { _id: hold._id, status: "HELD" },
+      {
+        $set: {
+          status: "CAPTURED",
+          targetAccountType,
+          targetAccountId,
+          capturedAt: now,
+        },
+        $push: {
+          statusTimeline: {
+            status: "CAPTURED",
+            at: now,
+            note: "Hold captured to target account",
+            actor: "api",
+          },
+        },
       },
-      lines: [
-        {
-          direction: "DEBIT",
-          accountType: "HOLD_BALANCE",
-          accountId: hold.holdId,
-          amountMinor: Number(hold.amountMinor || 0),
-        },
-        {
-          direction: "CREDIT",
-          accountType: targetAccountType,
-          accountId: targetAccountId,
-          amountMinor: Number(hold.amountMinor || 0),
-        },
-      ],
-    });
+      { new: true }
+    );
 
-    hold.targetAccountType = targetAccountType;
-    hold.targetAccountId = targetAccountId;
-    hold.capturedAt = new Date();
-    appendHoldTimeline(hold, "CAPTURED", "Hold captured to target account", "api");
-    await hold.save();
+    if (!claimed) {
+      const fresh = await findOwnedWalletHold(req, req.params.holdId);
+      return res.status(409).json({
+        ok: false,
+        code: "HOLD_NOT_ACTIVE",
+        message: "This hold is no longer active.",
+        hold: fresh ? holdResponse(fresh) : undefined,
+      });
+    }
+
+    try {
+      await postBalancedLedgerEntries({
+        currency: claimed.currency,
+        sourceType: "HOLD",
+        sourceId: claimed.holdId,
+        metadata: {
+          operation: "WALLET_HOLD_CAPTURE",
+        },
+        lines: [
+          {
+            direction: "DEBIT",
+            accountType: "HOLD_BALANCE",
+            accountId: claimed.holdId,
+            amountMinor: Number(claimed.amountMinor || 0),
+          },
+          {
+            direction: "CREDIT",
+            accountType: targetAccountType,
+            accountId: targetAccountId,
+            amountMinor: Number(claimed.amountMinor || 0),
+          },
+        ],
+      });
+    } catch (postErr) {
+      // Compensating action: release the claim so the hold can be retried.
+      await WalletHold.updateOne(
+        { _id: claimed._id, status: "CAPTURED" },
+        {
+          $set: { status: "HELD", capturedAt: null },
+          $push: {
+            statusTimeline: {
+              status: "HELD",
+              at: new Date(),
+              note: "Capture reverted after ledger failure",
+              actor: "system",
+            },
+          },
+        }
+      );
+      throw postErr;
+    }
 
     return res.json({
       ok: true,
-      hold: holdResponse(hold),
+      hold: holdResponse(claimed),
     });
   } catch (e) {
     return res.status(500).json({
@@ -1934,44 +2232,88 @@ export async function releaseWalletHold(req, res) {
     }
 
     const userId = requestUserId(req);
-    await postBalancedLedgerEntries({
-      currency: hold.currency,
-      sourceType: "HOLD",
-      sourceId: hold.holdId,
-      metadata: {
-        operation: "WALLET_HOLD_RELEASE",
-      },
-      lines: [
-        {
-          direction: "DEBIT",
-          accountType: "HOLD_BALANCE",
-          accountId: hold.holdId,
-          amountMinor: Number(hold.amountMinor || 0),
-        },
-        {
-          direction: "CREDIT",
-          accountType: "USER_WALLET",
-          accountId: walletAccountId(userId),
-          amountMinor: Number(hold.amountMinor || 0),
-        },
-      ],
-    });
 
-    hold.releasedAt = new Date();
-    appendHoldTimeline(hold, "RELEASED", "Hold released back to wallet", "api");
-    await hold.save();
+    // Atomically claim the hold (HELD -> RELEASED) so it cannot be released
+    // twice, or released and captured concurrently.
+    const now = new Date();
+    const claimed = await WalletHold.findOneAndUpdate(
+      { _id: hold._id, status: "HELD" },
+      {
+        $set: { status: "RELEASED", releasedAt: now },
+        $push: {
+          statusTimeline: {
+            status: "RELEASED",
+            at: now,
+            note: "Hold released back to wallet",
+            actor: "api",
+          },
+        },
+      },
+      { new: true }
+    );
+
+    if (!claimed) {
+      const fresh = await findOwnedWalletHold(req, req.params.holdId);
+      return res.status(409).json({
+        ok: false,
+        code: "HOLD_NOT_ACTIVE",
+        message: "This hold is no longer active.",
+        hold: fresh ? holdResponse(fresh) : undefined,
+      });
+    }
+
+    try {
+      await postBalancedLedgerEntries({
+        currency: claimed.currency,
+        sourceType: "HOLD",
+        sourceId: claimed.holdId,
+        metadata: {
+          operation: "WALLET_HOLD_RELEASE",
+        },
+        lines: [
+          {
+            direction: "DEBIT",
+            accountType: "HOLD_BALANCE",
+            accountId: claimed.holdId,
+            amountMinor: Number(claimed.amountMinor || 0),
+          },
+          {
+            direction: "CREDIT",
+            accountType: "USER_WALLET",
+            accountId: walletAccountId(userId),
+            amountMinor: Number(claimed.amountMinor || 0),
+          },
+        ],
+      });
+    } catch (postErr) {
+      await WalletHold.updateOne(
+        { _id: claimed._id, status: "RELEASED" },
+        {
+          $set: { status: "HELD", releasedAt: null },
+          $push: {
+            statusTimeline: {
+              status: "HELD",
+              at: new Date(),
+              note: "Release reverted after ledger failure",
+              actor: "system",
+            },
+          },
+        }
+      );
+      throw postErr;
+    }
 
     const walletBalanceMinor = await getLedgerAccountBalanceMinor({
       accountType: "USER_WALLET",
       accountId: walletAccountId(userId),
-      currency: hold.currency,
+      currency: claimed.currency,
     });
 
     return res.json({
       ok: true,
-      hold: holdResponse(hold),
+      hold: holdResponse(claimed),
       wallet: {
-        currency: upper(hold.currency || "GBP"),
+        currency: upper(claimed.currency || "GBP"),
         balanceMinor: walletBalanceMinor,
       },
     });
@@ -1988,6 +2330,10 @@ export async function createWalletRefund(req, res) {
     if (!paymentsEnabled()) {
       return serviceUnavailable(res);
     }
+
+    // Refunds credit a user's wallet from a platform/system source. This is a
+    // privileged settlement operation and must not be self-service.
+    if (!ensureWalletAdmin(req, res)) return;
 
     const userId = requestUserId(req);
     if (!userId) {
@@ -2016,7 +2362,20 @@ export async function createWalletRefund(req, res) {
       });
     }
 
-    if (sourceAccountType !== "SYSTEM_ADJUSTMENT") {
+    if (sourceAccountType === "SYSTEM_ADJUSTMENT") {
+      // SYSTEM_ADJUSTMENT is the external-gateway bridge account; debiting it
+      // mints wallet credit (e.g. a genuine card-network refund). This is no
+      // longer skipped silently — it must be requested explicitly so it cannot
+      // happen by accident or via a default/guessed source.
+      if (req.body?.allowSystemAdjustment !== true) {
+        return res.status(400).json({
+          ok: false,
+          code: "SYSTEM_ADJUSTMENT_NOT_ALLOWED",
+          message:
+            "Refunding from SYSTEM_ADJUSTMENT requires allowSystemAdjustment=true.",
+        });
+      }
+    } else {
       const sourceBalanceMinor = await getLedgerAccountBalanceMinor({
         accountType: sourceAccountType,
         accountId: sourceAccountId,
@@ -2251,6 +2610,10 @@ export async function completeWalletWithdrawal(req, res) {
       return serviceUnavailable(res);
     }
 
+    // Marking a payout as PAID releases real money out of the platform. This
+    // is an administrator/back-office action, never self-service.
+    if (!ensureWalletAdmin(req, res)) return;
+
     const payout = await findOwnedPayout(req, req.params.payoutId);
     if (!payout) {
       return res.status(404).json({ ok: false, message: "Withdrawal not found" });
@@ -2300,6 +2663,26 @@ export async function completeWalletWithdrawal(req, res) {
       });
     }
 
+    // Atomically claim the payout (settlable -> PROCESSING) so two concurrent
+    // completions cannot both post the payout ledger and double-pay.
+    const claimedPayout = await Payout.findOneAndUpdate(
+      {
+        _id: payout._id,
+        status: { $in: ["REQUESTED", "PENDING_REVIEW", "APPROVED", "PROCESSING"] },
+      },
+      { $set: { status: "PROCESSING" } },
+      { new: true }
+    );
+    if (!claimedPayout) {
+      const fresh = await findOwnedPayout(req, req.params.payoutId);
+      return res.status(409).json({
+        ok: false,
+        code: "WITHDRAWAL_NOT_SETTLABLE",
+        message: "This withdrawal is already being settled or is no longer settlable.",
+        payout: fresh ? payoutResponse(fresh) : undefined,
+      });
+    }
+
     const lines = [
       {
         direction: "DEBIT",
@@ -2323,23 +2706,32 @@ export async function completeWalletWithdrawal(req, res) {
       });
     }
 
-    await postBalancedLedgerEntries({
-      currency: payout.currency,
-      sourceType: "WITHDRAWAL",
-      sourceId: payout.payoutId,
-      metadata: {
-        operation: "WITHDRAWAL_COMPLETE",
-      },
-      lines,
-    });
+    try {
+      await postBalancedLedgerEntries({
+        currency: claimedPayout.currency,
+        sourceType: "WITHDRAWAL",
+        sourceId: claimedPayout.payoutId,
+        metadata: {
+          operation: "WITHDRAWAL_COMPLETE",
+        },
+        lines,
+      });
+    } catch (postErr) {
+      // Revert the claim to the original status so it can be retried.
+      await Payout.updateOne(
+        { _id: claimedPayout._id, status: "PROCESSING" },
+        { $set: { status } }
+      );
+      throw postErr;
+    }
 
-    payout.status = "PAID";
-    payout.processedAt = new Date();
-    payout.providerReference = cleanString(
+    claimedPayout.status = "PAID";
+    claimedPayout.processedAt = new Date();
+    claimedPayout.providerReference = cleanString(
       req.body?.providerReference || `MOCK_PAYOUT_${Date.now()}`
     );
-    payout.statusTimeline = [
-      ...(Array.isArray(payout.statusTimeline) ? payout.statusTimeline : []),
+    claimedPayout.statusTimeline = [
+      ...(Array.isArray(claimedPayout.statusTimeline) ? claimedPayout.statusTimeline : []),
       {
         status: "PAID",
         at: new Date(),
@@ -2347,11 +2739,11 @@ export async function completeWalletWithdrawal(req, res) {
         actor: "api",
       },
     ];
-    await payout.save();
+    await claimedPayout.save();
 
     return res.json({
       ok: true,
-      payout: payoutResponse(payout),
+      payout: payoutResponse(claimedPayout),
     });
   } catch (e) {
     return res.status(500).json({
@@ -2384,70 +2776,105 @@ export async function failWalletWithdrawal(req, res) {
       });
     }
 
-    const metadata =
-      payout.metadata && typeof payout.metadata === "object"
-        ? { ...payout.metadata }
-        : {};
-    const holdAccountId = cleanString(metadata.holdAccountId || `WD_${payout.payoutId}`);
-    const holdBalanceMinor = await getLedgerAccountBalanceMinor({
-      accountType: "HOLD_BALANCE",
-      accountId: holdAccountId,
-      currency: payout.currency,
-    });
-    const releaseMinor = Math.max(0, Math.min(holdBalanceMinor, Number(payout.amountMinor || 0)));
-
-    if (releaseMinor > 0) {
-      await postBalancedLedgerEntries({
-        currency: payout.currency,
-        sourceType: "WITHDRAWAL",
-        sourceId: payout.payoutId,
-        metadata: {
-          operation: "WITHDRAWAL_REVERT",
-        },
-        lines: [
-          {
-            direction: "DEBIT",
-            accountType: "HOLD_BALANCE",
-            accountId: holdAccountId,
-            amountMinor: releaseMinor,
-          },
-          {
-            direction: "CREDIT",
-            accountType: "USER_WALLET",
-            accountId: walletAccountId(requestUserId(req)),
-            amountMinor: releaseMinor,
-          },
-        ],
+    // Atomically claim the payout so the hold-to-wallet revert below cannot be
+    // applied twice (which would double-credit the wallet).
+    const claimedPayout = await Payout.findOneAndUpdate(
+      {
+        _id: payout._id,
+        status: { $in: ["REQUESTED", "PENDING_REVIEW", "APPROVED", "PROCESSING"] },
+      },
+      { $set: { status: "PROCESSING" } },
+      { new: true }
+    );
+    if (!claimedPayout) {
+      const fresh = await findOwnedPayout(req, req.params.payoutId);
+      const freshStatus = upper(fresh?.status || "");
+      if (["FAILED", "CANCELLED", "REJECTED"].includes(freshStatus)) {
+        return res.json({ ok: true, reused: true, payout: payoutResponse(fresh) });
+      }
+      return res.status(409).json({
+        ok: false,
+        code: "WITHDRAWAL_NOT_FAILABLE",
+        message: "This withdrawal is already being settled or is no longer failable.",
+        payout: fresh ? payoutResponse(fresh) : undefined,
       });
     }
 
+    const metadata =
+      claimedPayout.metadata && typeof claimedPayout.metadata === "object"
+        ? { ...claimedPayout.metadata }
+        : {};
+    const holdAccountId = cleanString(metadata.holdAccountId || `WD_${claimedPayout.payoutId}`);
+    const holdBalanceMinor = await getLedgerAccountBalanceMinor({
+      accountType: "HOLD_BALANCE",
+      accountId: holdAccountId,
+      currency: claimedPayout.currency,
+    });
+    const releaseMinor = Math.max(
+      0,
+      Math.min(holdBalanceMinor, Number(claimedPayout.amountMinor || 0))
+    );
+
+    try {
+      if (releaseMinor > 0) {
+        await postBalancedLedgerEntries({
+          currency: claimedPayout.currency,
+          sourceType: "WITHDRAWAL",
+          sourceId: claimedPayout.payoutId,
+          metadata: {
+            operation: "WITHDRAWAL_REVERT",
+          },
+          lines: [
+            {
+              direction: "DEBIT",
+              accountType: "HOLD_BALANCE",
+              accountId: holdAccountId,
+              amountMinor: releaseMinor,
+            },
+            {
+              direction: "CREDIT",
+              accountType: "USER_WALLET",
+              accountId: walletAccountId(requestUserId(req)),
+              amountMinor: releaseMinor,
+            },
+          ],
+        });
+      }
+    } catch (postErr) {
+      await Payout.updateOne(
+        { _id: claimedPayout._id, status: "PROCESSING" },
+        { $set: { status: currentStatus } }
+      );
+      throw postErr;
+    }
+
     const failedStatus = upper(req.body?.status || "FAILED");
-    payout.status = ["FAILED", "CANCELLED", "REJECTED"].includes(failedStatus)
+    claimedPayout.status = ["FAILED", "CANCELLED", "REJECTED"].includes(failedStatus)
       ? failedStatus
       : "FAILED";
-    payout.processedAt = new Date();
-    payout.statusTimeline = [
-      ...(Array.isArray(payout.statusTimeline) ? payout.statusTimeline : []),
+    claimedPayout.processedAt = new Date();
+    claimedPayout.statusTimeline = [
+      ...(Array.isArray(claimedPayout.statusTimeline) ? claimedPayout.statusTimeline : []),
       {
-        status: payout.status,
+        status: claimedPayout.status,
         at: new Date(),
         note: cleanString(req.body?.reason || "Withdrawal reverted to wallet"),
         actor: "api",
       },
     ];
-    await payout.save();
+    await claimedPayout.save();
 
     const walletBalanceMinor = await getLedgerAccountBalanceMinor({
       accountType: "USER_WALLET",
       accountId: walletAccountId(requestUserId(req)),
-      currency: payout.currency,
+      currency: claimedPayout.currency,
     });
 
     return res.json({
       ok: true,
-      payout: payoutResponse(payout),
+      payout: payoutResponse(claimedPayout),
       wallet: {
-        currency: upper(payout.currency || "GBP"),
+        currency: upper(claimedPayout.currency || "GBP"),
         balanceMinor: walletBalanceMinor,
       },
     });
@@ -2673,6 +3100,17 @@ export async function myLedgerSummary(req, res) {
 export async function ingestWebhookEvent(req, res) {
   try {
     const provider = upper(req.params.provider || "UNKNOWN");
+
+    // Phase C: reject webhooks from unknown providers before doing any work.
+    if (!isKnownWebhookProvider(provider)) {
+      return res.status(400).json({
+        ok: false,
+        code: "UNKNOWN_WEBHOOK_PROVIDER",
+        message: "Unknown webhook provider.",
+        provider,
+      });
+    }
+
     const payload = req.body && typeof req.body === "object" ? req.body : {};
 
     const providerEventId = cleanString(
@@ -2766,6 +3204,12 @@ export async function ingestWebhookEvent(req, res) {
       provider,
       payload,
       signature,
+      rawBody:
+        typeof req.rawBody === "string"
+          ? req.rawBody
+          : Buffer.isBuffer(req.rawBody)
+          ? req.rawBody.toString("utf8")
+          : "",
     });
 
     if (!signatureCheck.verified) {

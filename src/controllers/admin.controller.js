@@ -3,6 +3,25 @@ import Club from "../models/club.model.js";
 import StoreItem from "../models/storeItem.model.js";
 import StoreOrder from "../models/storeOrder.model.js";
 import Tournament from "../models/tournament.model.js";
+import LedgerEntry from "../models/ledgerEntry.model.js";
+import DisputeCase from "../models/disputeCase.model.js";
+import {
+  primaryRole,
+  hasPlatformAdminAccess,
+  isAssignableRole,
+  assignableRoles,
+} from "../utils/authz.js";
+import {
+  summarizeLedgerByAccountType,
+  platformFinanceFromLedger,
+  countByKey,
+} from "../utils/ledgerSummary.js";
+import {
+  availableBalanceToMinor,
+  classifyWalletDelta,
+  summarizeReconciliation,
+  isReconciliationSafeToBackfill,
+} from "../utils/walletReconciliation.js";
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
@@ -16,31 +35,14 @@ function normalizeSku(v) {
   return cleanString(v).toUpperCase();
 }
 
+// Kept for response compatibility (was `roleFromUser`).
 function roleFromUser(user) {
-  const candidates = [
-    user?.role,
-    user?.userType,
-    user?.accountType,
-    user?.profile?.role,
-    user?.profile?.userType,
-    user?.profile?.type,
-  ];
-
-  for (const c of candidates) {
-    const s = cleanString(c).toLowerCase();
-    if (s) return s;
-  }
-  return "";
+  return primaryRole(user);
 }
 
+// Effective platform-admin decision (honours AUTHZ_STRICT_ADMIN flag).
 function isAdminUser(user) {
-  const role = roleFromUser(user);
-  return (
-    role.includes("admin") ||
-    role.includes("organizer") ||
-    role.includes("club") ||
-    role.includes("venue")
-  );
+  return hasPlatformAdminAccess(user);
 }
 
 // --------------------------------------------------
@@ -150,6 +152,17 @@ export async function updateUserRole(req, res) {
       return res.status(400).json({
         ok: false,
         message: "userId and role are required",
+      });
+    }
+
+    // Prevent privilege creep: the role-update endpoint may only assign roles
+    // from a safe allow-list. Platform-admin roles cannot be granted here.
+    if (!isAssignableRole(role)) {
+      return res.status(400).json({
+        ok: false,
+        code: "ROLE_NOT_ASSIGNABLE",
+        message: `Role '${role}' cannot be assigned via this endpoint.`,
+        allowedRoles: assignableRoles(),
       });
     }
 
@@ -671,6 +684,138 @@ export async function dashboardStats(req, res) {
     return res.status(500).json({
       ok: false,
       message: e.message || "Failed to load dashboard stats",
+    });
+  }
+}
+
+// --------------------------------------------------
+// PLATFORM FINANCIAL OVERVIEW (Phase D)
+// GET /admin/overview
+// Counts + ledger-derived money totals by account type. Extends the
+// counts-only /admin/stats without changing it.
+// --------------------------------------------------
+export async function platformOverview(req, res) {
+  try {
+    const currency = cleanString(req.query.currency || "GBP").toUpperCase() || "GBP";
+
+    const [
+      usersCount,
+      clubsCount,
+      tournamentsByStatus,
+      disputesByStatus,
+      ledgerRows,
+    ] = await Promise.all([
+      User.countDocuments({}),
+      Club.countDocuments({}),
+      Tournament.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+      DisputeCase.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+      LedgerEntry.aggregate([
+        { $match: { status: "POSTED", currency } },
+        {
+          $group: {
+            _id: "$accountType",
+            debitMinor: {
+              $sum: { $cond: [{ $eq: ["$direction", "DEBIT"] }, "$amountMinor", 0] },
+            },
+            creditMinor: {
+              $sum: { $cond: [{ $eq: ["$direction", "CREDIT"] }, "$amountMinor", 0] },
+            },
+          },
+        },
+      ]),
+    ]);
+
+    const ledgerByType = summarizeLedgerByAccountType(ledgerRows);
+    const finance = platformFinanceFromLedger(ledgerByType);
+    const tournaments = countByKey(tournamentsByStatus);
+    const disputes = countByKey(disputesByStatus);
+
+    return res.json({
+      ok: true,
+      overview: {
+        currency,
+        counts: {
+          users: usersCount,
+          clubs: clubsCount,
+          tournaments: tournaments.total,
+          tournamentsByStatus: tournaments.byStatus,
+          disputes: disputes.total,
+          disputesByStatus: disputes.byStatus,
+        },
+        finance,
+        ledgerByType,
+        generatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to load platform overview",
+    });
+  }
+}
+
+// --------------------------------------------------
+// WALLET RECONCILIATION (U0 of ledger↔earnings unification)
+// --------------------------------------------------
+//
+// READ-ONLY. Per user, compares cached spendable balance
+// (earnings.availableBalance, MAJOR units) vs the authoritative USER_WALLET
+// ledger balance (MINOR units) and classifies the delta. Drives the U3 backfill
+// and gives a go/no-go signal. Makes no writes.
+//
+//   GET /api/admin/wallet-reconciliation?currency=GBP&onlyFlagged=true&limit=200
+export async function walletReconciliation(req, res) {
+  try {
+    const currency = cleanString(req.query.currency || "GBP").toUpperCase() || "GBP";
+    const onlyFlagged = cleanString(req.query.onlyFlagged) === "true";
+    const limit = Math.min(1000, Math.max(1, Number(req.query.limit || 200)));
+
+    const [ledgerRows, users] = await Promise.all([
+      LedgerEntry.aggregate([
+        { $match: { accountType: "USER_WALLET", currency, status: "POSTED" } },
+        {
+          $group: {
+            _id: "$accountId",
+            debitMinor: { $sum: { $cond: [{ $eq: ["$direction", "DEBIT"] }, "$amountMinor", 0] } },
+            creditMinor: { $sum: { $cond: [{ $eq: ["$direction", "CREDIT"] }, "$amountMinor", 0] } },
+          },
+        },
+      ]),
+      User.find({}, { username: 1, "earnings.availableBalance": 1 }).lean(),
+    ]);
+
+    const ledgerByUser = new Map();
+    for (const r of ledgerRows) {
+      ledgerByUser.set(String(r._id), Number(r.creditMinor || 0) - Number(r.debitMinor || 0));
+    }
+
+    const rows = users.map((u) => {
+      const userId = String(u._id);
+      const availableMinor = availableBalanceToMinor(u?.earnings?.availableBalance);
+      const ledgerMinor = ledgerByUser.get(userId) || 0;
+      const { status, deltaMinor } = classifyWalletDelta({ availableMinor, ledgerMinor });
+      return { userId, username: cleanString(u?.username), availableMinor, ledgerMinor, status, deltaMinor };
+    });
+
+    const summary = summarizeReconciliation(rows);
+    const visible = (onlyFlagged ? rows.filter((r) => r.status !== "IN_SYNC") : rows).slice(0, limit);
+
+    return res.json({
+      ok: true,
+      reconciliation: {
+        currency,
+        summary,
+        safeToBackfill: isReconciliationSafeToBackfill(summary),
+        rows: visible,
+        truncated: (onlyFlagged ? rows.filter((r) => r.status !== "IN_SYNC").length : rows.length) > visible.length,
+        generatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to reconcile wallets",
     });
   }
 }

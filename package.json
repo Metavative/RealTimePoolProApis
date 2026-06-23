@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "node ./test/run-tests.js",
+    "test:integration": "node ./test/integration.test.js",
     "dev": "nodemon ./src/index.js"
   },
   "repository": {

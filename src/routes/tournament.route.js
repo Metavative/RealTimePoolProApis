@@ -1,9 +1,16 @@
 // src/routes/tournament.routes.js
 import express from "express";
 import { clubAuthMiddleware } from "../middleware/clubAuthMiddleware.js";
+import { authAny } from "../middleware/authAny.middleware.js";
 import * as c from "../controllers/tournamentController.js";
+import { discoverTournaments } from "../controllers/tournamentInvite.controller.js";
 
 const router = express.Router();
+
+// ✅ Phase B: Player-facing discovery of OPEN, joinable tournaments.
+// MUST be declared before "/:id" so it isn't captured by the club-only getOne.
+// Uses player (authAny) auth, not club auth.
+router.get("/discover", authAny, discoverTournaments);
 
 // list tournaments for this club
 router.get("/", clubAuthMiddleware, c.listMine);
@@ -46,5 +53,9 @@ router.delete("/:id/playoffs", clubAuthMiddleware, c.clearPlayoffs);
 // ✅ Start
 router.post("/:id/start", clubAuthMiddleware, c.startTournament);
 router.post("/:id/complete", clubAuthMiddleware, c.completeTournament);
+
+// ✅ Phase B money sub-phase: distribute prize pool (manual/retry).
+// Idempotent + feature-gated (FEATURE_TOURNAMENT_PAYOUTS).
+router.post("/:id/prizes/settle", clubAuthMiddleware, c.settlePrizes);
 
 export default router;

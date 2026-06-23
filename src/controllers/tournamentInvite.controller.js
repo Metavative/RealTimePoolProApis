@@ -1,6 +1,7 @@
 // src/controllers/tournamentInvite.controller.js
 import Tournament from "../models/tournament.model.js";
 import TournamentInvite from "../models/tournamentInvite.model.js";
+import TournamentEntryOrder from "../models/tournamentEntryOrder.model.js";
 import User from "../models/user.model.js";
 
 // -------------------------
@@ -271,7 +272,7 @@ export async function joinTournamentOpen(req, res) {
     if (!tournamentId) return res.status(400).json({ message: "tournamentId is required" });
 
     const tournament = await Tournament.findById(tournamentId).select(
-      "entriesStatus formatStatus status accessMode entrants"
+      "entriesStatus formatStatus status accessMode entrants maxPlayers"
     );
 
     if (!tournament) return res.status(404).json({ message: "Tournament not found" });
@@ -292,26 +293,66 @@ export async function joinTournamentOpen(req, res) {
       return res.status(200).json({ ok: true, alreadyJoined: true });
     }
 
+    // Optional capacity cap (0 = unlimited). Soft pre-check for a clear message;
+    // the authoritative guard is the atomic $expr filter below (race-safe).
+    const cap = Math.max(0, Number(tournament.maxPlayers || 0));
+    const currentCount = Array.isArray(tournament.entrants)
+      ? tournament.entrants.length
+      : 0;
+    if (cap > 0 && currentCount >= cap) {
+      return res.status(409).json({
+        ok: false,
+        code: "TOURNAMENT_FULL",
+        message: "This tournament is full.",
+        maxPlayers: cap,
+        entrantCount: currentCount,
+      });
+    }
+
     const displayName = bestUserDisplayName(req.user);
     const pk = resolveParticipantKeyForUser(req, req.userId);
 
-    await Tournament.updateOne(
-      { _id: tournamentId, "entrants.entrantId": { $ne: req.userId } },
-      {
-        $push: {
-          entrants: {
-            entrantId: req.userId,
-            name: displayName,
-            participantKey: pk,
-            username: safeUsername(req.user),
-            userId: userId,
-            isLocal: false,
-            rating: 0,
-            seed: 0,
-          },
+    // Atomic claim: only push if the user is not already an entrant AND (when a
+    // cap is set) the roster still has room. Prevents double-entry and
+    // over-capacity races without a transaction.
+    const filter = { _id: tournamentId, "entrants.entrantId": { $ne: req.userId } };
+    if (cap > 0) {
+      filter.$expr = { $lt: [{ $size: { $ifNull: ["$entrants", []] } }, cap] };
+    }
+
+    const result = await Tournament.updateOne(filter, {
+      $push: {
+        entrants: {
+          entrantId: req.userId,
+          name: displayName,
+          participantKey: pk,
+          username: safeUsername(req.user),
+          userId: userId,
+          isLocal: false,
+          rating: 0,
+          seed: 0,
         },
+      },
+    });
+
+    if (!result.modifiedCount) {
+      // The atomic filter rejected the write — re-read to report the exact cause.
+      const fresh = await Tournament.findById(tournamentId)
+        .select("entrants maxPlayers")
+        .lean();
+      const freshEntrants = Array.isArray(fresh?.entrants) ? fresh.entrants : [];
+      const nowJoined = freshEntrants.some((e) => String(e.entrantId) === userId);
+      if (nowJoined) {
+        return res.status(200).json({ ok: true, alreadyJoined: true });
       }
-    );
+      return res.status(409).json({
+        ok: false,
+        code: "TOURNAMENT_FULL",
+        message: "This tournament is full.",
+        maxPlayers: cap,
+        entrantCount: freshEntrants.length,
+      });
+    }
 
     return res.status(200).json({
       ok: true,
@@ -320,6 +361,188 @@ export async function joinTournamentOpen(req, res) {
     });
   } catch (e) {
     return res.status(500).json({ message: e?.message || "Failed to join tournament" });
+  }
+}
+
+// Pure mapper for a discovery row → client view. Exported for unit testing.
+// `viewerId` is the requesting user's id (string) used to compute alreadyJoined.
+export function buildDiscoveryView(t = {}, viewerId = "") {
+  const entrants = Array.isArray(t.entrants) ? t.entrants : [];
+  const entrantCount = entrants.length;
+  const cap = Math.max(0, Number(t.maxPlayers || 0));
+  const isFull = cap > 0 && entrantCount >= cap;
+  const vid = String(viewerId || "");
+  const alreadyJoined = vid
+    ? entrants.some((e) => String(e.entrantId) === vid)
+    : false;
+  const economy = t.economy || {};
+  const feeEnabled = !!economy.enabled;
+
+  return {
+    id: String(t._id),
+    title: t.title || "",
+    format: t.format || "",
+    status: t.status || "DRAFT",
+    accessMode: t.accessMode || "INVITE_ONLY",
+    entriesStatus: t.entriesStatus || "OPEN",
+    clubId: t.clubId ? String(t.clubId) : null,
+    entrantCount,
+    maxPlayers: cap,
+    isFull,
+    alreadyJoined,
+    joinable: !isFull && !alreadyJoined,
+    entryFee: feeEnabled
+      ? {
+          enabled: true,
+          currency: economy.currency || "GBP",
+          amountMinor: Number(economy.entryFeeMinor || 0),
+        }
+      : { enabled: false },
+    createdAt: t.createdAt,
+  };
+}
+
+/**
+ * GET /api/tournaments/discover
+ * user or playable venue-owner
+ * Player-facing discovery of OPEN, joinable tournaments. Additive — does not
+ * touch the club-only listing (listMine). Read-only.
+ *
+ * Query: q (title search), format, hasFee ("true"/"false"), page, limit
+ */
+export async function discoverTournaments(req, res) {
+  try {
+    if (!requirePlayableUser(req, res)) return;
+
+    const q = req.query || {};
+
+    // Joinable = self-join allowed: OPEN access, entries OPEN, not yet started,
+    // and format not finalised (roster still mutable).
+    const criteria = {
+      accessMode: "OPEN",
+      entriesStatus: "OPEN",
+      status: { $nin: ["ACTIVE", "LIVE", "COMPLETED"] },
+      formatStatus: { $ne: "FINALISED" },
+    };
+
+    const search = String(q.q || q.search || "").trim();
+    if (search) {
+      criteria.title = { $regex: escapeRegExp(search), $options: "i" };
+    }
+
+    const format = String(q.format || "").trim().toLowerCase();
+    if (format) criteria.format = format;
+
+    const hasFee = String(q.hasFee ?? "").trim().toLowerCase();
+    if (hasFee === "true") criteria["economy.enabled"] = true;
+    else if (hasFee === "false") criteria["economy.enabled"] = { $ne: true };
+
+    const limitRaw = Number(q.limit || 50);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(100, Math.round(limitRaw)))
+      : 50;
+    const pageRaw = Number(q.page || 1);
+    const page = Number.isFinite(pageRaw) ? Math.max(1, Math.round(pageRaw)) : 1;
+    const skip = (page - 1) * limit;
+
+    const [rows, total] = await Promise.all([
+      Tournament.find(criteria)
+        .select(
+          "title format status accessMode entriesStatus formatStatus maxPlayers entrants economy clubId createdAt"
+        )
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Tournament.countDocuments(criteria),
+    ]);
+
+    const viewerId = String(req.userId || "");
+    const data = rows.map((t) => buildDiscoveryView(t, viewerId));
+
+    return res.status(200).json({
+      data,
+      meta: {
+        page,
+        limit,
+        total,
+        hasMore: skip + rows.length < total,
+      },
+    });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ message: e?.message || "Failed to load tournaments" });
+  }
+}
+
+/**
+ * POST /api/tournaments/:tournamentId/leave
+ * user or playable venue-owner
+ * Safe self-withdrawal: allowed only while the roster is still mutable
+ * (entries open, not started, not finalised) AND the player has NOT paid an
+ * entry fee. Paid withdrawals require an organiser refund and are out of scope
+ * here (Phase C money flows) — we refuse rather than silently strand money.
+ */
+export async function leaveTournamentOpen(req, res) {
+  try {
+    if (!requirePlayableUser(req, res)) return;
+
+    const { tournamentId } = req.params;
+    if (!tournamentId)
+      return res.status(400).json({ message: "tournamentId is required" });
+
+    const tournament = await Tournament.findById(tournamentId).select(
+      "entriesStatus formatStatus status accessMode entrants"
+    );
+    if (!tournament)
+      return res.status(404).json({ message: "Tournament not found" });
+
+    const userId = String(req.userId);
+    const isEntrant = Array.isArray(tournament.entrants)
+      ? tournament.entrants.some((e) => String(e.entrantId) === userId)
+      : false;
+
+    if (!isEntrant) {
+      return res.status(200).json({ ok: true, alreadyLeft: true });
+    }
+
+    // Roster must still be mutable to self-leave (mirrors join gating).
+    if (!ensureRosterMutableOrRespond(res, tournament)) return;
+
+    // Block self-leave if the player paid an entry fee — money must be refunded
+    // by the organiser first (Phase C). This protects against losing track of
+    // captured funds.
+    const paidOrder = await TournamentEntryOrder.findOne({
+      tournamentId,
+      userId: req.userId,
+      status: "PAID",
+    })
+      .select("_id status")
+      .lean();
+
+    if (paidOrder) {
+      return res.status(409).json({
+        ok: false,
+        code: "ENTRY_FEE_PAID",
+        message:
+          "You have paid an entry fee. Please request a refund from the organiser to withdraw.",
+      });
+    }
+
+    const result = await Tournament.updateOne(
+      { _id: tournamentId },
+      { $pull: { entrants: { entrantId: req.userId } } }
+    );
+
+    return res.status(200).json({
+      ok: true,
+      left: result.modifiedCount > 0,
+    });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ message: e?.message || "Failed to leave tournament" });
   }
 }
 

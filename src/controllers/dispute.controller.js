@@ -5,6 +5,7 @@ import LevelMatchSession from "../models/levelMatchSession.model.js";
 import User from "../models/user.model.js";
 import Transaction from "../models/transaction.model.js";
 import LedgerEntry from "../models/ledgerEntry.model.js";
+import { requireTransactions } from "../utils/dbTransactions.js";
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
@@ -751,6 +752,7 @@ export async function escalateDispute(req, res) {
 }
 
 async function resolveDisputeInternal(req, res, { actorType = "USER" } = {}) {
+  if (!requireTransactions(res)) return;
   const caseId = upper(req.params.caseId);
   const row = await DisputeCase.findOne({ caseId });
   if (!row) return res.status(404).json({ ok: false, message: "Dispute case not found" });

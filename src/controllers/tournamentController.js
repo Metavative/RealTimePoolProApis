@@ -1,6 +1,10 @@
 // src/controllers/tournamentController.js
 import Tournament from "../models/tournament.model.js";
 import * as svc from "../services/tournament.service.js";
+import {
+  settleTournamentPrizes,
+  tournamentPayoutsEnabled,
+} from "../services/tournamentPayout.service.js";
 
 // -------------------------
 // response helpers
@@ -735,8 +739,61 @@ export async function completeTournament(req, res) {
 
     await t.save();
 
+    // Phase B money sub-phase: if prize payouts are enabled and this tournament
+    // has an economy, distribute the prize pool now. Best-effort and idempotent
+    // — a failure here must NOT fail completion; organisers can retry via the
+    // dedicated settle endpoint.
+    if (tournamentPayoutsEnabled() && t?.economy?.enabled) {
+      try {
+        const settlement = await settleTournamentPrizes(tid);
+        if (!settlement?.ok) {
+          console.warn(
+            `Prize settlement deferred for ${tid}: ${settlement?.code || "unknown"}`
+          );
+        }
+      } catch (e) {
+        console.error("Prize settlement error on complete:", e?.message || e);
+      }
+    }
+
     const out = await Tournament.findById(tid);
     return ok(res, out);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+// -------------------------
+// SETTLE PRIZES (manual / retry)
+// POST /:id/prizes/settle
+// -------------------------
+export async function settlePrizes(req, res) {
+  try {
+    const tid = String(req.params.id || "").trim();
+
+    const t = await Tournament.findById(tid);
+    if (!t) {
+      const err = new Error("Tournament not found");
+      err.statusCode = 404;
+      throw err;
+    }
+
+    assertSameClub(req, t);
+
+    if (!tournamentPayoutsEnabled()) {
+      return res.status(503).json({
+        ok: false,
+        code: "PAYOUTS_DISABLED",
+        message: "Tournament prize payouts are not enabled for this environment.",
+      });
+    }
+
+    const result = await settleTournamentPrizes(tid);
+    if (!result?.ok) {
+      const status = result?.code === "TOURNAMENT_NOT_COMPLETED" ? 409 : 400;
+      return res.status(status).json(result);
+    }
+    return res.json(result);
   } catch (e) {
     return fail(res, e);
   }

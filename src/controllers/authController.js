@@ -878,28 +878,54 @@ export async function verifyOtp(req, res) {
 }
 
 // =========================
-// forgot/reset password (email only)
+// forgot/reset password (email + phone)
 // =========================
 export async function forgotPassword(req, res) {
   try {
     const body = getBody(req);
     const lookup = pickEmailOrPhone(body);
     const email = lookup.email;
+    const phone = lookup.phone;
 
-    if (!email) return res.status(400).json({ message: "Password reset requires email for now" });
+    if (!email && !phone) {
+      return res.status(400).json({ message: "Email or phone required" });
+    }
 
-    const user = await User.findOne({ email });
+    if (phone && !isValidE164(phone)) {
+      return res
+        .status(400)
+        .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
+    }
+
+    const query = email ? { email } : { phone };
+    const user = await User.findOne(query);
     if (!user) return res.json({ message: "If the account exists, an OTP was sent" });
 
-    const code = otpToString(generateOtp(6));
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    if (isRateLimited(user.lastOtpSent, 60_000)) {
+      return res
+        .status(429)
+        .json({ message: "Please wait 60 seconds before requesting another code." });
+    }
 
-    user.otp = { code, expiresAt };
+    if (email) {
+      const code = otpToString(generateOtp(6));
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      user.otp = { code, expiresAt };
+      user.lastOtpSent = new Date();
+      user.lastOtpChannel = "email";
+      await user.save();
+
+      await sendOtpEmail(email, code);
+      return res.json({ message: "If the account exists, an OTP was sent" });
+    }
+
+    user.otp = undefined;
+    user.lastOtpSent = new Date();
+    user.lastOtpChannel = "phone";
     await user.save();
 
-    await sendOtpEmail(email, code);
-
-    return res.json({ message: "Reset OTP sent" });
+    await twilioSendVerifySms(phone);
+    return res.json({ message: "If the account exists, an OTP was sent" });
   } catch (error) {
     return res.status(500).json({ message: error?.message || "Internal server error" });
   }
@@ -908,27 +934,45 @@ export async function forgotPassword(req, res) {
 export async function resetPassword(req, res) {
   try {
     const body = getBody(req);
-    const email = normalizeEmail(body.email);
+    const lookup = pickEmailOrPhone(body);
+    const email = lookup.email;
+    const phone = lookup.phone;
     const otp = otpToString(body.otp || body.code);
     const newPassword = toStr(body.newPassword || body.password);
 
-    if (!email) return res.status(400).json({ message: "Email required" });
+    if (!email && !phone) return res.status(400).json({ message: "Email or phone required" });
     if (!otp || !newPassword) return res.status(400).json({ message: "otp and newPassword required" });
 
-    const user = await User.findOne({ email }).select("+passwordHash +password");
-    if (!user || !user.otp || !user.otp.code) return res.status(400).json({ message: "OTP not found" });
-
-    if (user.otp.expiresAt && user.otp.expiresAt.getTime() < Date.now()) {
-      return res.status(400).json({ message: "OTP expired" });
+    if (phone && !isValidE164(phone)) {
+      return res
+        .status(400)
+        .json({ message: "Phone must be in E.164 format, e.g. +447911123456" });
     }
 
-    const expected = otpToString(user.otp.code);
-    if (expected !== otp) return res.status(400).json({ message: "Invalid OTP" });
+    const query = email ? { email } : { phone };
+    const user = await User.findOne(query).select("+passwordHash +password");
+    if (!user) return res.status(400).json({ message: "Invalid or expired OTP" });
+
+    if (email) {
+      if (!user.otp || !user.otp.code) return res.status(400).json({ message: "Invalid or expired OTP" });
+
+      if (user.otp.expiresAt && user.otp.expiresAt.getTime() < Date.now()) {
+        return res.status(400).json({ message: "OTP expired" });
+      }
+
+      const expected = otpToString(user.otp.code);
+      if (expected !== otp) return res.status(400).json({ message: "Invalid OTP" });
+    } else {
+      const ok = await twilioCheckVerifyCode(phone, otp);
+      if (!ok) return res.status(400).json({ message: "Invalid OTP" });
+    }
 
     const hash = await bcrypt.hash(newPassword, 10);
     setPasswordOnUser(user, hash);
 
     user.otp = undefined;
+    user.lastOtpSent = null;
+    user.lastOtpChannel = null;
     await user.save();
 
     return res.json({ message: "Password reset" });

@@ -4,6 +4,8 @@ import { adminMiddleware } from "../middleware/adminMiddleware.js";
 import {
   me,
   dashboardStats,
+  platformOverview,
+  walletReconciliation,
 
   listUsers,
   getUser,
@@ -38,6 +40,8 @@ router.get("/me", adminMiddleware, me);
 // Dashboard stats
 // ------------------------------
 router.get("/stats", adminMiddleware, dashboardStats);
+router.get("/overview", adminMiddleware, platformOverview);
+router.get("/wallet-reconciliation", adminMiddleware, walletReconciliation);
 
 // ------------------------------
 // Users

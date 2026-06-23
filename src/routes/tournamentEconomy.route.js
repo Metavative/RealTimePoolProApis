@@ -6,6 +6,7 @@ import {
   getTournamentEconomySummary,
   createTournamentEntryIntent,
   syncTournamentEntryPayment,
+  refundTournamentEntry,
   myTournamentEntryOrders,
 } from "../controllers/tournamentEconomy.controller.js";
 
@@ -26,6 +27,8 @@ router.get("/organizer/tournaments/:tournamentId/summary", clubAuthMiddleware, g
 // Player entry payment flow
 router.post("/player/tournaments/:tournamentId/entry-intent", authMiddleware, createTournamentEntryIntent);
 router.post("/player/entries/:entryOrderId/sync", authMiddleware, syncTournamentEntryPayment);
+// Organiser-approved refund of a player's paid entry (club token).
+router.post("/organizer/entries/:entryOrderId/refund", clubAuthMiddleware, refundTournamentEntry);
 router.get("/player/me/entries", authMiddleware, myTournamentEntryOrders);
 
 export default router;

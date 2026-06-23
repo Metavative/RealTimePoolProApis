@@ -1,6 +1,25 @@
 // src/controllers/userController.js
 import User from "../models/user.model.js";
 import Club from "../models/club.model.js";
+import FriendRequest from "../models/friendRequest.model.js";
+import Friendship from "../models/friendship.model.js";
+import Match from "../models/match.model.js";
+import LevelMatchSession from "../models/levelMatchSession.model.js";
+import LevelMatchmakingState from "../models/levelMatchmakingState.model.js";
+import StoreOrder from "../models/storeOrder.model.js";
+import PaymentIntent from "../models/paymentIntent.model.js";
+import WalletHold from "../models/walletHold.model.js";
+import Payout from "../models/payout.model.js";
+import TournamentEntryOrder from "../models/tournamentEntryOrder.model.js";
+import TournamentInvite from "../models/tournamentInvite.model.js";
+import Tournament from "../models/tournament.model.js";
+import DisputeCase from "../models/disputeCase.model.js";
+import ReferralCommission from "../models/referralCommission.model.js";
+import PrizeAward from "../models/prizeAward.model.js";
+import UserEntitlement from "../models/userEntitlement.model.js";
+import UserLoadout from "../models/userLoadout.model.js";
+import Transaction from "../models/transaction.model.js";
+import LedgerEntry from "../models/ledgerEntry.model.js";
 import { v2 as cloudinary } from "cloudinary";
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
@@ -535,6 +554,95 @@ function normalizeScope(raw) {
   return "global";
 }
 
+// Phase A: money-based ranking. Default remains "score" so the existing
+// leaderboard behaviour is unchanged; "money" ranks by total winnings/earnings.
+// Exported for unit testing of the pure ranking logic.
+export function normalizeSortBy(raw) {
+  const k = norm(raw);
+  if (
+    k === "money" ||
+    k === "winnings" ||
+    k === "earnings" ||
+    k === "prize" ||
+    k === "prizemoney" ||
+    k === "prize_money"
+  ) {
+    return "money";
+  }
+  return "score";
+}
+
+// Robust "money earned" resolver. Returns the highest of the three parallel
+// cumulative-earnings trackers and is never negative / never NaN / never
+// Infinity.
+//
+// Why max of exactly these three (and NOT earnings.availableBalance):
+//   - matchController.js (1v1) and levelEconomy.controller.js (level matches)
+//     increment earnings.career + stats.totalWinnings and set earnings.total
+//     together by the same payout, so they are designed to be equal.
+//   - referral.service.js credits earnings.career + earnings.total but NOT
+//     stats.totalWinnings, so career/total can legitimately exceed totalWinnings.
+//     max() recovers that real earned money instead of under-counting it.
+//   - dispute.controller.js moves all three together (can decrease them).
+//   - Deposits / refunds / stake-locks touch ONLY earnings.availableBalance,
+//     which is spendable balance — NOT money earned — so it is excluded here.
+// Exported for unit testing of the pure ranking logic.
+export function resolveMoneyEarned(u = {}) {
+  const candidates = [
+    u?.stats?.totalWinnings,
+    u?.earnings?.career,
+    u?.earnings?.total,
+  ];
+  let best = 0;
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n > best) best = n;
+  }
+  return best;
+}
+
+// Absolute, request-stable tiebreak so the same data always produces the same
+// order regardless of the order Mongo returns documents in.
+function compareById(a, b) {
+  return String(a?._id || "").localeCompare(String(b?._id || ""));
+}
+
+// Score-based ordering — this is the EXACT legacy leaderboard ordering, just
+// named and extracted so it can be unit tested and reused as a tiebreak.
+// Exported for testing.
+export function compareByScore(a, b) {
+  const as = Number(a?.stats?.score || 0);
+  const bs = Number(b?.stats?.score || 0);
+  if (bs !== as) return bs - as;
+
+  const aw = Number(a?.stats?.totalWinnings || 0);
+  const bw = Number(b?.stats?.totalWinnings || 0);
+  if (bw !== aw) return bw - aw;
+
+  const ag = Number(a?.stats?.gamesWon || 0);
+  const bg = Number(b?.stats?.gamesWon || 0);
+  if (bg !== ag) return bg - ag;
+
+  const byName = displayName(a).localeCompare(displayName(b));
+  if (byName !== 0) return byName;
+  return compareById(a, b);
+}
+
+// Money-based ordering — primary key is money earned, then it falls back to the
+// full score-based ordering so ties resolve deterministically. Exported for
+// testing.
+export function compareByMoney(a, b) {
+  const am = resolveMoneyEarned(a);
+  const bm = resolveMoneyEarned(b);
+  if (bm !== am) return bm - am;
+  return compareByScore(a, b);
+}
+
+// Picks the comparator for a normalized sortBy value. Exported for testing.
+export function makeLeaderboardComparator(sortBy) {
+  return sortBy === "money" ? compareByMoney : compareByScore;
+}
+
 function ageFromDob(dobLike) {
   if (!dobLike) return -1;
   const dt = new Date(dobLike);
@@ -921,6 +1029,7 @@ export async function leaderboard(req, res) {
     const q = req.query || {};
     const category = normalizeCategory(q.filter || q.category || q.group);
     const scope = normalizeScope(q.scope || q.geoScope || q.locationScope);
+    const sortBy = normalizeSortBy(q.sortBy || q.rankBy || q.sort || q.orderBy);
     const limitRaw = Number(q.limit || 100);
     const limit = Number.isFinite(limitRaw)
       ? Math.max(1, Math.min(500, Math.round(limitRaw)))
@@ -991,6 +1100,8 @@ export async function leaderboard(req, res) {
             "stats.gamesWon",
             "stats.rank",
             "stats.userIdTag",
+            "earnings.career",
+            "earnings.total",
             "avatar",
             "avatarUrl",
             "photo",
@@ -1009,25 +1120,32 @@ export async function leaderboard(req, res) {
       .filter((u) => includeByCategory(u, category))
       .filter((u) => includeByScope(u, scope, viewerCountry, viewerRegion));
 
-    filtered.sort((a, b) => {
-      const as = Number(a?.stats?.score || 0);
-      const bs = Number(b?.stats?.score || 0);
-      if (bs !== as) return bs - as;
+    filtered.sort(makeLeaderboardComparator(sortBy));
 
-      const aw = Number(a?.stats?.totalWinnings || 0);
-      const bw = Number(b?.stats?.totalWinnings || 0);
-      if (bw !== aw) return bw - aw;
-
-      const ag = Number(a?.stats?.gamesWon || 0);
-      const bg = Number(b?.stats?.gamesWon || 0);
-      if (bg !== ag) return bg - ag;
-
-      return displayName(a).localeCompare(displayName(b));
-    });
+    // Viewer's own standing across the full sorted+filtered set, so a player can
+    // see their rank even when they fall outside the returned slice. Additive —
+    // never affects the leaderboard array itself.
+    const viewerId = String(req.userId || req?.user?._id || "").trim();
+    let viewerStanding = null;
+    if (viewerId) {
+      const viewerIdx = filtered.findIndex((u) => String(u._id) === viewerId);
+      if (viewerIdx >= 0) {
+        const vu = filtered[viewerIdx];
+        viewerStanding = {
+          rank: viewerIdx + 1,
+          total: filtered.length,
+          userId: viewerId,
+          score: Number(vu?.stats?.score || 0),
+          moneyEarned: resolveMoneyEarned(vu),
+          inTopList: viewerIdx < limit,
+        };
+      }
+    }
 
     const leaderboard = filtered.slice(0, limit).map((u, idx) => {
       const points = Number(u?.stats?.score || 0);
       const winnings = Number(u?.stats?.totalWinnings || 0);
+      const moneyEarned = resolveMoneyEarned(u);
       const country = resolveCountry(u);
       const region = resolveRegion(u);
       const avatarUrl = resolveAvatarUrl(u);
@@ -1047,6 +1165,7 @@ export async function leaderboard(req, res) {
         score: points,
         totalWinnings: winnings,
         winnings,
+        moneyEarned,
         country,
         region,
         stats: {
@@ -1060,15 +1179,97 @@ export async function leaderboard(req, res) {
 
     return res.json({
       leaderboard,
+      viewer: viewerStanding,
       meta: {
         category,
         scope,
+        sortBy,
         count: leaderboard.length,
         updatedAt: new Date().toISOString(),
       },
     });
   } catch (error) {
     return res.status(500).json({ message: error.message || "Failed to load leaderboard" });
+  }
+}
+
+// Phase D: consolidated player dashboard — one call that aggregates the
+// profile/stats/money/counts a player home screen needs, instead of the client
+// fanning out to /me + /earnings + /ledger/me/summary + entry list. Additive;
+// all existing endpoints are unchanged.
+export async function dashboard(req, res) {
+  try {
+    const userId = String(req.userId || req.user?._id || "").trim();
+    if (!userId) return res.status(401).json({ ok: false, message: "Unauthorized" });
+
+    const currency = "GBP";
+
+    const [user, walletRows, tournamentsEntered, activeHolds] = await Promise.all([
+      User.findById(userId).select("username profile stats earnings").lean(),
+      LedgerEntry.aggregate([
+        {
+          $match: {
+            accountType: "USER_WALLET",
+            accountId: userId,
+            currency,
+            status: "POSTED",
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            debitMinor: { $sum: { $cond: [{ $eq: ["$direction", "DEBIT"] }, "$amountMinor", 0] } },
+            creditMinor: { $sum: { $cond: [{ $eq: ["$direction", "CREDIT"] }, "$amountMinor", 0] } },
+          },
+        },
+      ]),
+      TournamentEntryOrder.countDocuments({ userId, status: "PAID" }),
+      WalletHold.countDocuments({ userId, status: "HELD" }),
+    ]);
+
+    if (!user) return res.status(404).json({ ok: false, message: "User not found" });
+
+    const wr = walletRows[0] || { debitMinor: 0, creditMinor: 0 };
+    const walletBalanceMinor = Number(wr.creditMinor || 0) - Number(wr.debitMinor || 0);
+    const stats = user.stats || {};
+    const earnings = user.earnings || {};
+
+    return res.json({
+      ok: true,
+      dashboard: {
+        profile: {
+          userId,
+          name: displayName(user),
+          username: toStr(user.username),
+          rank: toStr(stats.rank),
+          avatar: resolveAvatarUrl(user),
+        },
+        stats: {
+          score: Number(stats.score || 0),
+          totalWinnings: Number(stats.totalWinnings || 0),
+          gamesWon: Number(stats.gamesWon || 0),
+          gamesLost: Number(stats.gamesLost || 0),
+          totalMatches: Number(stats.totalMatches || 0),
+          winRate: Number(stats.winRate || 0),
+          currentWinStreak: Number(stats.currentWinStreak || 0),
+        },
+        money: {
+          currency,
+          moneyEarned: resolveMoneyEarned(user),
+          career: Number(earnings.career || 0),
+          total: Number(earnings.total || 0),
+          availableBalance: Number(earnings.availableBalance || 0),
+          walletBalanceMinor,
+        },
+        counts: {
+          tournamentsEntered,
+          activeHolds,
+        },
+        generatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message || "Failed to load dashboard" });
   }
 }
 
@@ -1101,23 +1302,120 @@ export async function deleteMyAccount(req, res) {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
 
-    const user = await User.findById(userId).select("_id");
+    const user = await User.findById(userId).select("_id username stats.userIdTag");
     if (!user) {
       return res.status(404).json({ ok: false, message: "User not found" });
     }
 
-    await Promise.all([
-      User.updateMany({ friends: user._id }, { $pull: { friends: user._id } }),
-      Club.updateMany({ owner: user._id }, { $unset: { owner: "" } }),
-    ]);
+    const uid = user._id;
+    const uidText = String(uid);
+    const username = String(user.username || "").trim();
+    const userIdTag = String(user?.stats?.userIdTag || "").trim();
 
-    await User.deleteOne({ _id: user._id });
+    await FriendRequest.deleteMany({ $or: [{ from: uid }, { to: uid }] });
+    await Friendship.deleteMany({ $or: [{ a: uid }, { b: uid }] });
 
-    return res.json({ ok: true, message: "Account deleted" });
+    await Match.deleteMany({
+      $or: [{ players: uid }, { winner: uid }, { "score.user": uid }],
+    });
+
+    await LevelMatchmakingState.deleteMany({ userId: uid });
+    await LevelMatchSession.deleteMany({
+      $or: [
+        { participants: uid },
+        { challengerUserId: uid },
+        { opponentUserId: uid },
+        { winnerUserId: uid },
+        { loserUserId: uid },
+        { createdByUserId: uid },
+      ],
+    });
+
+    await StoreOrder.deleteMany({ userId: uid });
+    await PaymentIntent.deleteMany({ userId: uid });
+    await WalletHold.deleteMany({ userId: uid });
+    await Payout.deleteMany({ userId: uid });
+    await TournamentEntryOrder.deleteMany({ userId: uid });
+    await TournamentInvite.deleteMany({ toUserId: uid });
+    await UserEntitlement.deleteMany({ userId: uid });
+    await UserLoadout.deleteMany({ userId: uid });
+    await PrizeAward.deleteMany({ userId: uid });
+    await ReferralCommission.deleteMany({
+      $or: [{ referrerUserId: uid }, { referredUserId: uid }],
+    });
+    await Transaction.deleteMany({ user: uid });
+
+    await DisputeCase.deleteMany({
+      $or: [
+        { openedByUserId: uid },
+        { respondentUserId: uid },
+        { "comments.actorUserId": uid },
+        { "evidence.uploadedByUserId": uid },
+        { "resolution.decidedByUserId": uid },
+      ],
+    });
+
+    await LedgerEntry.deleteMany({
+      $or: [
+        { accountType: "USER_WALLET", accountId: uidText },
+        { accountType: "REFERRAL_COMMISSION", accountId: uidText },
+        { "metadata.userId": uidText },
+        ...(userIdTag ? [{ "metadata.userIdTag": userIdTag }] : []),
+      ],
+    });
+
+    await User.updateMany({ friends: uid }, { $pull: { friends: uid } });
+    await User.updateMany(
+      { "feedbacks.fromUserId": uid },
+      { $pull: { feedbacks: { fromUserId: uid } } }
+    );
+    await User.updateMany(
+      { "referral.referredByUserId": uid },
+      {
+        $set: {
+          "referral.referredByUserId": null,
+          "referral.referredByCode": "",
+          "referral.referredAt": null,
+        },
+      }
+    );
+
+    await Club.updateMany({ owner: uid }, { $unset: { owner: "" } });
+
+    await Tournament.updateMany(
+      { "entrants.entrantId": uid },
+      { $pull: { entrants: { entrantId: uid } } }
+    );
+    await Tournament.updateMany(
+      { "entrants.userId": uidText },
+      { $pull: { entrants: { userId: uidText } } }
+    );
+    if (username) {
+      await Tournament.updateMany(
+        { "entrants.username": username },
+        { $pull: { entrants: { username } } }
+      );
+    }
+
+    const deleted = await User.deleteOne({ _id: uid });
+    if (!deleted || Number(deleted.deletedCount || 0) < 1) {
+      return res.status(500).json({
+        ok: false,
+        message:
+          "We could not complete account deletion. Please try again.",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      message: "Account deleted permanently",
+    });
   } catch (error) {
     return res.status(500).json({
       ok: false,
-      message: error.message || "Failed to delete account",
+      message:
+        error?.message ||
+        "We could not complete account deletion right now. Please try again.",
     });
   }
 }

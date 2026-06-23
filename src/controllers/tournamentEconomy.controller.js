@@ -4,7 +4,7 @@ import Tournament from "../models/tournament.model.js";
 import TournamentEntryOrder from "../models/tournamentEntryOrder.model.js";
 import User from "../models/user.model.js";
 import { resolvePaymentProvider } from "../services/payments/paymentProvider.factory.js";
-import { applyLedgerRulesForIntent } from "./payments.controller.js";
+import { applyLedgerRulesForIntent, reverseIntentSettlement } from "./payments.controller.js";
 import { addEntrantAndReseed } from "../services/tournament.service.js";
 
 function cleanString(v, fallback = "") {
@@ -26,6 +26,28 @@ function tournamentEconomyEnabled() {
 
 function paymentsEnabled() {
   return boolFromEnv("FEATURE_PAYMENTS_V2", false);
+}
+
+function tournamentRefundsEnabled() {
+  return boolFromEnv("FEATURE_TOURNAMENT_REFUNDS", false);
+}
+
+// Pure refund-eligibility check. Exported for testing.
+// A paid entry is refundable only while the tournament has NOT started and the
+// order is still PAID (not already refunded/cancelled).
+export function tournamentEntryRefundEligibility(order = {}, tournament = {}) {
+  const orderStatus = upper(order?.status, "PENDING_PAYMENT");
+  if (orderStatus === "REFUNDED") {
+    return { ok: false, code: "ALREADY_REFUNDED", idempotent: true };
+  }
+  if (orderStatus !== "PAID") {
+    return { ok: false, code: "ORDER_NOT_PAID" };
+  }
+  const tStatus = upper(tournament?.status, "DRAFT");
+  if (["ACTIVE", "LIVE", "COMPLETED"].includes(tStatus)) {
+    return { ok: false, code: "TOURNAMENT_STARTED" };
+  }
+  return { ok: true };
 }
 
 function providerName() {
@@ -563,27 +585,41 @@ export async function syncTournamentEntryPayment(req, res) {
       });
     }
 
+    // ---- Idempotent ledger application (Phase C) ----
+    // Atomically CLAIM the ledger-application right before posting, so two
+    // concurrent syncs of the same paid order can never both post the ledger.
+    // On posting failure we revert the claim so a later retry can re-run.
     let ledger = { applied: false, reused: false };
-    if (!order.ledgerApplied) {
-      const applied = await applyLedgerRulesForIntent(intent, {
-        trigger: "tournament_entry_sync",
-        actor: "api",
-      });
-      ledger = {
-        applied: !!applied?.applied,
-        reused: !!applied?.reused,
-        sourceId: cleanString(applied?.sourceId),
-        settlementId: cleanString(applied?.settlementId),
-      };
+    const ledgerClaim = await TournamentEntryOrder.findOneAndUpdate(
+      { _id: order._id, ledgerApplied: { $ne: true } },
+      { $set: { ledgerApplied: true } },
+      { new: true }
+    );
+    if (ledgerClaim) {
+      try {
+        const applied = await applyLedgerRulesForIntent(intent, {
+          trigger: "tournament_entry_sync",
+          actor: "api",
+        });
+        ledger = {
+          applied: !!applied?.applied,
+          reused: !!applied?.reused,
+          sourceId: cleanString(applied?.sourceId),
+          settlementId: cleanString(applied?.settlementId),
+        };
+      } catch (ledgerErr) {
+        // Release the claim so the next sync can retry the posting.
+        await TournamentEntryOrder.updateOne(
+          { _id: order._id },
+          { $set: { ledgerApplied: false } }
+        );
+        throw ledgerErr;
+      }
     } else {
       ledger = { applied: true, reused: true };
     }
 
-    order.status = "PAID";
-    order.ledgerApplied = true;
-    order.paidAt = order.paidAt || new Date();
-    order.settledAt = new Date();
-
+    // ---- Idempotent entrant add (Phase C) ----
     const tournament = await Tournament.findById(order.tournamentId).lean();
     let entrantAdded = !!order.entrantAdded;
     let entrantNote = "";
@@ -591,39 +627,70 @@ export async function syncTournamentEntryPayment(req, res) {
     if (tournament) {
       const economy = tournamentEconomyConfig(tournament);
       const shouldAutoAdd = economy.autoAddEntrantOnPayment || !!req.body?.forceAddEntrant;
-      if (shouldAutoAdd && !order.entrantAdded) {
-        const user = await User.findById(userId).select("username profile.nickname").lean();
-        const entrantPayload = {
-          participantKey: userParticipantKey(userId),
-          entrantId: userId,
-          userId,
-          username: cleanString(user?.username),
-          name: userDisplayName(user),
-          isLocal: false,
-        };
-
-        try {
-          const added = await addEntrantAndReseed(toObjectIdString(order.tournamentId), entrantPayload);
-          entrantAdded = added?.added === false ? true : !!added?.added;
-          entrantNote = added?.added ? "Entrant added to tournament." : "Entrant already existed.";
-        } catch (entrantErr) {
-          entrantAdded = false;
-          entrantNote = cleanString(entrantErr?.message || "Could not auto-add entrant");
+      if (shouldAutoAdd) {
+        // Claim the entrant-add right atomically (same pattern as the ledger).
+        const entrantClaim = await TournamentEntryOrder.findOneAndUpdate(
+          { _id: order._id, entrantAdded: { $ne: true } },
+          { $set: { entrantAdded: true } },
+          { new: true }
+        );
+        if (entrantClaim) {
+          const user = await User.findById(userId).select("username profile.nickname").lean();
+          const entrantPayload = {
+            participantKey: userParticipantKey(userId),
+            entrantId: userId,
+            userId,
+            username: cleanString(user?.username),
+            name: userDisplayName(user),
+            isLocal: false,
+          };
+          try {
+            const added = await addEntrantAndReseed(
+              toObjectIdString(order.tournamentId),
+              entrantPayload
+            );
+            entrantAdded = true;
+            entrantNote = added?.added
+              ? "Entrant added to tournament."
+              : "Entrant already existed.";
+          } catch (entrantErr) {
+            // Release the claim so it can be retried; the entrant was not added.
+            await TournamentEntryOrder.updateOne(
+              { _id: order._id },
+              { $set: { entrantAdded: false } }
+            );
+            entrantAdded = false;
+            entrantNote = cleanString(entrantErr?.message || "Could not auto-add entrant");
+          }
+        } else {
+          entrantAdded = true;
+          entrantNote = "Entrant already processed.";
         }
       }
     }
 
-    order.entrantAdded = entrantAdded;
-    const nextMeta = order.metadata && typeof order.metadata === "object" ? { ...order.metadata } : {};
-    nextMeta.entrantNote = entrantNote;
-    order.metadata = nextMeta;
-    await order.save();
+    // ---- Finalize order status atomically ----
+    // Use $set (not .save()) so a concurrent sync cannot clobber the claimed
+    // ledgerApplied/entrantAdded flags with stale in-memory values.
+    await TournamentEntryOrder.updateOne(
+      { _id: order._id },
+      {
+        $set: {
+          status: "PAID",
+          paidAt: order.paidAt || new Date(),
+          settledAt: new Date(),
+          "metadata.entrantNote": entrantNote,
+        },
+      }
+    );
+
+    const finalOrder = await TournamentEntryOrder.findById(order._id);
 
     return res.json({
       ok: true,
       synced: true,
       message: "Tournament entry payment synced.",
-      order: orderResponse(order),
+      order: orderResponse(finalOrder || order),
       intent: intentResponse(intent),
       ledger,
       entrant: {
@@ -633,6 +700,120 @@ export async function syncTournamentEntryPayment(req, res) {
     });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message || "Failed to sync tournament payment" });
+  }
+}
+
+/**
+ * POST /organizer/entries/:entryOrderId/refund
+ * Organiser-approved refund of a player's paid tournament entry BEFORE the
+ * tournament starts. Only the club that owns the tournament may refund.
+ * Idempotent (atomic PAID->REFUNDED claim), flag-gated, reverses the ledger and
+ * removes the entrant. Money returns to the original payment source via the
+ * settlement reversal (EXTERNAL_GATEWAY_IN), so there is no earnings double-count.
+ */
+export async function refundTournamentEntry(req, res) {
+  if (!tournamentEconomyEnabled()) return serviceUnavailable(res);
+  if (!tournamentRefundsEnabled()) {
+    return res.status(503).json({
+      ok: false,
+      code: "TOURNAMENT_REFUNDS_DISABLED",
+      message: "Tournament entry refunds are not enabled for this environment.",
+    });
+  }
+
+  try {
+    const clubId = toObjectIdString(requestClubId(req));
+    if (!clubId) {
+      return res.status(401).json({ ok: false, message: "Club authorization required" });
+    }
+
+    const orderId = upper(req.params.entryOrderId || req.params.orderId || req.body?.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "entryOrderId is required" });
+
+    const order = await TournamentEntryOrder.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, message: "Tournament entry order not found" });
+
+    const tournament = await Tournament.findById(order.tournamentId).lean();
+
+    // Only the organiser that owns this tournament may refund its entries.
+    const ownerClubId =
+      toObjectIdString(tournament?.clubId) || toObjectIdString(order.clubId);
+    if (!ownerClubId || ownerClubId !== clubId) {
+      return res.status(403).json({
+        ok: false,
+        code: "FORBIDDEN",
+        message: "You do not own this tournament.",
+      });
+    }
+
+    // The player whose paid entry is being refunded.
+    const userId = toObjectIdString(order.userId);
+    if (!userId) {
+      return res.status(400).json({ ok: false, code: "ORDER_HAS_NO_USER" });
+    }
+
+    const eligibility = tournamentEntryRefundEligibility(order, tournament || {});
+    if (!eligibility.ok) {
+      if (eligibility.idempotent) {
+        return res.json({ ok: true, refunded: true, alreadyRefunded: true, order: orderResponse(order) });
+      }
+      const status = eligibility.code === "TOURNAMENT_STARTED" ? 409 : 400;
+      return res.status(status).json({ ok: false, code: eligibility.code });
+    }
+
+    // Atomic claim: only one request flips PAID -> REFUNDED.
+    const claimed = await TournamentEntryOrder.findOneAndUpdate(
+      { _id: order._id, status: "PAID" },
+      { $set: { status: "REFUNDED" } },
+      { new: true }
+    );
+    if (!claimed) {
+      const fresh = await TournamentEntryOrder.findById(order._id).lean();
+      if (upper(fresh?.status) === "REFUNDED") {
+        return res.json({ ok: true, refunded: true, alreadyRefunded: true, order: orderResponse(fresh) });
+      }
+      return res.status(409).json({ ok: false, code: "REFUND_CONFLICT" });
+    }
+
+    let ledger = { reversed: false };
+    try {
+      // Reverse the ledger settlement (only meaningful when it was posted).
+      if (order.ledgerApplied) {
+        const intent = await PaymentIntent.findOne({ intentId: order.intentId, userId });
+        if (intent) {
+          ledger = await reverseIntentSettlement(intent, { trigger: "tournament_entry_refund" });
+        }
+      }
+
+      // Remove the entrant from the tournament roster.
+      await Tournament.updateOne(
+        { _id: order.tournamentId },
+        { $pull: { entrants: { entrantId: userId } } }
+      );
+
+      await TournamentEntryOrder.updateOne(
+        { _id: order._id },
+        { $set: { settledAt: new Date(), entrantAdded: false, "metadata.refundedAt": new Date() } }
+      );
+    } catch (refundErr) {
+      // Release the claim so the refund can be retried; nothing partial sticks
+      // beyond the idempotent ledger reversal (which is keyed and safe to retry).
+      await TournamentEntryOrder.updateOne(
+        { _id: order._id },
+        { $set: { status: "PAID" } }
+      );
+      throw refundErr;
+    }
+
+    const finalOrder = await TournamentEntryOrder.findById(order._id);
+    return res.json({
+      ok: true,
+      refunded: true,
+      order: orderResponse(finalOrder || claimed),
+      ledger,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message || "Failed to refund tournament entry" });
   }
 }
 

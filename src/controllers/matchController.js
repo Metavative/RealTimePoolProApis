@@ -5,6 +5,12 @@ import Transaction from "../models/transaction.model.js";
 import mongoose from "mongoose";
 import { postReferralCommission } from "../services/referral.service.js";
 import { evaluateAndAwardMilestones } from "../services/achievement.service.js";
+import { requireTransactions } from "../utils/dbTransactions.js";
+import {
+  ledgerUnifiedEnabled,
+  creditUserWallet,
+  syncAvailableBalanceCache,
+} from "../services/ledgerUnification.service.js";
 
 const APP_COMMISSION_RATE = 0.10;
 const WINNER_SCORE_BONUS = 25;
@@ -196,6 +202,7 @@ export async function acceptChallenge(req, res) {
 // 3. FINISH MATCH
 // ========================
 export async function finishMatch(req, res) {
+  if (!requireTransactions(res)) return;
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -363,6 +370,31 @@ export async function finishMatch(req, res) {
     await User.findByIdAndUpdate(winnerId, winnerUpdate, { session });
     await User.findByIdAndUpdate(loserId, loserUpdate, { session });
 
+    // U2 (ledger unification): when FEATURE_LEDGER_UNIFIED is on, the winner's
+    // payout must ALSO land in the USER_WALLET ledger so it is withdrawable /
+    // stakeable. The earnings.availableBalance write above is then the synced
+    // cache. The contra is SYSTEM_ADJUSTMENT (1v1 entry fees are not ledgered,
+    // so the pot originates outside the ledger; the batch still balances).
+    // Idempotent + transaction-wrapped (inherits the C3 replica-set guard).
+    if (ledgerUnifiedEnabled() && payoutAmount > 0) {
+      const payoutMinor = Math.max(0, Math.round(Number(payoutAmount) * 100));
+      if (payoutMinor > 0) {
+        await creditUserWallet({
+          userId: toId(winnerId),
+          amountMinor: payoutMinor,
+          contraAccountType: "SYSTEM_ADJUSTMENT",
+          contraAccountId: "SYSTEM",
+          sourceType: "PAYOUT",
+          baseEntryId: `MWIN_${toId(match._id)}`,
+          currency: "GBP",
+          session,
+          metadata: { matchId: toId(match._id), winnerId: toId(winnerId) },
+        });
+        // U4: keep the availableBalance cache equal to the ledger projection.
+        await syncAvailableBalanceCache({ userId: toId(winnerId), currency: "GBP", session });
+      }
+    }
+
     if (payoutAmount > 0) {
       await Transaction.create(
         [
@@ -466,6 +498,7 @@ export async function finishMatch(req, res) {
 // 4. CANCEL MATCH
 // ========================
 export async function cancelMatch(req, res) {
+  if (!requireTransactions(res)) return;
   const session = await mongoose.startSession();
   session.startTransaction();
 

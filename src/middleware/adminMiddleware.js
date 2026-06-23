@@ -1,34 +1,13 @@
 import { authMiddleware } from "./authMiddleware.js";
-
-function extractRole(user) {
-  const candidates = [
-    user?.role,
-    user?.userType,
-    user?.accountType,
-    user?.profile?.role,
-    user?.profile?.userType,
-    user?.profile?.type,
-  ];
-
-  for (const c of candidates) {
-    const s = String(c || "").trim().toLowerCase();
-    if (s) return s;
-  }
-  return "";
-}
+import { hasPlatformAdminAccess } from "../utils/authz.js";
 
 export async function adminMiddleware(req, res, next) {
   return authMiddleware(req, res, async () => {
     try {
-      const role = extractRole(req.user);
-
-      const allowed =
-        role.includes("admin") ||
-        role.includes("organizer") ||
-        role.includes("club") ||
-        role.includes("venue");
-
-      if (!allowed) {
+      // Platform-admin access requires an explicit admin signal (see
+      // utils/authz.js). The legacy substring behaviour is only used when
+      // AUTHZ_STRICT_ADMIN is explicitly disabled.
+      if (!hasPlatformAdminAccess(req.user)) {
         return res.status(403).json({
           ok: false,
           message: "Admin access required",

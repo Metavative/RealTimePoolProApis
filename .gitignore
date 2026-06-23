@@ -5,6 +5,8 @@ node_modules/
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
 
 # Logs
 logs
@@ -45,3 +47,6 @@ uploads/
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+
+# Local DB backups (contains production data — never commit)
+backup/
