@@ -22,6 +22,7 @@ import {
   summarizeReconciliation,
   isReconciliationSafeToBackfill,
 } from "../utils/walletReconciliation.js";
+import { summarizeDisputeTrends } from "../utils/disputeAnalytics.js";
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
@@ -816,6 +817,50 @@ export async function walletReconciliation(req, res) {
     return res.status(500).json({
       ok: false,
       message: e.message || "Failed to reconcile wallets",
+    });
+  }
+}
+
+// READ-ONLY dispute-trend analytics for the admin dashboard: volume, status /
+// module / decision breakdowns, resolution rate, average resolution time, and a
+// daily opened-vs-resolved series over a window.
+export async function disputeTrends(req, res) {
+  try {
+    const windowDays = Math.min(365, Math.max(1, Number(req.query.windowDays || 30)));
+    // Pull cases created in-window plus any still-open ones (so the backlog is
+    // reflected even if opened before the window).
+    const since = new Date(Date.now() - windowDays * 86400000);
+    const cases = await DisputeCase.find(
+      {
+        $or: [
+          { createdAt: { $gte: since } },
+          { status: { $nin: ["RESOLVED", "REJECTED", "CANCELLED"] } },
+        ],
+      },
+      {
+        status: 1,
+        module: 1,
+        createdAt: 1,
+        claimedAmountMinor: 1,
+        "resolution.resolvedAt": 1,
+        "resolution.decision": 1,
+        "resolution.payoutAmountMinor": 1,
+      }
+    )
+      .limit(5000)
+      .lean();
+
+    const trends = summarizeDisputeTrends(cases, { now: Date.now(), windowDays });
+
+    return res.json({
+      ok: true,
+      trends,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to load dispute trends",
     });
   }
 }

@@ -27,6 +27,7 @@ import {
   generateDoubleElim,
   progressDoubleElimination,
 } from "../src/services/tournament.service.js";
+import { summarizeDisputeTrends } from "../src/utils/disputeAnalytics.js";
 
 // Tiny fixture helper for ranking tests.
 function mkUser(id, { score = 0, winnings = 0, career, total, gamesWon = 0, name } = {}) {
@@ -823,6 +824,57 @@ await runTest("double-elim: editing an early result re-cascades the bracket", ()
   // Finish again; a valid champion is still produced.
   dePlayOut(t, () => "A");
   assert.ok(t.championName, "champion decided after the edit");
+});
+
+// ---- Dispute-trend analytics ----
+
+await runTest("disputeTrends: counts, rate, avg resolution time and series", () => {
+  const now = new Date("2026-06-29T00:00:00.000Z").getTime();
+  const day = 86400000;
+  const cases = [
+    // resolved 2 days after opening, 1 day ago
+    {
+      status: "RESOLVED",
+      module: "MATCH",
+      createdAt: new Date(now - 3 * day),
+      claimedAmountMinor: 1000,
+      resolution: { resolvedAt: new Date(now - 1 * day), decision: "REFUND", payoutAmountMinor: 1000 },
+    },
+    // still open, created 5 days ago
+    { status: "OPEN", module: "TOURNAMENT", createdAt: new Date(now - 5 * day), claimedAmountMinor: 500 },
+    // rejected (terminal, not resolved)
+    { status: "REJECTED", module: "MATCH", createdAt: new Date(now - 2 * day), claimedAmountMinor: 200 },
+  ];
+
+  const s = summarizeDisputeTrends(cases, { now, windowDays: 30 });
+  assert.equal(s.total, 3);
+  assert.equal(s.open, 1, "only the OPEN case is non-terminal");
+  assert.equal(s.resolved, 1);
+  assert.equal(s.byStatus.RESOLVED, 1);
+  assert.equal(s.byStatus.OPEN, 1);
+  assert.equal(s.byStatus.REJECTED, 1);
+  assert.equal(s.byModule.MATCH, 2);
+  assert.equal(s.byDecision.REFUND, 1);
+  assert.equal(s.claimedMinorTotal, 1700);
+  assert.equal(s.payoutMinorTotal, 1000);
+  assert.equal(s.resolutionRatePct, 33.3, "1 of 3 resolved");
+  assert.equal(s.avgResolutionHours, 48, "resolved 2 days after opening");
+  assert.equal(s.series.length, 30);
+  // series newest-last; the last day is "now".
+  assert.equal(s.series[s.series.length - 1].date, "2026-06-29");
+  const opened = s.series.reduce((acc, d) => acc + d.opened, 0);
+  assert.equal(opened, 3, "all three opened within the window");
+  const resolvedInSeries = s.series.reduce((acc, d) => acc + d.resolved, 0);
+  assert.equal(resolvedInSeries, 1);
+});
+
+await runTest("disputeTrends: empty input yields zeroed summary with a full series", () => {
+  const now = new Date("2026-06-29T00:00:00.000Z").getTime();
+  const s = summarizeDisputeTrends([], { now, windowDays: 7 });
+  assert.equal(s.total, 0);
+  assert.equal(s.resolutionRatePct, 0);
+  assert.equal(s.avgResolutionHours, null);
+  assert.equal(s.series.length, 7);
 });
 
 if (failures > 0) {

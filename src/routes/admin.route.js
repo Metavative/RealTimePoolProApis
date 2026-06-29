@@ -6,6 +6,7 @@ import {
   dashboardStats,
   platformOverview,
   walletReconciliation,
+  disputeTrends,
 
   listUsers,
   getUser,
@@ -48,6 +49,7 @@ router.get("/me", adminMiddleware, me);
 router.get("/stats", adminMiddleware, dashboardStats);
 router.get("/overview", adminMiddleware, platformOverview);
 router.get("/wallet-reconciliation", adminMiddleware, walletReconciliation);
+router.get("/dispute-trends", adminMiddleware, disputeTrends);
 
 // ------------------------------
 // Users
