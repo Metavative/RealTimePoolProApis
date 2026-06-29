@@ -23,6 +23,10 @@ import {
 } from "../src/utils/walletReconciliation.js";
 import { createMockPaymentProvider } from "../src/services/payments/providers/mock.provider.js";
 import { createMyPosPaymentProvider } from "../src/services/payments/providers/mypos.provider.js";
+import {
+  generateDoubleElim,
+  progressDoubleElimination,
+} from "../src/services/tournament.service.js";
 
 // Tiny fixture helper for ranking tests.
 function mkUser(id, { score = 0, winnings = 0, career, total, gamesWon = 0, name } = {}) {
@@ -720,6 +724,105 @@ await runTest("mypos provider: refundPayment throws NOT_CONFIGURED until creds e
     () => provider.refundPayment({ intent: { intentId: "PAY_3" }, amountMinor: 100 }),
     (err) => err.code === "MYPOS_NOT_CONFIGURED"
   );
+});
+
+// ---- Double elimination engine ----
+
+// Build a double-elim tournament fixture for n players and return a fake `t`.
+function mkDeTournament(n) {
+  const keys = Array.from({ length: n }, (_, i) => `uid:${i + 1}`);
+  const nameByKey = new Map(keys.map((k) => [k, `P${k.slice(4)}`]));
+  const matches = generateDoubleElim(keys, "Table 1", nameByKey);
+  const t = { matches, championName: "", entrants: keys.map((k) => ({ participantKey: k, name: nameByKey.get(k) })) };
+  progressDoubleElimination(t);
+  return { t, keys };
+}
+
+function deReady(m) {
+  const real = (k) => k && !["BYE", "TBD"].includes(String(k).toUpperCase());
+  return m.status !== "played" && real(m.teamA) && real(m.teamB);
+}
+
+// Play out the whole bracket; `pick(m)` returns "A" or "B" for the winner.
+function dePlayOut(t, pick) {
+  for (let guard = 0; guard < 1000; guard++) {
+    const m = t.matches.find((x) => x.id.startsWith("de_") && deReady(x));
+    if (!m) break;
+    const win = pick(m); // "A" or "B"
+    m.scoreA = win === "A" ? 1 : 0;
+    m.scoreB = win === "B" ? 1 : 0;
+    m.status = "played";
+    progressDoubleElimination(t);
+  }
+}
+
+await runTest("double-elim: bracket has the right shape (2S-1 matches, one WB final)", () => {
+  for (const n of [2, 3, 4, 5, 8, 11, 16]) {
+    const { t } = mkDeTournament(n);
+    const S = (() => { let p = 1; while (p < n) p *= 2; return p; })();
+    const de = t.matches.filter((m) => m.id.startsWith("de_"));
+    assert.equal(de.length, 2 * S - 1, `n=${n}: expected ${2 * S - 1} matches`);
+    assert.equal(de.filter((m) => m.id.startsWith("de_wb_")).length, S - 1, `n=${n}: WB count`);
+    assert.equal(de.filter((m) => m.id.startsWith("de_lb_")).length, S - 2, `n=${n}: LB count`);
+    assert.ok(de.find((m) => m.id === "de_gf_1") && de.find((m) => m.id === "de_gf_2"));
+  }
+});
+
+await runTest("double-elim: WB side undefeated wins without a reset", () => {
+  for (const n of [2, 3, 4, 5, 8, 11, 16]) {
+    const { t, keys } = mkDeTournament(n);
+    // teamA always wins -> the winners-bracket finalist never loses.
+    dePlayOut(t, () => "A");
+    assert.ok(t.championName, `n=${n}: a champion should be decided`);
+    assert.ok(keys.includes(t.championName), `n=${n}: champion is a real entrant`);
+    const gf2 = t.matches.find((m) => m.id === "de_gf_2");
+    // No reset needed, so the reset game stays unplayed.
+    assert.notEqual(gf2.status, "played", `n=${n}: no bracket reset expected`);
+  }
+});
+
+await runTest("double-elim: losing the grand final forces a bracket reset", () => {
+  const { t, keys } = mkDeTournament(8);
+  // Play everything teamA-wins until only the grand final remains.
+  for (let guard = 0; guard < 1000; guard++) {
+    const m = t.matches.find((x) => x.id.startsWith("de_") && deReady(x));
+    if (!m) break;
+    if (m.id === "de_gf_1") break;
+    m.scoreA = 1; m.scoreB = 0; m.status = "played";
+    progressDoubleElimination(t);
+  }
+  const gf1 = t.matches.find((m) => m.id === "de_gf_1");
+  assert.ok(deReady(gf1), "grand final should be ready");
+  // The losers-bracket side (teamB) wins game 1 -> reset.
+  gf1.scoreA = 0; gf1.scoreB = 1; gf1.status = "played";
+  progressDoubleElimination(t);
+  assert.equal(t.championName, "", "no champion yet — reset game pending");
+  const gf2 = t.matches.find((m) => m.id === "de_gf_2");
+  assert.ok(deReady(gf2), "reset game should be populated and ready");
+  // Whoever wins the reset is champion.
+  gf2.scoreA = 1; gf2.scoreB = 0; gf2.status = "played";
+  progressDoubleElimination(t);
+  assert.equal(t.championName, gf2.teamA, "reset winner is champion");
+  assert.ok(keys.includes(t.championName));
+});
+
+await runTest("double-elim: editing an early result re-cascades the bracket", () => {
+  const { t } = mkDeTournament(4);
+  dePlayOut(t, () => "A");
+  const championAllAWin = t.championName;
+  // Now flip the very first winners-bracket match and replay.
+  const wb1 = t.matches.find((m) => m.id === "de_wb_r1_1");
+  wb1.scoreA = 0; wb1.scoreB = 1; wb1.status = "played";
+  progressDoubleElimination(t);
+  // Downstream WB slot must reflect the new winner (teamB of wb1), not stale.
+  const wbFinal = t.matches.find((m) => m.id === "de_wb_r2_1");
+  assert.ok(
+    [wbFinal.teamA, wbFinal.teamB].includes(wb1.teamB),
+    "edited winner propagates into the WB final"
+  );
+  // Finish again; a valid champion is still produced.
+  dePlayOut(t, () => "A");
+  assert.ok(t.championName, "champion decided after the edit");
 });
 
 if (failures > 0) {

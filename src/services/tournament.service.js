@@ -122,6 +122,10 @@ function isPlayoffMatchId(id) {
   return String(id || "").startsWith("po_");
 }
 
+function isDoubleElimMatchId(id) {
+  return String(id || "").startsWith("de_");
+}
+
 function playoffRoundOf(id) {
   const parts = String(id || "").split("_"); // po, r1, 1
   if (parts.length < 3) return null;
@@ -920,6 +924,9 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
     }
     t3.matches = matches;
     t3.championName = "";
+    if (format === "double_elim" || format === "double_elimination") {
+      progressDoubleElimination(t3);
+    }
     await t3.save();
   }
 
@@ -1204,12 +1211,12 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     if (String(m.teamB || "").trim().toUpperCase() === "BYE") m.teamBName = "BYE";
   }
 
-  // playoff validation
-  if (isPlayoffMatchId(m.id) && m.status === "played") {
+  // playoff / double-elim validation: elimination matches cannot end in a draw
+  if ((isPlayoffMatchId(m.id) || isDoubleElimMatchId(m.id)) && m.status === "played") {
     const aBye = String(m.teamA || "").trim().toUpperCase() === "BYE";
     const bBye = String(m.teamB || "").trim().toUpperCase() === "BYE";
     if (!aBye && !bBye && m.scoreA === m.scoreB) {
-      const err = new Error("Playoff matches cannot end in a draw");
+      const err = new Error("Elimination matches cannot end in a draw");
       err.statusCode = 400;
       throw err;
     }
@@ -1224,6 +1231,10 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     } else {
       recomputeChampion(t);
     }
+  } else if (isDoubleElimMatchId(m.id)) {
+    // Recompute the whole double-elim bracket from the played results so an
+    // edited result cascades through both brackets and the grand final.
+    progressDoubleElimination(t);
   } else {
     recomputeChampion(t);
   }
@@ -1284,8 +1295,250 @@ function generateKnockoutRound1(keys, defaultVenue = "", prefix = "ko", nameByKe
   return out;
 }
 
-function generateDoubleElim(keys, defaultVenue = "", nameByKey) {
-  return generateKnockoutRound1(keys, defaultVenue, "de_wb_r1", nameByKey);
+// ============================================================================
+// Double elimination
+//
+// Full bracket generated up front: a winners bracket (WB), a losers bracket
+// (LB) fed by WB losers, and a grand final with a bracket-reset game. Match ids
+// encode the bracket/round/position: de_wb_r{R}_{P}, de_lb_r{R}_{P}, de_gf_1,
+// de_gf_2. WB round 1 holds the actual seeded draw; every other slot starts as
+// "TBD" and is filled by progressDoubleElimination() as results come in.
+//
+// Progression recomputes ALL derived slots from the played results on every
+// edit, so changing an earlier result correctly cascades (and stale downstream
+// results are cleared). BYEs propagate cleanly: a bye "advances" as BYE so the
+// opponent auto-wins, and a bye never drops a real loser into the LB.
+// ============================================================================
+
+const DE_TBD = "TBD";
+
+function deIsBye(key) {
+  return String(key || "").trim().toUpperCase() === "BYE";
+}
+function deIsTbd(key) {
+  const k = String(key || "").trim();
+  return k === "" || k.toUpperCase() === "TBD";
+}
+function deIsReal(key) {
+  return !deIsBye(key) && !deIsTbd(key);
+}
+
+function deName(key, nameByKey) {
+  if (deIsBye(key)) return "BYE";
+  if (deIsTbd(key)) return "TBD";
+  return nameByKey.get(String(key).trim()) || "Player";
+}
+
+function makeDeMatch({ id, a, b, venue, nameByKey }) {
+  const A = String(a == null || a === "" ? DE_TBD : a).trim();
+  const B = String(b == null || b === "" ? DE_TBD : b).trim();
+  const m = makeMatchBase({ id, teamA: A, teamB: B, venue, nameByKey });
+  m.teamAName = deName(A, nameByKey);
+  m.teamBName = deName(B, nameByKey);
+  if (!deIsReal(A)) m.teamAId = null;
+  if (!deIsReal(B)) m.teamBId = null;
+  return m;
+}
+
+// Standard tournament seed order (1, then 1/2, then 1/4/3/2, ...) so top seeds
+// are spread out and any BYEs fall against the strongest seeds.
+function standardSeedOrder(size) {
+  let order = [1];
+  while (order.length < size) {
+    const n = order.length * 2;
+    const next = [];
+    for (const s of order) {
+      next.push(s);
+      next.push(n + 1 - s);
+    }
+    order = next;
+  }
+  return order;
+}
+
+// The key that ADVANCES out of a match (winner). A bye advances as "BYE" so a
+// downstream opponent auto-wins; an undecided match yields "TBD".
+function deAdvancingKey(m) {
+  if (!m) return DE_TBD;
+  const a = String(m.teamA || "").trim();
+  const b = String(m.teamB || "").trim();
+  if (deIsReal(a) && deIsBye(b)) return a;
+  if (deIsReal(b) && deIsBye(a)) return b;
+  if (deIsBye(a) && deIsBye(b)) return "BYE";
+  if (!deIsReal(a) || !deIsReal(b)) return DE_TBD;
+  if (m.status !== "played" || Number(m.scoreA) === Number(m.scoreB)) return DE_TBD;
+  return Number(m.scoreA) > Number(m.scoreB) ? a : b;
+}
+
+// The key that DROPS to the losers bracket. "BYE" when no real player loses
+// (a bye match), "TBD" when undecided.
+function deLoserDropKey(m) {
+  if (!m) return DE_TBD;
+  const a = String(m.teamA || "").trim();
+  const b = String(m.teamB || "").trim();
+  if (deIsBye(a) || deIsBye(b)) return "BYE";
+  if (!deIsReal(a) || !deIsReal(b)) return DE_TBD;
+  if (m.status !== "played" || Number(m.scoreA) === Number(m.scoreB)) return DE_TBD;
+  return Number(m.scoreA) > Number(m.scoreB) ? b : a;
+}
+
+// A concrete real winner (used for the champion); null unless decided between
+// two real players.
+function deRealWinner(m) {
+  const k = deAdvancingKey(m);
+  return deIsReal(k) ? k : null;
+}
+
+export function generateDoubleElim(keys, defaultVenue = "", nameByKey) {
+  const real = shuffle((keys || []).filter(Boolean));
+  const n = real.length;
+  if (n < 2) return [];
+
+  const S = Math.max(2, nextPowerOf2(n)); // bracket size (power of 2)
+  const W = Math.round(Math.log2(S)); // number of WB rounds
+  const venue = String(defaultVenue || "").trim();
+
+  const seedOrder = standardSeedOrder(S);
+  const slotKeys = seedOrder.map((seed) => (seed <= n ? real[seed - 1] : "BYE"));
+
+  const out = [];
+
+  // Winners bracket round 1 — the actual seeded draw.
+  for (let p = 0; p < S / 2; p++) {
+    out.push(
+      makeDeMatch({
+        id: `de_wb_r1_${p + 1}`,
+        a: slotKeys[2 * p],
+        b: slotKeys[2 * p + 1],
+        venue,
+        nameByKey,
+      })
+    );
+  }
+
+  // Winners bracket rounds 2..W — placeholders.
+  for (let r = 2; r <= W; r++) {
+    const count = S / Math.pow(2, r);
+    for (let p = 1; p <= count; p++) {
+      out.push(makeDeMatch({ id: `de_wb_r${r}_${p}`, a: DE_TBD, b: DE_TBD, venue, nameByKey }));
+    }
+  }
+
+  // Losers bracket rounds 1..(2W-2) — placeholders.
+  const lbRounds = 2 * W - 2;
+  for (let r = 1; r <= lbRounds; r++) {
+    const level = Math.ceil(r / 2);
+    const count = S / Math.pow(2, level + 1);
+    for (let p = 1; p <= count; p++) {
+      out.push(makeDeMatch({ id: `de_lb_r${r}_${p}`, a: DE_TBD, b: DE_TBD, venue, nameByKey }));
+    }
+  }
+
+  // Grand final + bracket-reset game.
+  out.push(makeDeMatch({ id: "de_gf_1", a: DE_TBD, b: DE_TBD, venue, nameByKey }));
+  out.push(makeDeMatch({ id: "de_gf_2", a: DE_TBD, b: DE_TBD, venue, nameByKey }));
+
+  return out;
+}
+
+export function progressDoubleElimination(t) {
+  const matches = Array.isArray(t.matches) ? t.matches : [];
+  const de = matches.filter((m) => isDoubleElimMatchId(m.id));
+  if (de.length === 0) return;
+
+  const byId = new Map(de.map((m) => [String(m.id), m]));
+  const get = (id) => byId.get(String(id)) || null;
+
+  const wbR1Count = de.filter((m) => /^de_wb_r1_\d+$/.test(m.id)).length;
+  const S = wbR1Count * 2;
+  if (S < 2) return;
+  const W = Math.round(Math.log2(S));
+  const nameByKey = buildNameByKey(t);
+
+  // Set a derived slot; clear any stale result if the participants changed.
+  const setSlot = (m, a, b) => {
+    if (!m) return;
+    const A = String(a == null || a === "" ? DE_TBD : a).trim();
+    const B = String(b == null || b === "" ? DE_TBD : b).trim();
+    if (String(m.teamA) !== A || String(m.teamB) !== B) {
+      m.teamA = A;
+      m.teamB = B;
+      m.teamAId = deIsReal(A) ? pkToUserObjectId(A) : null;
+      m.teamBId = deIsReal(B) ? pkToUserObjectId(B) : null;
+      m.scoreA = 0;
+      m.scoreB = 0;
+      m.status = "scheduled";
+    }
+    m.teamAName = deName(A, nameByKey);
+    m.teamBName = deName(B, nameByKey);
+  };
+
+  // Winners bracket rounds 2..W.
+  for (let r = 2; r <= W; r++) {
+    const count = S / Math.pow(2, r);
+    for (let p = 1; p <= count; p++) {
+      setSlot(
+        get(`de_wb_r${r}_${p}`),
+        deAdvancingKey(get(`de_wb_r${r - 1}_${2 * p - 1}`)),
+        deAdvancingKey(get(`de_wb_r${r - 1}_${2 * p}`))
+      );
+    }
+  }
+
+  // Losers bracket.
+  const lbRounds = 2 * W - 2;
+  for (let r = 1; r <= lbRounds; r++) {
+    const level = Math.ceil(r / 2);
+    const count = S / Math.pow(2, level + 1);
+    for (let p = 1; p <= count; p++) {
+      let a;
+      let b;
+      if (r === 1) {
+        // Pair up the WB round 1 losers.
+        a = deLoserDropKey(get(`de_wb_r1_${2 * p - 1}`));
+        b = deLoserDropKey(get(`de_wb_r1_${2 * p}`));
+      } else if (r % 2 === 0) {
+        // Major round: previous LB winner vs a WB loser dropping in.
+        a = deAdvancingKey(get(`de_lb_r${r - 1}_${p}`));
+        b = deLoserDropKey(get(`de_wb_r${level + 1}_${p}`));
+      } else {
+        // Minor round: pair up the previous (major) LB round winners.
+        a = deAdvancingKey(get(`de_lb_r${r - 1}_${2 * p - 1}`));
+        b = deAdvancingKey(get(`de_lb_r${r - 1}_${2 * p}`));
+      }
+      setSlot(get(`de_lb_r${r}_${p}`), a, b);
+    }
+  }
+
+  // Grand final: WB champion vs LB champion. With no LB (S=2), the "LB
+  // champion" is simply the WB final's loser.
+  const wbFinal = get(`de_wb_r${W}_1`);
+  const lbFinal = lbRounds >= 1 ? get(`de_lb_r${lbRounds}_1`) : null;
+  const wbWinner = deAdvancingKey(wbFinal);
+  const lbWinner = lbRounds >= 1 ? deAdvancingKey(lbFinal) : deLoserDropKey(wbFinal);
+
+  const gf1 = get("de_gf_1");
+  setSlot(gf1, wbWinner, lbWinner);
+
+  const gf2 = get("de_gf_2");
+  const gf1A = String(gf1?.teamA || "").trim();
+  const gf1B = String(gf1?.teamB || "").trim();
+  const gf1Winner = deRealWinner(gf1);
+
+  let champion = "";
+  if (gf1Winner && gf1Winner === gf1A) {
+    // The WB side stayed unbeaten — champion, no reset needed.
+    champion = gf1Winner;
+    setSlot(gf2, DE_TBD, DE_TBD);
+  } else if (gf1Winner && gf1Winner === gf1B) {
+    // The LB side handed the WB side its first loss — play the reset game.
+    setSlot(gf2, gf1A, gf1B);
+    champion = deRealWinner(gf2) || "";
+  } else {
+    setSlot(gf2, DE_TBD, DE_TBD);
+  }
+
+  t.championName = champion || "";
 }
 
 export async function generateMatchesForFormat(tournamentId, { format, defaultVenue }) {
@@ -1329,6 +1582,8 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
 
   t.matches = matches;
   t.championName = "";
+  // Resolve any first-round byes into the next slots immediately.
+  if (f === "double_elim" || f === "double_elimination") progressDoubleElimination(t);
   await t.save();
   return t;
 }
