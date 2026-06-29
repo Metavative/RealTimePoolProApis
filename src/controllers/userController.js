@@ -1546,20 +1546,33 @@ export async function updateProfile(req, res) {
     }
 
     if (req.file) {
-      const result = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            folder: "profile_pics",
-            transformation: [{ width: 400, height: 400, crop: "fill", gravity: "auto" }],
-          },
-          (uploadError, uploadResult) => {
-            if (uploadError) reject(uploadError);
-            else resolve(uploadResult);
-          }
-        );
+      let result;
+      try {
+        result = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              folder: "profile_pics",
+              transformation: [{ width: 400, height: 400, crop: "fill", gravity: "auto" }],
+            },
+            (uploadError, uploadResult) => {
+              if (uploadError) reject(uploadError);
+              else resolve(uploadResult);
+            }
+          );
 
-        stream.end(req.file.buffer);
-      });
+          stream.end(req.file.buffer);
+        });
+      } catch (uploadErr) {
+        // Surface a clear, specific error instead of a generic 500 so the cause
+        // (e.g. image hosting / Cloudinary not configured) is diagnosable and the
+        // client can show a meaningful message.
+        console.log("Avatar upload failed:", uploadErr?.message || uploadErr);
+        return res.status(502).json({
+          code: "AVATAR_UPLOAD_FAILED",
+          message:
+            "Profile photo upload failed. Image hosting is not available right now. Please try again later.",
+        });
+      }
 
       user.profile = user.profile || {};
       user.profile.avatar = result.secure_url;
