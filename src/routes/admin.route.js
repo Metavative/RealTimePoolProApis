@@ -29,6 +29,12 @@ import {
   updateClubStatus,
 } from "../controllers/admin.controller.js";
 
+import {
+  adminListPayouts,
+  adminCompletePayout,
+  adminFailPayout,
+} from "../controllers/payments.controller.js";
+
 const router = express.Router();
 
 // ------------------------------
@@ -83,5 +89,12 @@ router.patch(
 // ------------------------------
 router.get("/clubs", adminMiddleware, listClubs);
 router.patch("/clubs/:clubId/status", adminMiddleware, updateClubStatus);
+
+// ------------------------------
+// Payout settlement (player withdrawals + organiser payouts)
+// ------------------------------
+router.get("/payouts", adminMiddleware, adminListPayouts);
+router.post("/payouts/:payoutId/complete", adminMiddleware, adminCompletePayout);
+router.post("/payouts/:payoutId/fail", adminMiddleware, adminFailPayout);
 
 export default router;

@@ -71,9 +71,14 @@ const {
 const { refundTournamentEntry } = await import(
   "../src/controllers/tournamentEconomy.controller.js"
 );
-const { requestOrganizerPayout, listOrganizerPayouts } = await import(
-  "../src/controllers/payments.controller.js"
-);
+const {
+  requestOrganizerPayout,
+  listOrganizerPayouts,
+  requestWalletWithdrawal,
+  adminCompletePayout,
+  adminFailPayout,
+  adminListPayouts,
+} = await import("../src/controllers/payments.controller.js");
 const LedgerEntry = (await import("../src/models/ledgerEntry.model.js")).default;
 const PaymentIntent = (await import("../src/models/paymentIntent.model.js")).default;
 const { dashboard } = await import("../src/controllers/userController.js");
@@ -132,8 +137,14 @@ function playerReq(user, extra = {}) {
   };
 }
 
+let _userSeq = 0;
 async function mkUser(fields = {}) {
+  // Always assign a unique username so usernameLower is non-null; the User model
+  // has a unique index on usernameLower and multiple null values collide once
+  // the index is built (otherwise the suite is order/timing dependent).
+  _userSeq += 1;
   return User.create({
+    username: fields.username || `tester_${_userSeq}`,
     profile: { nickname: fields.name || "P", role: "USER" },
     stats: {
       score: fields.score || 0,
@@ -144,7 +155,6 @@ async function mkUser(fields = {}) {
       total: fields.total || 0,
       availableBalance: fields.balance || 0,
     },
-    ...(fields.username ? { username: fields.username } : {}),
   });
 }
 
@@ -152,9 +162,11 @@ async function mkUser(fields = {}) {
 // Phase A — money ranking via the real leaderboard controller
 // =====================================================================
 await t("A: leaderboard sortBy=money ranks by money, default by score", async () => {
-  const viewer = await mkUser({ name: "Viewer", score: 1, winnings: 1 });
-  await mkUser({ name: "HighScore", score: 1000, winnings: 10 });
-  await mkUser({ name: "RichLowScore", score: 5, winnings: 9999, career: 9999 });
+  // The leaderboard displays the public username (falling back to nickname), so
+  // give these rows explicit usernames matching the labels we assert on.
+  const viewer = await mkUser({ name: "Viewer", username: "Viewer", score: 1, winnings: 1 });
+  await mkUser({ name: "HighScore", username: "HighScore", score: 1000, winnings: 10 });
+  await mkUser({ name: "RichLowScore", username: "RichLowScore", score: 5, winnings: 9999, career: 9999 });
 
   const resMoney = mkRes();
   await leaderboard(playerReq(viewer, { query: { sortBy: "money" } }), resMoney);
@@ -733,6 +745,104 @@ await t("Organizer payout: cashes out ORGANIZER_BALANCE, blocks overdraw, lists 
   await requestOrganizerPayout(clubReq({ amountMinor: 100 }), rDisabled);
   assert.equal(rDisabled.statusCode, 503);
   assert.equal(rDisabled.body.code, "ORGANIZER_PAYOUTS_DISABLED");
+});
+
+// =====================================================================
+// Admin payout settlement — completes withdrawals, reverts to the OWNER
+// =====================================================================
+await t("Admin settlement: completes a player withdrawal and reverts an organiser payout to its own balance", async () => {
+  process.env.FEATURE_PAYMENTS_V2 = "true";
+  process.env.FEATURE_ORGANIZER_PAYOUTS = "true";
+
+  const adminReq = (params, body) => ({
+    user: { role: "admin", profile: { role: "admin" } },
+    params: params || {},
+    body: body || {},
+    query: {},
+  });
+
+  // ---- Player withdrawal -> admin complete (money leaves the platform) ----
+  const player = await mkUser({ name: "Withdrawer" });
+  await LedgerEntry.create({
+    entryId: "LE-WD-1",
+    direction: "CREDIT",
+    accountType: "USER_WALLET",
+    accountId: String(player._id),
+    amountMinor: 5000,
+    currency: "GBP",
+    status: "POSTED",
+    sourceType: "SETTLEMENT",
+    sourceId: "WD-SEED-1",
+  });
+
+  const rReq = mkRes();
+  await requestWalletWithdrawal(
+    {
+      user: { _id: player._id, id: String(player._id) },
+      userId: String(player._id),
+      headers: {},
+      query: {},
+      body: { amountMinor: 2000 },
+    },
+    rReq
+  );
+  assert.equal(rReq.statusCode, 201);
+  const playerPayoutId = rReq.body.payout.payoutId;
+  // Wallet debited to 3000; the 2000 sits in the withdrawal hold.
+  assert.equal(await ledgerBalance("USER_WALLET", String(player._id)), 3000);
+
+  const rComplete = mkRes();
+  await adminCompletePayout(adminReq({ payoutId: playerPayoutId }), rComplete);
+  assert.equal(rComplete.statusCode, 200);
+  assert.equal(rComplete.body.payout.status, "PAID");
+  // Hold drained; wallet stays at 3000 (the money left the platform, not refunded).
+  assert.equal(await ledgerBalance("HOLD_BALANCE", `WD_${playerPayoutId}`), 0);
+  assert.equal(await ledgerBalance("USER_WALLET", String(player._id)), 3000);
+
+  // ---- Organiser payout -> admin fail reverts to ORGANIZER_BALANCE ----
+  const clubId = new mongoose.Types.ObjectId();
+  const owner = await mkUser({ name: "OrgOwner2" });
+  const clubReq = (body) => ({
+    clubId: String(clubId),
+    club: { _id: clubId },
+    ownerUserId: String(owner._id),
+    headers: {},
+    query: {},
+    body: body || {},
+  });
+  await LedgerEntry.create({
+    entryId: "LE-ORG-2",
+    direction: "CREDIT",
+    accountType: "ORGANIZER_BALANCE",
+    accountId: String(clubId),
+    amountMinor: 3000,
+    currency: "GBP",
+    status: "POSTED",
+    sourceType: "SETTLEMENT",
+    sourceId: "ORG-SEED-2",
+  });
+
+  const rOP = mkRes();
+  await requestOrganizerPayout(clubReq({ amountMinor: 1000 }), rOP);
+  assert.equal(rOP.statusCode, 201);
+  const orgPayoutId = rOP.body.payout.payoutId;
+  assert.equal(await ledgerBalance("ORGANIZER_BALANCE", String(clubId)), 2000);
+
+  const rFail = mkRes();
+  await adminFailPayout(adminReq({ payoutId: orgPayoutId }, { reason: "rejected" }), rFail);
+  assert.equal(rFail.statusCode, 200);
+  assert.equal(rFail.body.payout.status, "FAILED");
+  // Hold released; funds return to the CLUB's balance (not the acting admin).
+  assert.equal(await ledgerBalance("HOLD_BALANCE", `OP_${orgPayoutId}`), 0);
+  assert.equal(await ledgerBalance("ORGANIZER_BALANCE", String(clubId)), 3000);
+
+  // ---- Admin list surfaces both payouts with their type ----
+  const rList = mkRes();
+  await adminListPayouts(adminReq({}, {}), rList);
+  assert.equal(rList.statusCode, 200);
+  assert.ok(rList.body.payouts.length >= 2, "lists player + organiser payouts");
+  const types = new Set(rList.body.payouts.map((p) => p.type));
+  assert.ok(types.has("PLAYER") && types.has("ORGANIZER"));
 });
 
 // =====================================================================

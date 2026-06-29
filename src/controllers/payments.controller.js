@@ -3411,6 +3411,306 @@ export async function listOrganizerPayouts(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Admin / back-office payout settlement
+//
+// The player-facing completeWalletWithdrawal/failWalletWithdrawal use
+// findOwnedPayout (caller-owned only), so they can't settle another user's
+// payout and would mis-route a revert. These admin endpoints act on ANY payout
+// and route the ledger to the correct owner: USER_WALLET for player
+// withdrawals, ORGANIZER_BALANCE for organiser payouts. Admin-gated by route
+// (adminMiddleware). Idempotency comes from the atomic Payout status claim.
+// ---------------------------------------------------------------------------
+
+const SETTLABLE_PAYOUT_STATUSES = [
+  "REQUESTED",
+  "PENDING_REVIEW",
+  "APPROVED",
+  "PROCESSING",
+];
+
+function payoutHoldAccountId(payout) {
+  const meta =
+    payout?.metadata && typeof payout.metadata === "object" ? payout.metadata : {};
+  return cleanString(meta.holdAccountId || `WD_${payout.payoutId}`);
+}
+
+// Where a reverted (failed) payout's held funds should return: organiser payouts
+// go back to ORGANIZER_BALANCE; everything else to the owner's USER_WALLET.
+function payoutRevertCreditLine(payout, amountMinor) {
+  const meta =
+    payout?.metadata && typeof payout.metadata === "object" ? payout.metadata : {};
+  if (meta.organizerPayout === true) {
+    return {
+      direction: "CREDIT",
+      accountType: "ORGANIZER_BALANCE",
+      accountId: cleanString(meta.organizerAccountId || payout.clubId),
+      amountMinor,
+    };
+  }
+  return {
+    direction: "CREDIT",
+    accountType: "USER_WALLET",
+    accountId: walletAccountId(cleanString(payout.userId)),
+    amountMinor,
+  };
+}
+
+export async function adminListPayouts(req, res) {
+  try {
+    const status = upper(req.query.status || "");
+    const type = upper(req.query.type || "");
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+
+    const query = {};
+    if (status) query.status = status;
+    if (type === "ORGANIZER") query["metadata.organizerPayout"] = true;
+    if (type === "PLAYER") query["metadata.organizerPayout"] = { $ne: true };
+
+    const rows = await Payout.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      ok: true,
+      payouts: rows.map((p) => ({
+        ...payoutResponse(p),
+        userId: cleanString(p.userId),
+        clubId: cleanString(p.clubId),
+        type: p?.metadata?.organizerPayout ? "ORGANIZER" : "PLAYER",
+      })),
+      meta: { count: rows.length, limit, serverTimeMs: Date.now() },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to load payouts",
+    });
+  }
+}
+
+export async function adminCompletePayout(req, res) {
+  try {
+    if (!paymentsEnabled()) return serviceUnavailable(res);
+
+    const payoutId = upper(req.params.payoutId);
+    const payout = await Payout.findOne({ payoutId });
+    if (!payout) return res.status(404).json({ ok: false, message: "Payout not found" });
+
+    const status = upper(payout.status || "REQUESTED");
+    if (status === "PAID") {
+      return res.json({ ok: true, reused: true, payout: payoutResponse(payout) });
+    }
+    if (!SETTLABLE_PAYOUT_STATUSES.includes(status)) {
+      return res.status(409).json({
+        ok: false,
+        code: "PAYOUT_NOT_SETTLABLE",
+        message: "This payout cannot be completed in its current status.",
+        payout: payoutResponse(payout),
+      });
+    }
+
+    const holdAccountId = payoutHoldAccountId(payout);
+    const amountMinor = Number(payout.amountMinor || 0);
+    const feeMinor = Math.max(0, Number(payout.feeMinor || 0));
+    const netAmountMinor = Math.max(0, amountMinor - feeMinor);
+
+    const holdBalanceMinor = await getLedgerAccountBalanceMinor({
+      accountType: "HOLD_BALANCE",
+      accountId: holdAccountId,
+      currency: payout.currency,
+    });
+    if (holdBalanceMinor < amountMinor) {
+      return res.status(409).json({
+        ok: false,
+        code: "PAYOUT_HOLD_INSUFFICIENT",
+        message: "Payout hold balance is insufficient for settlement.",
+      });
+    }
+
+    // Atomic claim so two concurrent completions can't both pay out.
+    const claimed = await Payout.findOneAndUpdate(
+      { _id: payout._id, status: { $in: SETTLABLE_PAYOUT_STATUSES } },
+      { $set: { status: "PROCESSING" } },
+      { new: true }
+    );
+    if (!claimed) {
+      const fresh = await Payout.findById(payout._id).lean();
+      if (upper(fresh?.status) === "PAID") {
+        return res.json({ ok: true, reused: true, payout: payoutResponse(fresh) });
+      }
+      return res.status(409).json({
+        ok: false,
+        code: "PAYOUT_NOT_SETTLABLE",
+        message: "This payout is already being settled.",
+        payout: fresh ? payoutResponse(fresh) : undefined,
+      });
+    }
+
+    const lines = [
+      {
+        direction: "DEBIT",
+        accountType: "HOLD_BALANCE",
+        accountId: holdAccountId,
+        amountMinor,
+      },
+      {
+        direction: "CREDIT",
+        accountType: "SYSTEM_ADJUSTMENT",
+        accountId: "EXTERNAL_PAYOUT_OUT",
+        amountMinor: netAmountMinor,
+      },
+    ];
+    if (feeMinor > 0) {
+      lines.push({
+        direction: "CREDIT",
+        accountType: "PLATFORM_REVENUE",
+        accountId: "PLATFORM_DEFAULT",
+        amountMinor: feeMinor,
+      });
+    }
+
+    try {
+      await postBalancedLedgerEntries({
+        currency: claimed.currency,
+        sourceType: "WITHDRAWAL",
+        sourceId: claimed.payoutId,
+        metadata: { operation: "PAYOUT_COMPLETE", admin: cleanString(requestUserId(req)) },
+        lines,
+      });
+    } catch (postErr) {
+      await Payout.updateOne(
+        { _id: claimed._id, status: "PROCESSING" },
+        { $set: { status } }
+      );
+      throw postErr;
+    }
+
+    claimed.status = "PAID";
+    claimed.processedAt = new Date();
+    claimed.providerReference = cleanString(
+      req.body?.providerReference || `MANUAL_PAYOUT_${Date.now()}`
+    );
+    claimed.statusTimeline = [
+      ...(Array.isArray(claimed.statusTimeline) ? claimed.statusTimeline : []),
+      { status: "PAID", at: new Date(), note: "Payout completed by admin", actor: "admin" },
+    ];
+    await claimed.save();
+
+    return res.json({ ok: true, payout: payoutResponse(claimed) });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to complete payout",
+    });
+  }
+}
+
+export async function adminFailPayout(req, res) {
+  try {
+    if (!paymentsEnabled()) return serviceUnavailable(res);
+
+    const payoutId = upper(req.params.payoutId);
+    const payout = await Payout.findOne({ payoutId });
+    if (!payout) return res.status(404).json({ ok: false, message: "Payout not found" });
+
+    const currentStatus = upper(payout.status || "REQUESTED");
+    if (["FAILED", "CANCELLED", "REJECTED"].includes(currentStatus)) {
+      return res.json({ ok: true, reused: true, payout: payoutResponse(payout) });
+    }
+    if (currentStatus === "PAID") {
+      return res.status(409).json({
+        ok: false,
+        code: "PAYOUT_ALREADY_PAID",
+        message: "Completed payouts cannot be failed.",
+      });
+    }
+
+    // Atomic claim so the hold-to-owner revert can't be applied twice.
+    const claimed = await Payout.findOneAndUpdate(
+      { _id: payout._id, status: { $in: SETTLABLE_PAYOUT_STATUSES } },
+      { $set: { status: "PROCESSING" } },
+      { new: true }
+    );
+    if (!claimed) {
+      const fresh = await Payout.findById(payout._id).lean();
+      const freshStatus = upper(fresh?.status || "");
+      if (["FAILED", "CANCELLED", "REJECTED"].includes(freshStatus)) {
+        return res.json({ ok: true, reused: true, payout: payoutResponse(fresh) });
+      }
+      return res.status(409).json({
+        ok: false,
+        code: "PAYOUT_NOT_FAILABLE",
+        message: "This payout is already being settled.",
+        payout: fresh ? payoutResponse(fresh) : undefined,
+      });
+    }
+
+    const holdAccountId = payoutHoldAccountId(claimed);
+    const holdBalanceMinor = await getLedgerAccountBalanceMinor({
+      accountType: "HOLD_BALANCE",
+      accountId: holdAccountId,
+      currency: claimed.currency,
+    });
+    const releaseMinor = Math.max(
+      0,
+      Math.min(holdBalanceMinor, Number(claimed.amountMinor || 0))
+    );
+
+    try {
+      if (releaseMinor > 0) {
+        await postBalancedLedgerEntries({
+          currency: claimed.currency,
+          sourceType: "WITHDRAWAL",
+          sourceId: claimed.payoutId,
+          metadata: { operation: "PAYOUT_REVERT", admin: cleanString(requestUserId(req)) },
+          lines: [
+            {
+              direction: "DEBIT",
+              accountType: "HOLD_BALANCE",
+              accountId: holdAccountId,
+              amountMinor: releaseMinor,
+            },
+            // Route the refund back to the ORIGINAL owner (player wallet or
+            // organiser balance) — never the acting admin.
+            payoutRevertCreditLine(claimed, releaseMinor),
+          ],
+        });
+      }
+    } catch (postErr) {
+      await Payout.updateOne(
+        { _id: claimed._id, status: "PROCESSING" },
+        { $set: { status: currentStatus } }
+      );
+      throw postErr;
+    }
+
+    const requested = upper(req.body?.status || "FAILED");
+    claimed.status = ["FAILED", "CANCELLED", "REJECTED"].includes(requested)
+      ? requested
+      : "FAILED";
+    claimed.processedAt = new Date();
+    claimed.statusTimeline = [
+      ...(Array.isArray(claimed.statusTimeline) ? claimed.statusTimeline : []),
+      {
+        status: claimed.status,
+        at: new Date(),
+        note: cleanString(req.body?.reason || "Payout failed; funds returned"),
+        actor: "admin",
+      },
+    ];
+    await claimed.save();
+
+    return res.json({ ok: true, payout: payoutResponse(claimed) });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to fail payout",
+    });
+  }
+}
+
 export async function ingestWebhookEvent(req, res) {
   try {
     const provider = upper(req.params.provider || "UNKNOWN");
