@@ -1104,6 +1104,111 @@ export async function reverseIntentSettlement(intent, { trigger = "refund", acto
   return { reversed: true, reused: false, sourceId: refundSourceId };
 }
 
+function providerRefundsEnabled() {
+  return boolFromEnv("FEATURE_PROVIDER_REFUNDS", false);
+}
+
+/**
+ * Issue a REAL refund of the original charge with the payment provider — the
+ * external, money-moving step that actually returns funds to the player's card.
+ * This is distinct from reverseIntentSettlement(), which only reverses the
+ * INTERNAL ledger; that alone never moves real money back to the customer.
+ *
+ * Gated behind FEATURE_PROVIDER_REFUNDS (default OFF): when off this is a no-op
+ * and the caller behaves exactly as before (internal-only reversal), so existing
+ * flows are unchanged until a live provider is wired and the flag is flipped.
+ *
+ * Idempotent: keyed on REFUND_<intentId> and short-circuits if a providerRefundId
+ * is already recorded on the intent, so a retry can never double-refund a card.
+ * The refund info is stored under metadata.providerRefund (a separate key from
+ * metadata.refund, which reverseIntentSettlement owns) so the two never clobber
+ * each other. Throws on provider error so the caller can abort and release its
+ * claim — leaving nothing partially refunded.
+ */
+export async function requestProviderRefund(
+  intent,
+  { amountMinor, currency, reason = "REFUND", trigger = "refund", actor = "api" } = {}
+) {
+  if (!intent) return { attempted: false, reason: "intent_not_found" };
+  if (!providerRefundsEnabled()) {
+    return { attempted: false, reason: "provider_refunds_disabled" };
+  }
+
+  const meta = intentMeta(intent);
+
+  // Idempotency: never ask the provider to refund the same charge twice.
+  const existing = meta.providerRefund;
+  if (existing && cleanString(existing.providerRefundId)) {
+    return {
+      attempted: true,
+      reused: true,
+      providerRefundId: cleanString(existing.providerRefundId),
+      status: upper(existing.status || "REFUNDED"),
+    };
+  }
+
+  const idempotencyKey = upper(`REFUND_${cleanString(intent.intentId)}`);
+  const amt = Math.max(
+    0,
+    Math.floor(Number(amountMinor) || Number(intent.amountMinor) || 0)
+  );
+  const cur = upper(currency || intent.currency || "GBP");
+
+  const provider = resolvePaymentProvider(intent.provider || providerName());
+  if (typeof provider.refundPayment !== "function") {
+    const err = new Error("Payment provider does not support refunds yet.");
+    err.code = "PROVIDER_REFUND_NOT_SUPPORTED";
+    throw err;
+  }
+
+  const result = await provider.refundPayment({
+    intent,
+    amountMinor: amt,
+    currency: cur,
+    reason: upper(reason),
+    idempotencyKey,
+  });
+
+  const providerRefundId = cleanString(result?.providerRefundId) || idempotencyKey;
+  const providerReference = cleanString(result?.providerReference);
+  const status = upper(result?.status || "REFUNDED");
+
+  intent.metadata = {
+    ...meta,
+    providerRefund: {
+      providerRefundId,
+      providerReference,
+      status,
+      amountMinor: amt,
+      currency: cur,
+      reason: upper(reason),
+      trigger,
+      at: new Date().toISOString(),
+    },
+  };
+  // Record on the timeline WITHOUT changing the intent's lifecycle status — the
+  // ledger reversal (reverseIntentSettlement) is what flips it to REFUNDED.
+  const timeline = Array.isArray(intent.statusTimeline) ? intent.statusTimeline : [];
+  timeline.push({
+    status: upper(intent.status || "PAID"),
+    at: new Date(),
+    note: `Provider refund ${status.toLowerCase()} (${providerRefundId})`,
+    actor: cleanString(actor, "api"),
+  });
+  intent.statusTimeline = timeline;
+  await intent.save();
+
+  return {
+    attempted: true,
+    reused: false,
+    providerRefundId,
+    providerReference,
+    status,
+    amountMinor: amt,
+    currency: cur,
+  };
+}
+
 // Phase C2: draw down a tournament's prize-pool ledger account when a prize is
 // paid out, so PRIZE_TOURN_<id> doesn't keep a phantom balance. The winner's
 // spendable money is credited via the earnings fields (in tournamentPayout

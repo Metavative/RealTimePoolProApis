@@ -54,6 +54,24 @@ export function createMockPaymentProvider() {
       };
     },
 
+    async refundPayment({ intent, amountMinor, currency, idempotencyKey }) {
+      const intentId = cleanString(intent?.intentId);
+      const providerPaymentId =
+        cleanString(intent?.providerPaymentId) || `MOCK_PAY_${intentId}`;
+      // The idempotency key (REFUND_<intentId>) doubles as the synthetic refund
+      // id so repeated calls for the same charge resolve to the same id.
+      const providerRefundId =
+        cleanString(idempotencyKey) || `MOCK_REFUND_${intentId}`;
+      return {
+        status: "REFUNDED",
+        providerRefundId,
+        providerReference: `MOCK_REFUND_${Date.now()}`,
+        providerPaymentId,
+        amountMinor: Math.max(0, Math.floor(Number(amountMinor) || 0)),
+        currency: upper(currency || intent?.currency || "GBP"),
+      };
+    },
+
     async fetchPaymentStatus({ intent }) {
       return {
         status: upper(intent?.status || "PENDING_PAYMENT"),

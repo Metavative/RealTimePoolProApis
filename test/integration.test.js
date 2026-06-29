@@ -72,6 +72,7 @@ const { refundTournamentEntry } = await import(
   "../src/controllers/tournamentEconomy.controller.js"
 );
 const LedgerEntry = (await import("../src/models/ledgerEntry.model.js")).default;
+const PaymentIntent = (await import("../src/models/paymentIntent.model.js")).default;
 const { dashboard } = await import("../src/controllers/userController.js");
 const { platformOverview } = await import("../src/controllers/admin.controller.js");
 
@@ -573,6 +574,98 @@ await t("C2: organiser refund removes entrant once and is idempotent", async () 
   await refundTournamentEntry(clubReq("ORD-REFUND-2"), r3);
   assert.equal(r3.statusCode, 409);
   assert.equal(r3.body.code, "TOURNAMENT_STARTED");
+});
+
+// =====================================================================
+// Provider refunds — real gateway refund returns money to the player
+// =====================================================================
+await t("C2: provider refund issues a real gateway refund only when FEATURE_PROVIDER_REFUNDS is on", async () => {
+  process.env.FEATURE_TOURNAMENT_ECONOMY_V2 = "true";
+  process.env.FEATURE_TOURNAMENT_REFUNDS = "true";
+  process.env.PAYMENTS_PROVIDER = "MOCK";
+
+  const clubId = new mongoose.Types.ObjectId();
+  const clubReq = (orderId) => ({
+    clubId: String(clubId),
+    club: { _id: clubId },
+    authType: "club",
+    auth: { tokenRole: "CLUB" },
+    params: { entryOrderId: orderId },
+    query: {},
+    body: {},
+  });
+
+  const player = await mkUser({ name: "GatewayRefundee" });
+  const tourn = await Tournament.create({
+    title: "Gateway Refund Cup",
+    clubId,
+    accessMode: "OPEN",
+    entriesStatus: "OPEN",
+    status: "DRAFT",
+    entrants: [
+      { entrantId: player._id, participantKey: `uid:${player._id}`, userId: String(player._id) },
+    ],
+    economy: { enabled: true, currency: "GBP", entryFeeMinor: 1000 },
+  });
+  const mkOrder = (orderId, intentId) =>
+    TournamentEntryOrder.create({
+      orderId,
+      tournamentId: tourn._id,
+      clubId,
+      userId: player._id,
+      intentId,
+      status: "PAID",
+      amountMinor: 1000,
+      prizePoolMinor: 500,
+      organizerShareMinor: 500,
+      ledgerApplied: false, // isolate the gateway-refund behaviour from ledger reversal
+      entrantAdded: true,
+    });
+  const mkIntent = (intentId) =>
+    PaymentIntent.create({
+      intentId,
+      module: "TOURNAMENT",
+      moduleRefId: intentId,
+      userId: player._id,
+      provider: "MOCK",
+      currency: "GBP",
+      amountMinor: 1000,
+      status: "PAID",
+      providerPaymentId: `MOCK_PAY_${intentId}`,
+    });
+
+  // ---- flag OFF: prior behaviour — no gateway refund attempted ----
+  delete process.env.FEATURE_PROVIDER_REFUNDS;
+  await mkIntent("GW-INT-OFF");
+  await mkOrder("ORD-GW-OFF", "GW-INT-OFF");
+  const rOff = mkRes();
+  await refundTournamentEntry(clubReq("ORD-GW-OFF"), rOff);
+  assert.equal(rOff.statusCode, 200);
+  assert.equal(rOff.body.refunded, true);
+  assert.equal(rOff.body.providerRefund.attempted, false, "no gateway refund when flag off");
+  const intentOff = await PaymentIntent.findOne({ intentId: "GW-INT-OFF" }).lean();
+  assert.equal(intentOff.metadata?.providerRefund, undefined, "intent not touched by gateway refund");
+
+  // ---- flag ON: a real gateway refund is issued and recorded on the intent ----
+  process.env.FEATURE_PROVIDER_REFUNDS = "true";
+  await mkIntent("GW-INT-ON");
+  await mkOrder("ORD-GW-ON", "GW-INT-ON");
+  const rOn = mkRes();
+  await refundTournamentEntry(clubReq("ORD-GW-ON"), rOn);
+  assert.equal(rOn.statusCode, 200);
+  assert.equal(rOn.body.refunded, true);
+  assert.equal(rOn.body.providerRefund.attempted, true);
+  assert.equal(rOn.body.providerRefund.status, "REFUNDED");
+  assert.equal(rOn.body.providerRefund.providerRefundId, "REFUND_GW-INT-ON");
+  const intentOn = await PaymentIntent.findOne({ intentId: "GW-INT-ON" }).lean();
+  assert.equal(intentOn.metadata.providerRefund.providerRefundId, "REFUND_GW-INT-ON");
+  assert.equal(intentOn.metadata.providerRefund.amountMinor, 1000);
+
+  // Order is refunded and entrant removed exactly as before.
+  const orderOn = await TournamentEntryOrder.findOne({ orderId: "ORD-GW-ON" }).lean();
+  assert.equal(orderOn.status, "REFUNDED");
+
+  process.env.FEATURE_PROVIDER_REFUNDS = "false";
 });
 
 // =====================================================================

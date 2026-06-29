@@ -21,6 +21,8 @@ import {
   summarizeReconciliation,
   isReconciliationSafeToBackfill,
 } from "../src/utils/walletReconciliation.js";
+import { createMockPaymentProvider } from "../src/services/payments/providers/mock.provider.js";
+import { createMyPosPaymentProvider } from "../src/services/payments/providers/mypos.provider.js";
 
 // Tiny fixture helper for ranking tests.
 function mkUser(id, { score = 0, winnings = 0, career, total, gamesWon = 0, name } = {}) {
@@ -674,6 +676,50 @@ await runTest("U0: safe-to-backfill is false when any UNEXPLAINED present", () =
   const unsafe = summarizeReconciliation([{ status: "UNEXPLAINED", deltaMinor: 50 }]);
   assert.equal(isReconciliationSafeToBackfill(safe), true);
   assert.equal(isReconciliationSafeToBackfill(unsafe), false);
+});
+
+// ---- Provider refunds (real gateway refund of a charge) ----
+
+await runTest("mock provider: refundPayment returns a REFUNDED result keyed to the intent", async () => {
+  const provider = createMockPaymentProvider();
+  const result = await provider.refundPayment({
+    intent: { intentId: "PAY_1", providerPaymentId: "MOCK_PAY_PAY_1", currency: "gbp" },
+    amountMinor: 500,
+    currency: "GBP",
+    idempotencyKey: "REFUND_PAY_1",
+  });
+  assert.equal(result.status, "REFUNDED");
+  // Idempotency key doubles as the refund id, so retries resolve to the same id.
+  assert.equal(result.providerRefundId, "REFUND_PAY_1");
+  assert.equal(result.amountMinor, 500);
+  assert.equal(result.currency, "GBP");
+  assert.equal(result.providerPaymentId, "MOCK_PAY_PAY_1");
+});
+
+await runTest("mock provider: refundPayment falls back to a synthetic id without a key", async () => {
+  const provider = createMockPaymentProvider();
+  const result = await provider.refundPayment({ intent: { intentId: "PAY_2" }, amountMinor: 0 });
+  assert.equal(result.providerRefundId, "MOCK_REFUND_PAY_2");
+  assert.equal(result.amountMinor, 0);
+});
+
+await runTest("mypos provider: refundPayment throws NOT_CONFIGURED until creds exist", async () => {
+  // Ensure no myPOS config is present in the test env.
+  for (const k of [
+    "MYPOS_PARTNER_CLIENT_ID",
+    "MYPOS_PARTNER_SECRET",
+    "MYPOS_MERCHANT_CLIENT_ID",
+    "MYPOS_MERCHANT_SECRET",
+    "MYPOS_PARTNER_ID",
+    "MYPOS_APPLICATION_ID",
+  ]) {
+    delete process.env[k];
+  }
+  const provider = createMyPosPaymentProvider();
+  await assert.rejects(
+    () => provider.refundPayment({ intent: { intentId: "PAY_3" }, amountMinor: 100 }),
+    (err) => err.code === "MYPOS_NOT_CONFIGURED"
+  );
 });
 
 if (failures > 0) {

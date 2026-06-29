@@ -4,7 +4,11 @@ import Tournament from "../models/tournament.model.js";
 import TournamentEntryOrder from "../models/tournamentEntryOrder.model.js";
 import User from "../models/user.model.js";
 import { resolvePaymentProvider } from "../services/payments/paymentProvider.factory.js";
-import { applyLedgerRulesForIntent, reverseIntentSettlement } from "./payments.controller.js";
+import {
+  applyLedgerRulesForIntent,
+  reverseIntentSettlement,
+  requestProviderRefund,
+} from "./payments.controller.js";
 import { addEntrantAndReseed } from "../services/tournament.service.js";
 
 function cleanString(v, fallback = "") {
@@ -708,8 +712,15 @@ export async function syncTournamentEntryPayment(req, res) {
  * Organiser-approved refund of a player's paid tournament entry BEFORE the
  * tournament starts. Only the club that owns the tournament may refund.
  * Idempotent (atomic PAID->REFUNDED claim), flag-gated, reverses the ledger and
- * removes the entrant. Money returns to the original payment source via the
- * settlement reversal (EXTERNAL_GATEWAY_IN), so there is no earnings double-count.
+ * removes the entrant.
+ *
+ * Real money is returned to the player's payment method via requestProviderRefund
+ * (the gateway refund), which runs FIRST — the hard-to-reverse external step — so
+ * a gateway failure aborts cleanly with nothing internal changed. The internal
+ * ledger reversal (to EXTERNAL_GATEWAY_IN) then balances the books without an
+ * earnings double-count. The gateway call is itself gated by
+ * FEATURE_PROVIDER_REFUNDS: when off, behaviour is the prior internal-only
+ * reversal (no real money moves) — unchanged until a live provider is wired.
  */
 export async function refundTournamentEntry(req, res) {
   if (!tournamentEconomyEnabled()) return serviceUnavailable(res);
@@ -775,14 +786,49 @@ export async function refundTournamentEntry(req, res) {
       return res.status(409).json({ ok: false, code: "REFUND_CONFLICT" });
     }
 
+    const intent = await PaymentIntent.findOne({ intentId: order.intentId, userId });
+
+    // ---- 1) Real gateway refund FIRST ----
+    // Return the actual money to the player's payment method before touching any
+    // internal state. This is the hard-to-reverse external step, so doing it
+    // first means a gateway failure aborts cleanly with nothing internal changed.
+    // No-op (attempted:false) unless FEATURE_PROVIDER_REFUNDS is on. Idempotent,
+    // so a retry after a later internal failure never double-refunds the card.
+    let providerRefund = { attempted: false };
+    if (intent) {
+      try {
+        providerRefund = await requestProviderRefund(intent, {
+          amountMinor: order.amountMinor,
+          currency: order.currency,
+          reason: "TOURNAMENT_ENTRY_REFUND",
+          trigger: "tournament_entry_refund",
+        });
+      } catch (provErr) {
+        // Gateway refund failed: release the claim and surface a clear error.
+        // We deliberately do NOT reverse the ledger or remove the entrant — the
+        // player keeps their paid spot until the money can actually be returned.
+        await TournamentEntryOrder.updateOne(
+          { _id: order._id },
+          { $set: { status: "PAID" } }
+        );
+        return res.status(502).json({
+          ok: false,
+          code: "PROVIDER_REFUND_FAILED",
+          providerCode: upper(provErr?.code || ""),
+          message: cleanString(
+            provErr?.message ||
+              "Could not refund the original payment with the provider."
+          ),
+        });
+      }
+    }
+
+    // ---- 2) Internal ledger reversal + entrant removal ----
     let ledger = { reversed: false };
     try {
       // Reverse the ledger settlement (only meaningful when it was posted).
-      if (order.ledgerApplied) {
-        const intent = await PaymentIntent.findOne({ intentId: order.intentId, userId });
-        if (intent) {
-          ledger = await reverseIntentSettlement(intent, { trigger: "tournament_entry_refund" });
-        }
+      if (order.ledgerApplied && intent) {
+        ledger = await reverseIntentSettlement(intent, { trigger: "tournament_entry_refund" });
       }
 
       // Remove the entrant from the tournament roster.
@@ -796,8 +842,9 @@ export async function refundTournamentEntry(req, res) {
         { $set: { settledAt: new Date(), entrantAdded: false, "metadata.refundedAt": new Date() } }
       );
     } catch (refundErr) {
-      // Release the claim so the refund can be retried; nothing partial sticks
-      // beyond the idempotent ledger reversal (which is keyed and safe to retry).
+      // Release the claim so the refund can be retried; nothing partial sticks.
+      // Both the gateway refund and the ledger reversal are idempotent (keyed),
+      // so a retry re-uses the already-issued refund rather than double-refunding.
       await TournamentEntryOrder.updateOne(
         { _id: order._id },
         { $set: { status: "PAID" } }
@@ -811,6 +858,7 @@ export async function refundTournamentEntry(req, res) {
       refunded: true,
       order: orderResponse(finalOrder || claimed),
       ledger,
+      providerRefund,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message || "Failed to refund tournament entry" });

@@ -54,6 +54,15 @@ export function createMyPosPaymentProvider() {
       throw err;
     },
 
+    async refundPayment() {
+      if (!hasMyPosConfig()) {
+        throw notConfiguredError();
+      }
+      const err = new Error("myPOS refunds are not active yet");
+      err.code = "MYPOS_REFUND_NOT_IMPLEMENTED";
+      throw err;
+    },
+
     async fetchPaymentStatus() {
       if (!hasMyPosConfig()) {
         throw notConfiguredError();
