@@ -3202,6 +3202,215 @@ export async function myLedgerSummary(req, res) {
   }
 }
 
+function organizerPayoutsEnabled() {
+  return boolFromEnv("FEATURE_ORGANIZER_PAYOUTS", false);
+}
+
+// Organizer earnings accrue to ORGANIZER_BALANCE keyed by the club id (see
+// organizerAccountIdFromIntent). A club-level balance, aggregated across all the
+// club's tournaments.
+function organizerAccountIdForClub(clubId) {
+  return cleanString(clubId);
+}
+
+/**
+ * POST /organizer/payouts  (club-authed)
+ * Lets an organiser cash out their accrued ORGANIZER_BALANCE. Mirrors the player
+ * withdrawal: moves funds ORGANIZER_BALANCE -> HOLD_BALANCE and creates a Payout
+ * in REQUESTED status; the actual money-out settlement is an admin/back-office
+ * step (never self-service). Gated behind FEATURE_ORGANIZER_PAYOUTS (default off)
+ * and FEATURE_PAYMENTS_V2; idempotent via x-idempotency-key.
+ */
+export async function requestOrganizerPayout(req, res) {
+  try {
+    if (!paymentsEnabled()) return serviceUnavailable(res);
+    if (!organizerPayoutsEnabled()) {
+      return res.status(503).json({
+        ok: false,
+        code: "ORGANIZER_PAYOUTS_DISABLED",
+        message: "Organizer payouts are not enabled for this environment.",
+      });
+    }
+
+    const clubId = cleanString(req.clubId || req.club?._id);
+    if (!clubId) {
+      return res.status(401).json({ ok: false, message: "Club authorization required" });
+    }
+
+    // A Payout needs a userId to credit on settlement; use the club's linked
+    // owner account. Without one we can't route the money, so block clearly.
+    const ownerUserId = cleanString(req.ownerUserId);
+    if (!ownerUserId) {
+      return res.status(409).json({
+        ok: false,
+        code: "ORGANIZER_NO_OWNER_USER",
+        message: "Link an owner account to this organizer before requesting a payout.",
+      });
+    }
+
+    const body = req.body || {};
+    const amountMinor = toMinorFromBody(body.amount, body.amountMinor);
+    const currency = upper(body.currency || "GBP");
+    if (amountMinor <= 0) {
+      return res.status(400).json({ ok: false, message: "Amount must be greater than zero" });
+    }
+
+    const accountId = organizerAccountIdForClub(clubId);
+    const balanceMinor = await getLedgerAccountBalanceMinor({
+      accountType: "ORGANIZER_BALANCE",
+      accountId,
+      currency,
+    });
+    if (balanceMinor < amountMinor) {
+      return res.status(400).json({
+        ok: false,
+        code: "INSUFFICIENT_ORGANIZER_BALANCE",
+        message: "Your organizer balance is not enough for this payout.",
+        organizer: { currency, balanceMinor },
+      });
+    }
+
+    const idempotencyKey = cleanString(
+      req.headers["x-idempotency-key"] || body.idempotencyKey
+    );
+    if (idempotencyKey) {
+      const existing = await Payout.findOne({ clubId, idempotencyKey }).lean();
+      if (existing) {
+        return res.json({
+          ok: true,
+          reused: true,
+          payout: payoutResponse(existing),
+          organizer: { currency, balanceMinor },
+        });
+      }
+    }
+
+    const payoutId = generatePublicId("OPO");
+    const holdAccountId = `OP_${payoutId}`;
+    const created = await Payout.create({
+      payoutId,
+      userId: ownerUserId,
+      clubId,
+      provider: providerName(),
+      currency,
+      amountMinor,
+      feeMinor: 0,
+      netAmountMinor: amountMinor,
+      status: "REQUESTED",
+      destinationType: upper(body.destinationType || "BANK"),
+      destinationLast4: cleanString(body.destinationLast4),
+      idempotencyKey,
+      requestedAt: new Date(),
+      statusTimeline: [
+        {
+          status: "REQUESTED",
+          at: new Date(),
+          note: "Organizer payout requested and funds moved to hold",
+          actor: "api",
+        },
+      ],
+      metadata: {
+        ...(body.metadata && typeof body.metadata === "object" ? body.metadata : {}),
+        organizerPayout: true,
+        organizerAccountId: accountId,
+        holdAccountId,
+      },
+    });
+
+    try {
+      await postBalancedLedgerEntries({
+        currency,
+        sourceType: "WITHDRAWAL",
+        sourceId: created.payoutId,
+        metadata: { operation: "ORGANIZER_PAYOUT_REQUEST", clubId },
+        lines: [
+          {
+            direction: "DEBIT",
+            accountType: "ORGANIZER_BALANCE",
+            accountId,
+            amountMinor,
+          },
+          {
+            direction: "CREDIT",
+            accountType: "HOLD_BALANCE",
+            accountId: holdAccountId,
+            amountMinor,
+          },
+        ],
+      });
+    } catch (ledgerErr) {
+      created.status = "FAILED";
+      created.statusTimeline = [
+        ...(Array.isArray(created.statusTimeline) ? created.statusTimeline : []),
+        {
+          status: "FAILED",
+          at: new Date(),
+          note: "Organizer payout hold posting failed",
+          actor: "system",
+        },
+      ];
+      await created.save().catch(() => {});
+      throw ledgerErr;
+    }
+
+    const newBalanceMinor = await getLedgerAccountBalanceMinor({
+      accountType: "ORGANIZER_BALANCE",
+      accountId,
+      currency,
+    });
+    return res.status(201).json({
+      ok: true,
+      payout: payoutResponse(created),
+      organizer: { currency, balanceMinor: newBalanceMinor },
+    });
+  } catch (e) {
+    if (e?.code === 11000) {
+      return res.status(409).json({ ok: false, message: "Duplicate payout request" });
+    }
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to request organizer payout",
+    });
+  }
+}
+
+/**
+ * GET /organizer/payouts  (club-authed)
+ * The organiser's payout history plus their current ORGANIZER_BALANCE.
+ */
+export async function listOrganizerPayouts(req, res) {
+  try {
+    const clubId = cleanString(req.clubId || req.club?._id);
+    if (!clubId) {
+      return res.status(401).json({ ok: false, message: "Club authorization required" });
+    }
+
+    const currency = upper(req.query.currency || "GBP");
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 30)));
+    const payouts = await Payout.find({ clubId, "metadata.organizerPayout": true })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+    const balanceMinor = await getLedgerAccountBalanceMinor({
+      accountType: "ORGANIZER_BALANCE",
+      accountId: organizerAccountIdForClub(clubId),
+      currency,
+    });
+
+    return res.json({
+      ok: true,
+      payouts: payouts.map(payoutResponse),
+      organizer: { currency, balanceMinor },
+      meta: { count: payouts.length, limit, serverTimeMs: Date.now() },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "Failed to load organizer payouts",
+    });
+  }
+}
+
 export async function ingestWebhookEvent(req, res) {
   try {
     const provider = upper(req.params.provider || "UNKNOWN");

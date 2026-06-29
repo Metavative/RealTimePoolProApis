@@ -71,6 +71,9 @@ const {
 const { refundTournamentEntry } = await import(
   "../src/controllers/tournamentEconomy.controller.js"
 );
+const { requestOrganizerPayout, listOrganizerPayouts } = await import(
+  "../src/controllers/payments.controller.js"
+);
 const LedgerEntry = (await import("../src/models/ledgerEntry.model.js")).default;
 const PaymentIntent = (await import("../src/models/paymentIntent.model.js")).default;
 const { dashboard } = await import("../src/controllers/userController.js");
@@ -666,6 +669,70 @@ await t("C2: provider refund issues a real gateway refund only when FEATURE_PROV
   assert.equal(orderOn.status, "REFUNDED");
 
   process.env.FEATURE_PROVIDER_REFUNDS = "false";
+});
+
+// =====================================================================
+// Organizer payouts — cash out ORGANIZER_BALANCE
+// =====================================================================
+await t("Organizer payout: cashes out ORGANIZER_BALANCE, blocks overdraw, lists history", async () => {
+  process.env.FEATURE_PAYMENTS_V2 = "true";
+  process.env.FEATURE_ORGANIZER_PAYOUTS = "true";
+
+  const clubId = new mongoose.Types.ObjectId();
+  const owner = await mkUser({ name: "ClubOwner" });
+  const clubReq = (body) => ({
+    clubId: String(clubId),
+    club: { _id: clubId },
+    ownerUserId: String(owner._id),
+    authType: "club",
+    headers: {},
+    query: {},
+    body: body || {},
+  });
+
+  // Seed organizer earnings: +£20 to ORGANIZER_BALANCE(clubId).
+  await LedgerEntry.create({
+    entryId: "LE-ORG-1",
+    direction: "CREDIT",
+    accountType: "ORGANIZER_BALANCE",
+    accountId: String(clubId),
+    amountMinor: 2000,
+    currency: "GBP",
+    status: "POSTED",
+    sourceType: "SETTLEMENT",
+    sourceId: "ORG-SEED-1",
+  });
+
+  // Overdrawing the balance is rejected.
+  const rOver = mkRes();
+  await requestOrganizerPayout(clubReq({ amountMinor: 5000 }), rOver);
+  assert.equal(rOver.statusCode, 400);
+  assert.equal(rOver.body.code, "INSUFFICIENT_ORGANIZER_BALANCE");
+
+  // A valid £12 payout moves funds to a hold and returns the reduced balance.
+  const rOk = mkRes();
+  await requestOrganizerPayout(clubReq({ amountMinor: 1200 }), rOk);
+  assert.equal(rOk.statusCode, 201);
+  assert.equal(rOk.body.payout.status, "REQUESTED");
+  assert.equal(rOk.body.payout.amountMinor, 1200);
+  assert.equal(rOk.body.organizer.balanceMinor, 800, "balance reduced by payout");
+
+  // ORGANIZER_BALANCE ledger nets to 800 (2000 credit − 1200 debit).
+  assert.equal(await ledgerBalance("ORGANIZER_BALANCE", String(clubId)), 800);
+
+  // The payout shows up in the organiser's history with the live balance.
+  const rList = mkRes();
+  await listOrganizerPayouts(clubReq(), rList);
+  assert.equal(rList.statusCode, 200);
+  assert.equal(rList.body.payouts.length, 1);
+  assert.equal(rList.body.organizer.balanceMinor, 800);
+
+  // With the flag off, requests are refused (zero behaviour change by default).
+  process.env.FEATURE_ORGANIZER_PAYOUTS = "false";
+  const rDisabled = mkRes();
+  await requestOrganizerPayout(clubReq({ amountMinor: 100 }), rDisabled);
+  assert.equal(rDisabled.statusCode, 503);
+  assert.equal(rDisabled.body.code, "ORGANIZER_PAYOUTS_DISABLED");
 });
 
 // =====================================================================

@@ -9,6 +9,10 @@ import {
   refundTournamentEntry,
   myTournamentEntryOrders,
 } from "../controllers/tournamentEconomy.controller.js";
+import {
+  requestOrganizerPayout,
+  listOrganizerPayouts,
+} from "../controllers/payments.controller.js";
 
 const router = express.Router();
 
@@ -23,6 +27,10 @@ router.use((req, res, next) => {
 // Organizer/club controls
 router.put("/organizer/tournaments/:tournamentId/config", clubAuthMiddleware, updateTournamentEconomyConfig);
 router.get("/organizer/tournaments/:tournamentId/summary", clubAuthMiddleware, getTournamentEconomySummary);
+
+// Organizer payouts (cash out accrued ORGANIZER_BALANCE).
+router.post("/organizer/payouts", clubAuthMiddleware, requestOrganizerPayout);
+router.get("/organizer/payouts", clubAuthMiddleware, listOrganizerPayouts);
 
 // Player entry payment flow
 router.post("/player/tournaments/:tournamentId/entry-intent", authMiddleware, createTournamentEntryIntent);
