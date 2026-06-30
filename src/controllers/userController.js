@@ -1420,6 +1420,45 @@ export async function deleteMyAccount(req, res) {
   }
 }
 
+// SECURITY: the ONLY profile fields a client may set via PATCH /api/user/me.
+// Everything else — role, isAdmin, isPlatformAdmin, organizer, fairPlay,
+// verification/KYC status, etc. — is server-controlled and must never be
+// mass-assigned from the request body. (earnings/stats/score are also
+// server-only and are not accepted here at all.)
+const CLIENT_EDITABLE_PROFILE_KEYS = new Set([
+  "name",
+  "legalName",
+  "firstName",
+  "lastName",
+  "nickname",
+  "homeTable",
+  "musicPlayer",
+  "minLevel",
+  "maxLevel",
+  "gender",
+  "dateOfBirth",
+  "dob",
+  "birthDate",
+  "age",
+  "country",
+  "countryCode",
+  "countryName",
+  "region",
+  "state",
+  "county",
+  "province",
+]);
+
+function pickEditableProfile(src) {
+  const out = {};
+  if (src && typeof src === "object") {
+    for (const k of Object.keys(src)) {
+      if (CLIENT_EDITABLE_PROFILE_KEYS.has(k)) out[k] = src[k];
+    }
+  }
+  return out;
+}
+
 export async function updateProfile(req, res) {
   try {
     const user = await User.findById(req.userId);
@@ -1427,7 +1466,13 @@ export async function updateProfile(req, res) {
 
     const payload = req.body || {};
 
-    let nextProfile = mergePlainObject(user.profile || {}, payload.profile || {});
+    // SECURITY: only merge an allow-list of editable fields from the client's
+    // profile object — never the whole thing (prevents privilege escalation via
+    // role/isPlatformAdmin/organizer/etc.).
+    let nextProfile = mergePlainObject(
+      user.profile || {},
+      pickEditableProfile(payload.profile)
+    );
 
     const directName = normalizeName(payload.name);
     const directNickname = toStr(payload.nickname);
@@ -1517,13 +1562,9 @@ export async function updateProfile(req, res) {
     nextProfile = normalizeAvatarProfile(nextProfile, { stampNow: false });
     user.profile = nextProfile;
 
-    if (payload.earnings !== undefined && payload.earnings && typeof payload.earnings === "object") {
-      user.earnings = mergePlainObject(user.earnings || {}, payload.earnings || {});
-    }
-
-    if (payload.stats !== undefined && payload.stats && typeof payload.stats === "object") {
-      user.stats = mergePlainObject(user.stats || {}, payload.stats || {});
-    }
+    // SECURITY: earnings and stats are server-controlled (set by match results,
+    // settlements and the ledger). They are deliberately NOT accepted from the
+    // client here — accepting them allowed wallet/leaderboard manipulation.
 
     if (payload.username !== undefined) {
       const { username, lower } = normalizeUsername(payload.username);

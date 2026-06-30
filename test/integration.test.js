@@ -82,6 +82,7 @@ const {
 const LedgerEntry = (await import("../src/models/ledgerEntry.model.js")).default;
 const PaymentIntent = (await import("../src/models/paymentIntent.model.js")).default;
 const { dashboard } = await import("../src/controllers/userController.js");
+const { updateProfile } = await import("../src/controllers/userController.js");
 const { platformOverview } = await import("../src/controllers/admin.controller.js");
 
 async function ledgerBalance(accountType, accountId, currency = "GBP") {
@@ -898,6 +899,60 @@ await t("D: admin overview reports counts and ledger-derived finance", async () 
   assert.equal(o.finance.platformRevenueMinor, 1234);
   assert.equal(o.finance.prizePoolHeldMinor, 800);
   assert.ok(o.counts.tournamentsByStatus.DRAFT >= 1);
+});
+
+// =====================================================================
+// SECURITY — PATCH /api/user/me must not allow mass-assignment
+// =====================================================================
+await t("SECURITY: updateProfile cannot mass-assign role/admin/earnings/stats", async () => {
+  const u = await mkUser({ name: "Victim", score: 7, winnings: 3, career: 3 });
+  const before = await User.findById(u._id).lean();
+
+  const res = mkRes();
+  await updateProfile(
+    {
+      userId: String(u._id),
+      user: u,
+      body: {
+        name: "New Display Name",
+        profile: {
+          isPlatformAdmin: true,
+          isAdmin: true,
+          role: "admin",
+          fairPlay: 99,
+          organizer: { clubId: "hacked" },
+        },
+        earnings: { availableBalance: 999999, career: 999999, total: 999999 },
+        stats: { score: 999999, totalWinnings: 999999 },
+      },
+    },
+    res
+  );
+  assert.equal(res.statusCode, 200, "the legitimate part of the update still succeeds");
+
+  const after = await User.findById(u._id).lean();
+  // Legitimate editable field IS applied.
+  assert.equal(after.profile.name, "New Display Name");
+  // Privileged profile fields are NOT mass-assigned.
+  assert.notEqual(after.profile.isPlatformAdmin, true, "isPlatformAdmin must not be settable");
+  assert.notEqual(after.profile.isAdmin, true, "isAdmin must not be settable");
+  assert.notEqual(String(after.profile.role || "").toLowerCase(), "admin", "role must not be settable");
+  // Server-controlled money/stats are unchanged.
+  assert.equal(
+    Number(after.earnings?.availableBalance || 0),
+    Number(before.earnings?.availableBalance || 0),
+    "availableBalance must not be settable"
+  );
+  assert.equal(
+    Number(after.stats?.score || 0),
+    Number(before.stats?.score || 0),
+    "stats.score must not be settable"
+  );
+  assert.equal(
+    Number(after.stats?.totalWinnings || 0),
+    Number(before.stats?.totalWinnings || 0),
+    "stats.totalWinnings must not be settable"
+  );
 });
 
 // ---- teardown ----
