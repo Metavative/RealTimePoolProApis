@@ -86,6 +86,10 @@ const { updateProfile } = await import("../src/controllers/userController.js");
 const { platformOverview } = await import("../src/controllers/admin.controller.js");
 const Match = (await import("../src/models/match.model.js")).default;
 const { applyMatchPayoutImpact } = await import("../src/controllers/dispute.controller.js");
+const {
+  getMyposMobileConfig,
+  confirmMyposMobilePayment,
+} = await import("../src/controllers/payments.controller.js");
 
 async function ledgerBalance(accountType, accountId, currency = "GBP") {
   const rows = await LedgerEntry.aggregate([
@@ -1027,6 +1031,118 @@ await t("SECURITY: updateProfile cannot mass-assign role/admin/earnings/stats", 
     Number(before.stats?.totalWinnings || 0),
     "stats.totalWinnings must not be settable"
   );
+});
+
+// =====================================================================
+// myPOS Mobile SDK — mobile-config + mobile/confirm
+// =====================================================================
+await t("myPOS mobile-config: 503 unless payments enabled + provider MYPOS", async () => {
+  const u = await mkUser({ name: "CfgUser" });
+
+  // Payments off → 503.
+  process.env.FEATURE_PAYMENTS_V2 = "false";
+  const r1 = mkRes();
+  await getMyposMobileConfig(playerReq(u), r1);
+  assert.equal(r1.statusCode, 503);
+
+  // Payments on but provider MOCK → 503 (never leaks config).
+  process.env.FEATURE_PAYMENTS_V2 = "true";
+  process.env.PAYMENTS_PROVIDER = "MOCK";
+  const r2 = mkRes();
+  await getMyposMobileConfig(playerReq(u), r2);
+  assert.equal(r2.statusCode, 503);
+
+  // Provider MYPOS + configured → returns the init config incl. currency.
+  process.env.PAYMENTS_PROVIDER = "MYPOS";
+  process.env.MYPOS_WALLET_NUMBER = "40110856610";
+  process.env.MYPOS_SID = "1341961";
+  process.env.MYPOS_KEY_INDEX = "1";
+  process.env.MYPOS_PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\\nAAA\\n-----END RSA PRIVATE KEY-----";
+  process.env.MYPOS_PUBLIC_CERT = "-----BEGIN CERTIFICATE-----\\nBBB\\n-----END CERTIFICATE-----";
+  process.env.MYPOS_MOBILE_CURRENCY = "GBP";
+  const r3 = mkRes();
+  await getMyposMobileConfig(playerReq(u), r3);
+  assert.equal(r3.statusCode, 200);
+  assert.equal(r3.body.config.sid, "1341961");
+  assert.equal(r3.body.config.currency, "GBP");
+  assert.ok(r3.body.config.privateKey && r3.body.config.publicKey);
+
+  process.env.PAYMENTS_PROVIDER = "MOCK";
+  process.env.FEATURE_PAYMENTS_V2 = "false";
+});
+
+await t("myPOS mobile/confirm: verifies, settles wallet top-up, idempotent, replay-guarded", async () => {
+  process.env.FEATURE_PAYMENTS_V2 = "true";
+  process.env.PAYMENTS_PROVIDER = "MYPOS";
+  process.env.MYPOS_MOBILE_CURRENCY = "GBP";
+
+  const buyer = await mkUser({ name: "MobBuyer" });
+
+  // A pending MYPOS wallet top-up intent (as createWalletTopupIntent would make).
+  const mkTopupIntent = async (id, amountMinor) =>
+    PaymentIntent.create({
+      intentId: id, module: "WALLET_TOPUP", userId: buyer._id, provider: "MYPOS",
+      currency: "GBP", amountMinor, status: "PENDING_PAYMENT",
+      statusTimeline: [{ status: "PENDING_PAYMENT", at: new Date(), note: "seed", actor: "test" }],
+      metadata: { walletTopup: true },
+    });
+
+  const intentId = "PAY-MOB-1";
+  await mkTopupIntent(intentId, 700);
+
+  // Confirm WITHOUT a transaction reference → 422, no settlement.
+  const noRef = mkRes();
+  await confirmMyposMobilePayment(
+    playerReq(buyer, { body: { intentId, status: "SUCCESS" } }),
+    noRef
+  );
+  assert.equal(noRef.statusCode, 422);
+  assert.equal(noRef.body.reason, "MISSING_TRANSACTION_REFERENCE");
+  assert.equal(await getUserWalletBalanceMinor({ userId: String(buyer._id) }), 0);
+
+  // Confirm with a reference → settles, wallet credited 700.
+  const ok = mkRes();
+  await confirmMyposMobilePayment(
+    playerReq(buyer, { body: { intentId, transactionReference: "TXN-ABC-1", status: "SUCCESS" } }),
+    ok
+  );
+  assert.equal(ok.statusCode, 200);
+  assert.equal(ok.body.settled, true);
+  assert.equal(ok.body.intent.status, "PAID");
+  assert.equal(await getUserWalletBalanceMinor({ userId: String(buyer._id) }), 700);
+
+  // Idempotent: re-confirm same intent+ref → still 700, no double credit.
+  const again = mkRes();
+  await confirmMyposMobilePayment(
+    playerReq(buyer, { body: { intentId, transactionReference: "TXN-ABC-1", status: "SUCCESS" } }),
+    again
+  );
+  assert.equal(again.statusCode, 200);
+  assert.equal(await getUserWalletBalanceMinor({ userId: String(buyer._id) }), 700);
+
+  // Ownership: a different user cannot confirm this intent.
+  const other = await mkUser({ name: "MobOther" });
+  const forbidden = mkRes();
+  await confirmMyposMobilePayment(
+    playerReq(other, { body: { intentId, transactionReference: "TXN-ABC-1", status: "SUCCESS" } }),
+    forbidden
+  );
+  assert.equal(forbidden.statusCode, 403);
+
+  // Replay guard: a NEW intent cannot reuse TXN-ABC-1.
+  const intentId2 = "PAY-MOB-2";
+  await mkTopupIntent(intentId2, 300);
+  const replay = mkRes();
+  await confirmMyposMobilePayment(
+    playerReq(buyer, { body: { intentId: intentId2, transactionReference: "TXN-ABC-1", status: "SUCCESS" } }),
+    replay
+  );
+  assert.equal(replay.statusCode, 422);
+  assert.equal(replay.body.reason, "TRANSACTION_REFERENCE_REUSED");
+  assert.equal(await getUserWalletBalanceMinor({ userId: String(buyer._id) }), 700);
+
+  process.env.PAYMENTS_PROVIDER = "MOCK";
+  process.env.FEATURE_PAYMENTS_V2 = "false";
 });
 
 // ---- teardown ----

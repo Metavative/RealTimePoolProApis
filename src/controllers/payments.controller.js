@@ -4217,13 +4217,53 @@ export async function getMyposMobileConfig(req, res) {
 }
 
 // POST /api/payments/v2/mypos/mobile/confirm  (auth required)
-// Body: { intentId, transactionReference, status }
-// Called by the app after the native SDK returns. On success it marks the
-// caller-owned MYPOS intent PAID (idempotently) and applies the ledger rules
-// (which credit a wallet top-up or complete a tournament-entry settlement).
+// Verify a myPOS mobile charge before we settle it.
 //
-// NOTE: this trusts the SDK's on-device result. Production hardening = verify
-// the transaction server-side via myPOS IPCGetTransactionStatus before settling.
+// The myPOS Mobile SDK signs + charges the card ON THE DEVICE and returns a
+// transaction reference; its transaction-status endpoint is not published (the
+// URL is obfuscated inside the SDK), so a fully independent server-side check
+// requires the endpoint details from myPOS support. This is the SINGLE place to
+// add that call when available — drop the real IPCGetTransactionStatus request
+// here and return { verified, reason }.
+//
+// Until then we apply the strongest checks we reliably can:
+//   - a genuine SUCCESS always carries a non-empty gateway transaction reference,
+//   - that reference must not already belong to a DIFFERENT settled intent
+//     (replay guard).
+// Toggle stricter behaviour with MYPOS_REQUIRE_TXN_REF (default on).
+async function verifyMyposMobileTransaction(intent, transactionReference) {
+  const requireRef =
+    cleanString(process.env.MYPOS_REQUIRE_TXN_REF, "true").toLowerCase() !== "false";
+  const ref = cleanString(transactionReference);
+
+  if (requireRef && !ref) {
+    return { verified: false, reason: "MISSING_TRANSACTION_REFERENCE" };
+  }
+
+  if (ref) {
+    // Replay guard: the same gateway reference can't settle two intents.
+    const clash = await PaymentIntent.findOne({
+      providerReference: ref,
+      intentId: { $ne: intent.intentId },
+    })
+      .select({ intentId: 1 })
+      .lean();
+    if (clash) {
+      return { verified: false, reason: "TRANSACTION_REFERENCE_REUSED" };
+    }
+  }
+
+  // TODO(mypos): when the myPOS mobile transaction-status endpoint is available,
+  // call it here (IPCMethod=IPCIAGetTxnStatus, OrderID=intent.intentId) and gate
+  // on its TrnStatus before returning verified:true.
+  return { verified: true, reason: "REFERENCE_ACCEPTED" };
+}
+
+// Body: { intentId, transactionReference, status }
+// Called by the app after the native SDK returns. On success it verifies the
+// charge (see verifyMyposMobileTransaction), then marks the caller-owned MYPOS
+// intent PAID (idempotently) and applies the ledger rules (which credit a wallet
+// top-up or complete a tournament-entry settlement).
 export async function confirmMyposMobilePayment(req, res) {
   try {
     if (!paymentsEnabled()) {
@@ -4249,13 +4289,33 @@ export async function confirmMyposMobilePayment(req, res) {
       return res.status(409).json({ ok: false, code: "WRONG_PROVIDER", message: "Not a myPOS payment." });
     }
 
-    if (transactionReference) intent.providerReference = transactionReference;
-
     if (!success) {
+      if (transactionReference) intent.providerReference = transactionReference;
       appendTimeline(intent, intent.status, "myPOS mobile payment failed/cancelled", "app");
       await intent.save();
       return res.status(200).json({ ok: true, intent: paymentIntentResponse(intent), settled: false });
     }
+
+    // Verify the charge before settling. A failed check does NOT mark the intent
+    // PAID, so no money is credited on an unverifiable "success".
+    const verification = await verifyMyposMobileTransaction(intent, transactionReference);
+    if (!verification.verified) {
+      appendTimeline(
+        intent,
+        intent.status,
+        `myPOS mobile confirm rejected (${verification.reason})`,
+        "app"
+      );
+      await intent.save();
+      return res.status(422).json({
+        ok: false,
+        code: "MYPOS_VERIFICATION_FAILED",
+        reason: verification.reason,
+        message: "This payment could not be verified and was not applied.",
+      });
+    }
+
+    if (transactionReference) intent.providerReference = transactionReference;
 
     const nextStatus = normalizeProviderStatus("PAID", intent.status);
     if (allowWebhookStatusTransition(intent.status, nextStatus)) {
