@@ -84,6 +84,8 @@ const PaymentIntent = (await import("../src/models/paymentIntent.model.js")).def
 const { dashboard } = await import("../src/controllers/userController.js");
 const { updateProfile } = await import("../src/controllers/userController.js");
 const { platformOverview } = await import("../src/controllers/admin.controller.js");
+const Match = (await import("../src/models/match.model.js")).default;
+const { applyMatchPayoutImpact } = await import("../src/controllers/dispute.controller.js");
 
 async function ledgerBalance(accountType, accountId, currency = "GBP") {
   const rows = await LedgerEntry.aggregate([
@@ -510,6 +512,78 @@ await t("U2: with FEATURE_LEDGER_UNIFIED, tournament prize credits USER_WALLET l
 
   process.env.FEATURE_LEDGER_UNIFIED = "false";
   process.env.FEATURE_TOURNAMENT_PAYOUTS = "true";
+});
+
+await t("U2: MATCH dispute reversal moves USER_WALLET ledger only when FEATURE_LEDGER_UNIFIED is on", async () => {
+  // entryFee is MAJOR (£10) → pot £20, 10% commission → £18 payout = 1800 minor.
+  const mkFinishedMatch = async (winner, loser) =>
+    Match.create({
+      players: [winner._id, loser._id],
+      status: "finished",
+      winner: winner._id,
+      entryFee: 10,
+    });
+
+  // ---- flag OFF: cache moves, ledger untouched ----
+  {
+    const winner = await mkUser({ name: "DspWinOff", balance: 20 });
+    const loser = await mkUser({ name: "DspLoseOff", balance: 0 });
+    const match = await mkFinishedMatch(winner, loser);
+    // Seed the winner's ledger so we can prove it is NOT touched when the flag is off.
+    await creditUserWallet({
+      userId: String(winner._id), amountMinor: 2000,
+      contraAccountType: "SYSTEM_ADJUSTMENT", contraAccountId: `SYS_${winner._id}`,
+      sourceType: "PAYOUT", baseEntryId: `SEEDOFF_${winner._id}`,
+    });
+
+    process.env.FEATURE_LEDGER_UNIFIED = "false";
+    const r = await applyMatchPayoutImpact({
+      dispute: { caseId: "DSP-OFF-1", moduleRefId: String(match._id) },
+      action: "REVERSE_WINNER_TO_LOSER",
+      session: null,
+    });
+    assert.equal(r.payoutApplied === false ? false : true, true); // sanity: it ran
+
+    // Ledger is unchanged (still the seeded 2000 / 0).
+    assert.equal(await getUserWalletBalanceMinor({ userId: String(winner._id) }), 2000);
+    assert.equal(await getUserWalletBalanceMinor({ userId: String(loser._id) }), 0);
+    // Earnings cache moved by £18.
+    const w = await User.findById(winner._id).lean();
+    const l = await User.findById(loser._id).lean();
+    assert.equal(w.earnings.availableBalance, 2); // 20 - 18
+    assert.equal(l.earnings.availableBalance, 18);
+  }
+
+  // ---- flag ON: ledger AND cache move together ----
+  {
+    const winner = await mkUser({ name: "DspWinOn", balance: 20 });
+    const loser = await mkUser({ name: "DspLoseOn", balance: 0 });
+    const match = await mkFinishedMatch(winner, loser);
+    // The winner's original payout lives in the ledger (as it would post-U2).
+    await creditUserWallet({
+      userId: String(winner._id), amountMinor: 2000,
+      contraAccountType: "SYSTEM_ADJUSTMENT", contraAccountId: `SYS_${winner._id}`,
+      sourceType: "PAYOUT", baseEntryId: `SEEDON_${winner._id}`,
+    });
+
+    process.env.FEATURE_LEDGER_UNIFIED = "true";
+    await applyMatchPayoutImpact({
+      dispute: { caseId: "DSP-ON-1", moduleRefId: String(match._id) },
+      action: "REVERSE_WINNER_TO_LOSER",
+      session: null,
+    });
+
+    // Ledger transfer: winner -1800, loser +1800.
+    assert.equal(await getUserWalletBalanceMinor({ userId: String(winner._id) }), 200);
+    assert.equal(await getUserWalletBalanceMinor({ userId: String(loser._id) }), 1800);
+    // Cache stays consistent with the ledger.
+    const w = await User.findById(winner._id).lean();
+    const l = await User.findById(loser._id).lean();
+    assert.equal(w.earnings.availableBalance, 2);
+    assert.equal(l.earnings.availableBalance, 18);
+
+    process.env.FEATURE_LEDGER_UNIFIED = "false";
+  }
 });
 
 // =====================================================================

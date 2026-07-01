@@ -6,7 +6,7 @@ import User from "../models/user.model.js";
 import Transaction from "../models/transaction.model.js";
 import LedgerEntry from "../models/ledgerEntry.model.js";
 import { requireTransactions } from "../utils/dbTransactions.js";
-import { getSpendableBalanceMinor } from "../services/ledgerUnification.service.js";
+import { getSpendableBalanceMinor, ledgerUnifiedEnabled } from "../services/ledgerUnification.service.js";
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
@@ -194,7 +194,8 @@ async function resolveDisputeTarget(module, moduleRefId, actorUserId) {
   throw err;
 }
 
-async function applyMatchPayoutImpact({ dispute, action, session }) {
+// Exported for integration tests (dispute-reversal ledger write-side). Not a route.
+export async function applyMatchPayoutImpact({ dispute, action, session }) {
   const matchId = toObjectId(dispute.moduleRefId);
   const match = await Match.findById(matchId).session(session);
   if (!match) {
@@ -278,6 +279,44 @@ async function applyMatchPayoutImpact({ dispute, action, session }) {
     },
     { session }
   );
+
+  // U2 (ledger unification) — write-side for MATCH dispute reversals. Under
+  // FEATURE_LEDGER_UNIFIED the winner's original payout lives in the USER_WALLET
+  // ledger (matchController.finishMatch posts MWIN_<matchId>), so a reversal must
+  // move the disputed amount on the ledger too — otherwise the ledger (now the
+  // source of truth) would still show the winner holding money the dispute took
+  // back. Debit the winner's wallet, credit the loser's: a self-balancing
+  // USER_WALLET→USER_WALLET transfer. The U1 gate above guarantees the winner has
+  // enough. Flag OFF (prod today) ⇒ skipped entirely, cache-only behaviour
+  // unchanged. Mirrors the LEVEL_MATCH ledger block below.
+  if (ledgerUnifiedEnabled()) {
+    const transferMinor = Math.round(transferMajor * 100);
+    if (transferMinor > 0) {
+      const sourceId = upper(`DSP_${dispute.caseId}`);
+      const common = {
+        intentId: null,
+        amountMinor: transferMinor,
+        currency: "GBP",
+        status: "POSTED",
+        sourceType: "MANUAL",
+        sourceId,
+        metadata: {
+          operation: "DISPUTE_PAYOUT_ADJUSTMENT",
+          caseId: dispute.caseId,
+          action,
+          module: "MATCH",
+          moduleRefId: cleanString(match._id),
+        },
+      };
+      await LedgerEntry.insertMany(
+        [
+          { entryId: generatePublicId("LE"), direction: "DEBIT", accountType: "USER_WALLET", accountId: winnerUserId, ...common },
+          { entryId: generatePublicId("LE"), direction: "CREDIT", accountType: "USER_WALLET", accountId: loserUserId, ...common },
+        ],
+        { session, ordered: true }
+      );
+    }
+  }
 
   await Transaction.create(
     [
