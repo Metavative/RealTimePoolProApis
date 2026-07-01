@@ -11,6 +11,7 @@ import {
   buildPurchaseForm,
   verifyNotification,
   notificationStatus,
+  myposConfig,
 } from "../services/payments/providers/mypos.provider.js";
 import { hasPlatformAdminAccess, strictWalletEnabled } from "../utils/authz.js";
 
@@ -4159,4 +4160,107 @@ export function serveMyposReturn(req, res) {
 </html>`;
   res.set("Cache-Control", "no-store");
   return res.status(200).type("text/html").send(html);
+}
+
+// =====================================================================
+// myPOS Mobile Checkout SDK (native in-app card entry) — config + confirm
+// =====================================================================
+//
+// The native SDK (Android/iOS) signs and charges the card ON THE DEVICE, so the
+// app needs the merchant init parameters (incl. the merchant private key — this
+// is inherent to the myPOS mobile SDK design, which performs on-device signing).
+// After a successful native charge the app calls the confirm endpoint below to
+// settle the matching PaymentIntent through the same idempotent ledger machinery
+// the webhook uses.
+
+// GET /api/payments/v2/mypos/mobile-config  (auth required)
+// Returns the myPOS Mobile SDK init parameters. Gated on payments being enabled
+// and PAYMENTS_PROVIDER=MYPOS so nothing leaks when the provider is inactive.
+export async function getMyposMobileConfig(req, res) {
+  try {
+    if (!paymentsEnabled()) {
+      return res.status(503).json({ ok: false, code: "PAYMENTS_DISABLED", message: "Payments are not enabled." });
+    }
+    if (providerName() !== "MYPOS" || !hasMyPosConfig()) {
+      return res.status(503).json({ ok: false, code: "MYPOS_NOT_CONFIGURED", message: "myPOS is not configured." });
+    }
+    const c = myposConfig();
+    return res.status(200).json({
+      ok: true,
+      config: {
+        sid: c.sid,
+        walletNumber: c.walletNumber,
+        currency: upper(process.env.MYPOS_MOBILE_CURRENCY || "EUR"),
+        keyIndex: Number(c.keyIndex || 1) || 1,
+        language: c.lang || "EN",
+        isSandbox: c.environment !== "PRODUCTION",
+        privateKey: c.privateKey,
+        publicKey: c.publicCert,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message || "Failed to load myPOS mobile config" });
+  }
+}
+
+// POST /api/payments/v2/mypos/mobile/confirm  (auth required)
+// Body: { intentId, transactionReference, status }
+// Called by the app after the native SDK returns. On success it marks the
+// caller-owned MYPOS intent PAID (idempotently) and applies the ledger rules
+// (which credit a wallet top-up or complete a tournament-entry settlement).
+//
+// NOTE: this trusts the SDK's on-device result. Production hardening = verify
+// the transaction server-side via myPOS IPCGetTransactionStatus before settling.
+export async function confirmMyposMobilePayment(req, res) {
+  try {
+    if (!paymentsEnabled()) {
+      return res.status(503).json({ ok: false, code: "PAYMENTS_DISABLED", message: "Payments are not enabled." });
+    }
+    const intentId = upper(req.body?.intentId || req.body?.orderId);
+    const transactionReference = cleanString(req.body?.transactionReference);
+    const success = upper(req.body?.status || "SUCCESS") === "SUCCESS";
+    if (!intentId) {
+      return res.status(400).json({ ok: false, code: "MISSING_INTENT", message: "intentId is required." });
+    }
+
+    const intent = await PaymentIntent.findOne({ intentId });
+    if (!intent) {
+      return res.status(404).json({ ok: false, code: "INTENT_NOT_FOUND", message: "Payment not found." });
+    }
+    // Ownership: the intent must belong to the authenticated caller.
+    const callerId = cleanString(requestUserId(req));
+    if (callerId && cleanString(intent.userId) !== callerId) {
+      return res.status(403).json({ ok: false, code: "NOT_OWNER", message: "This payment isn't yours." });
+    }
+    if (upper(intent.provider) !== "MYPOS") {
+      return res.status(409).json({ ok: false, code: "WRONG_PROVIDER", message: "Not a myPOS payment." });
+    }
+
+    if (transactionReference) intent.providerReference = transactionReference;
+
+    if (!success) {
+      appendTimeline(intent, intent.status, "myPOS mobile payment failed/cancelled", "app");
+      await intent.save();
+      return res.status(200).json({ ok: true, intent: paymentIntentResponse(intent), settled: false });
+    }
+
+    const nextStatus = normalizeProviderStatus("PAID", intent.status);
+    if (allowWebhookStatusTransition(intent.status, nextStatus)) {
+      appendTimeline(intent, nextStatus, "myPOS mobile payment confirmed", "app");
+      await intent.save();
+    }
+
+    let ledgerResult = null;
+    if (upper(intent.status) === "PAID") {
+      ledgerResult = await applyLedgerRulesForIntent(intent, { trigger: "mypos_mobile", actor: "app" });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      intent: paymentIntentResponse(intent),
+      settled: !!ledgerResult?.applied,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message || "Failed to confirm myPOS mobile payment" });
+  }
 }

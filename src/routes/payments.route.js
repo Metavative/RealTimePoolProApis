@@ -29,6 +29,8 @@ import {
   serveMyposCheckoutRedirect,
   handleMyposNotify,
   serveMyposReturn,
+  getMyposMobileConfig,
+  confirmMyposMobilePayment,
 } from "../controllers/payments.controller.js";
 
 const router = express.Router();
@@ -50,6 +52,10 @@ router.post("/webhooks/:provider", ingestWebhookEvent);
 router.get("/mypos/redirect/:intentId", serveMyposCheckoutRedirect);
 router.post("/mypos/notify", handleMyposNotify);
 router.get("/mypos/return", serveMyposReturn);
+
+// myPOS Mobile Checkout SDK (native in-app card entry) — auth required.
+router.get("/mypos/mobile-config", auth, getMyposMobileConfig);
+router.post("/mypos/mobile/confirm", auth, confirmMyposMobilePayment);
 
 // Auth contracts
 router.post("/intents", auth, createPaymentIntent);
