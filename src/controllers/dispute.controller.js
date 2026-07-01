@@ -6,6 +6,7 @@ import User from "../models/user.model.js";
 import Transaction from "../models/transaction.model.js";
 import LedgerEntry from "../models/ledgerEntry.model.js";
 import { requireTransactions } from "../utils/dbTransactions.js";
+import { getSpendableBalanceMinor } from "../services/ledgerUnification.service.js";
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
@@ -193,30 +194,6 @@ async function resolveDisputeTarget(module, moduleRefId, actorUserId) {
   throw err;
 }
 
-async function userWalletMinorFromLedger({ userId, currency = "GBP", session = null }) {
-  const agg = LedgerEntry.aggregate([
-    {
-      $match: {
-        accountType: "USER_WALLET",
-        accountId: cleanString(userId),
-        currency: upper(currency, "GBP"),
-        status: "POSTED",
-      },
-    },
-    {
-      $group: {
-        _id: null,
-        debitMinor: { $sum: { $cond: [{ $eq: ["$direction", "DEBIT"] }, "$amountMinor", 0] } },
-        creditMinor: { $sum: { $cond: [{ $eq: ["$direction", "CREDIT"] }, "$amountMinor", 0] } },
-      },
-    },
-  ]);
-  if (session) agg.session(session);
-  const rows = await agg;
-  const row = rows[0] || { debitMinor: 0, creditMinor: 0 };
-  return Number(row.creditMinor || 0) - Number(row.debitMinor || 0);
-}
-
 async function applyMatchPayoutImpact({ dispute, action, session }) {
   const matchId = toObjectId(dispute.moduleRefId);
   const match = await Match.findById(matchId).session(session);
@@ -252,7 +229,18 @@ async function applyMatchPayoutImpact({ dispute, action, session }) {
   if (!winner || !loser) throw new Error("Users not found for payout adjustment");
 
   const winnerBalance = Number(winner?.earnings?.availableBalance || 0);
-  if (winnerBalance < transferMajor) {
+  // U1 (ledger unification): gate the reversal on the authoritative spendable
+  // balance. With FEATURE_LEDGER_UNIFIED off (prod today) getSpendableBalanceMinor
+  // returns max(ledger, cache), so for these legacy earnings-cache users it equals
+  // the cache and behaviour is unchanged; with the flag on it gates on the ledger.
+  // The clawback writes below still adjust the earnings cache (that's U2 scope).
+  const winnerSpendableMinor = await getSpendableBalanceMinor({
+    userId: winnerUserId,
+    currency: "GBP",
+    session,
+    fallbackMinor: Math.round(winnerBalance * 100),
+  });
+  if (winnerSpendableMinor < Math.round(transferMajor * 100)) {
     const err = new Error("Winner wallet does not have enough balance for payout reversal");
     err.statusCode = 409;
     throw err;
@@ -350,17 +338,19 @@ async function applyLevelMatchPayoutImpact({ dispute, action, session }) {
     return { payoutApplied: false, payoutAmountMinor: 0, notes: "No payout movement required" };
   }
 
-  const ledgerBalance = await userWalletMinorFromLedger({
-    userId: winnerUserId,
-    currency: row.currency,
-    session,
-  });
   const winner = await User.findById(winnerUserId).select("earnings stats").session(session);
   const loser = await User.findById(loserUserId).select("earnings stats").session(session);
   if (!winner || !loser) throw new Error("Users not found for level payout adjustment");
 
-  const fallbackWinnerMinor = Math.round(Number(winner?.earnings?.availableBalance || 0) * 100);
-  const winnerWalletMinor = Math.max(ledgerBalance, fallbackWinnerMinor);
+  // U1 (ledger unification): gate on the authoritative spendable balance. Off →
+  // max(ledger, cache) (unchanged from the previous hand-rolled max here); on →
+  // ledger only. Passes the earnings cache as the fallback in minor units.
+  const winnerWalletMinor = await getSpendableBalanceMinor({
+    userId: winnerUserId,
+    currency: row.currency,
+    session,
+    fallbackMinor: Math.round(Number(winner?.earnings?.availableBalance || 0) * 100),
+  });
   if (winnerWalletMinor < transferMinor) {
     const err = new Error("Winner wallet does not have enough balance for level payout reversal");
     err.statusCode = 409;
