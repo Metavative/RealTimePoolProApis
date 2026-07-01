@@ -41,6 +41,10 @@ export function myposConfig() {
     publicCert: normalizePem(process.env.MYPOS_PUBLIC_CERT),
     environment: upper(process.env.MYPOS_ENVIRONMENT, "TEST"),
     lang: upper(process.env.MYPOS_LANGUAGE, "EN"),
+    // Informational "Source" tag; myPOS does not validate its value, but it IS
+    // part of the signature so it must be sent and signed consistently. Default
+    // mirrors the myPOS PHP SDK so behaviour matches a known-good integration.
+    source: cleanString(process.env.MYPOS_SOURCE) || "SDK_PHP_1.3.1",
   };
 }
 
@@ -78,29 +82,18 @@ function amountToDecimalString(amountMinor) {
 
 // ---- purchase form -------------------------------------------------------
 //
-// The ORDER of these keys is the order myPOS concatenates values to build the
-// signature, so it must match the myPOS Checkout v1.4 request spec exactly.
-// It is centralised here as the single place to confirm/adjust against the
-// sandbox during activation. Cart-item fields (Article_1.. etc.) are appended
-// in index order after CartItems, which is where myPOS expects them.
-const PURCHASE_FIELD_ORDER = [
-  "IPCmethod",
-  "IPCVersion",
-  "IPCLanguage",
-  "SID",
-  "WalletNumber",
-  "KeyIndex",
-  "Source",
-  "Amount",
-  "Currency",
-  "OrderID",
-  "URL_OK",
-  "URL_Cancel",
-  "URL_Notify",
-  "CardTokenRequest",
-  "PaymentParametersRequired",
-  "CartItems",
-];
+// This replicates the myPOS Checkout PHP SDK's Purchase::process() EXACTLY —
+// same fields, same order, same empty-string placeholders for unused optional
+// fields — because myPOS verifies the signature against its own canonical field
+// set. Omitting a field the SDK sends (even an empty one) breaks verification
+// (E_SIGNATURE_FAILED). Source:
+// github.com/developermypos/myPOS-Checkout-SDK-PHP IPC/Purchase.php + Base.php.
+// Notes on the exact contract:
+//   - customer* field names are LOWERCASE.
+//   - cart-item order is Article, Quantity, Price, Amount, Currency.
+//   - CardTokenRequest / PaymentParametersRequired default to "" (SDK null).
+//   - PaymentMethod defaults to 3 (PAYMENT_METHOD_BOTH); expires_in to "86400".
+//   - Signature = base64( RSA-SHA256( base64(implode('-', allValuesInOrder)) ) ).
 
 // Build the fully-signed set of hidden form fields for an intent. `urls` carries
 // the public https return/notify endpoints (built by the redirect route from the
@@ -118,52 +111,55 @@ export function buildPurchaseForm({ intent, urls }) {
 
   const amount = amountToDecimalString(intent?.amountMinor);
   const currency = upper(intent?.currency, "GBP");
+  const itemName = (cleanString(intent?.metadata?.description) || `Order ${orderId}`).slice(0, 255);
 
-  // Single cart line describing the purchase (myPOS requires at least one item).
-  const itemName = cleanString(intent?.metadata?.description) || `Order ${orderId}`;
-  const item = {
-    Article_1: itemName.slice(0, 255),
-    Quantity_1: "1",
-    Price_1: amount,
-    Amount_1: amount,
-    Currency_1: currency,
-  };
-
-  const base = {
-    IPCmethod: "IPCPurchase",
-    IPCVersion: "1.4",
-    IPCLanguage: c.lang || "EN",
-    SID: c.sid,
-    WalletNumber: c.walletNumber,
-    KeyIndex: c.keyIndex,
-    Source: "Online",
-    Amount: amount,
-    Currency: currency,
-    OrderID: orderId,
-    URL_OK: cleanString(urls?.okUrl),
-    URL_Cancel: cleanString(urls?.cancelUrl),
-    URL_Notify: cleanString(urls?.notifyUrl),
-    CardTokenRequest: "0",
-    PaymentParametersRequired: "1",
-    CartItems: "1",
-  };
-
-  // Values in signature order: the base fields, then the cart-item fields.
-  const orderedValues = [
-    ...PURCHASE_FIELD_ORDER.map((k) => base[k]),
-    item.Article_1,
-    item.Quantity_1,
-    item.Price_1,
-    item.Amount_1,
-    item.Currency_1,
+  // The full field sequence, exactly as the SDK's process() emits it. Kept as an
+  // ordered array of [name, value] so the signature and the form use the very
+  // same order. Empty strings are intentional placeholders the SDK also sends.
+  const entries = [
+    ["IPCmethod", "IPCPurchase"],
+    ["IPCVersion", "1.4"],
+    ["IPCLanguage", c.lang || "EN"],
+    ["SID", c.sid],
+    ["WalletNumber", c.walletNumber],
+    ["KeyIndex", c.keyIndex],
+    ["Source", c.source],
+    ["Currency", currency],
+    ["Amount", amount],
+    ["OrderID", orderId],
+    ["URL_OK", cleanString(urls?.okUrl)],
+    ["URL_Cancel", cleanString(urls?.cancelUrl)],
+    ["URL_Notify", cleanString(urls?.notifyUrl)],
+    ["Note", ""],
+    ["expires_in", "86400"],
+    ["ApplicationID", ""],
+    ["PartnerID", ""],
+    ["customeremail", ""],
+    ["customerphone", ""],
+    ["customerfirstnames", ""],
+    ["customerfamilyname", ""],
+    ["customercountry", ""],
+    ["customercity", ""],
+    ["customerzipcode", ""],
+    ["customeraddress", ""],
+    ["CartItems", "1"],
+    ["Article_1", itemName],
+    ["Quantity_1", "1"],
+    ["Price_1", amount],
+    ["Amount_1", amount],
+    ["Currency_1", currency],
+    ["CardTokenRequest", ""],
+    ["PaymentParametersRequired", ""],
+    ["PaymentMethod", "3"],
   ];
 
-  const Signature = signValues(orderedValues, c.privateKey);
+  const Signature = signValues(entries.map(([, v]) => v), c.privateKey);
 
-  return {
-    action: myposGatewayUrl(),
-    fields: { ...base, ...item, Signature },
-  };
+  const fields = {};
+  for (const [k, v] of entries) fields[k] = v;
+  fields.Signature = Signature;
+
+  return { action: myposGatewayUrl(), fields };
 }
 
 // ---- IPN verification ----------------------------------------------------

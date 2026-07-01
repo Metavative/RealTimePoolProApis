@@ -802,15 +802,19 @@ await runTest("mypos buildPurchaseForm: signs the purchase and targets the sandb
   assert.equal(fields.URL_Notify, urls.notifyUrl);
   assert.ok(fields.Signature && fields.Signature.length > 0, "form is signed");
 
-  // The signature must verify over the exact ordered values the provider signed.
+  // Sanity: SDK field order — KeyIndex/Source right after WalletNumber, Currency
+  // before Amount, customer* lowercase, cart Article,Quantity,Price,Amount,Currency.
+  const keys = Object.keys(fields);
+  assert.deepEqual(keys.slice(0, 9), [
+    "IPCmethod", "IPCVersion", "IPCLanguage", "SID", "WalletNumber",
+    "KeyIndex", "Source", "Currency", "Amount",
+  ]);
+  assert.ok(keys.includes("customeremail") && keys.includes("PaymentMethod"));
+  assert.equal(fields.PaymentMethod, "3");
+  // The signature must verify over the exact posted values, in insertion order,
+  // excluding the Signature field itself.
   const pub = publicKey.export({ type: "spki", format: "pem" });
-  const ordered = [
-    fields.IPCmethod, fields.IPCVersion, fields.IPCLanguage, fields.SID, fields.WalletNumber,
-    fields.KeyIndex, fields.Source, fields.Amount, fields.Currency, fields.OrderID,
-    fields.URL_OK, fields.URL_Cancel, fields.URL_Notify, fields.CardTokenRequest,
-    fields.PaymentParametersRequired, fields.CartItems,
-    fields.Article_1, fields.Quantity_1, fields.Price_1, fields.Amount_1, fields.Currency_1,
-  ];
+  const ordered = keys.filter((k) => k !== "Signature").map((k) => fields[k]);
   assert.equal(verifyValues(ordered, fields.Signature, pub), true);
   clearMyposConfig();
 });
