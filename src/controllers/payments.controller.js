@@ -46,6 +46,12 @@ function providerName() {
   return upper(process.env.PAYMENTS_PROVIDER, "MOCK");
 }
 
+// Currency the myPOS mobile SDK charges in — must equal your myPOS store's
+// currency. Defaults to GBP (the app's wallet currency).
+function myposMobileCurrency() {
+  return upper(process.env.MYPOS_MOBILE_CURRENCY || "GBP");
+}
+
 function providerEnv() {
   const env = upper(process.env.PAYMENTS_ENVIRONMENT, "SANDBOX");
   return env === "PRODUCTION" ? "PRODUCTION" : "SANDBOX";
@@ -1829,7 +1835,14 @@ export async function createWalletTopupIntent(req, res) {
 
     const body = req.body || {};
     const amountMinor = toMinorFromBody(body.amount, body.amountMinor);
-    const currency = upper(body.currency || "GBP");
+    let currency = upper(body.currency || "GBP");
+    // The myPOS mobile SDK charges the card in the store currency
+    // (MYPOS_MOBILE_CURRENCY). Force the intent currency to match so the recorded
+    // intent can never silently diverge from the amount actually charged. Keep
+    // this equal to your myPOS store currency (both should be GBP).
+    if (providerName() === "MYPOS") {
+      currency = myposMobileCurrency();
+    }
     const expiresInMinutes = Math.max(1, Math.min(240, Number(body.expiresInMinutes || 30)));
     const idempotencyKey = cleanString(
       req.headers["x-idempotency-key"] || body.idempotencyKey
@@ -4190,7 +4203,7 @@ export async function getMyposMobileConfig(req, res) {
       config: {
         sid: c.sid,
         walletNumber: c.walletNumber,
-        currency: upper(process.env.MYPOS_MOBILE_CURRENCY || "EUR"),
+        currency: myposMobileCurrency(),
         keyIndex: Number(c.keyIndex || 1) || 1,
         language: c.lang || "EN",
         isSandbox: c.environment !== "PRODUCTION",
