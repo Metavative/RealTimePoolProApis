@@ -36,8 +36,13 @@ export function signValues(orderedValues, privateKeyPem) {
     err.code = "MYPOS_NOT_CONFIGURED";
     throw err;
   }
+  // Normalise to a KeyObject first. myPOS issues PKCS#1 keys
+  // (-----BEGIN RSA PRIVATE KEY-----), which OpenSSL 3 will not decode when
+  // handed as a raw PEM string to sign(); createPrivateKey accepts PKCS#1 and
+  // PKCS#8 alike and yields a KeyObject sign() always accepts.
+  const keyObject = crypto.createPrivateKey(key);
   const base = buildSignatureBase(orderedValues);
-  return crypto.createSign("RSA-SHA256").update(base).sign(key, "base64");
+  return crypto.createSign("RSA-SHA256").update(base).sign(keyObject, "base64");
 }
 
 // Verify a base64 signature over the ordered values against the myPOS public
@@ -54,7 +59,10 @@ export function verifyValues(orderedValues, signatureBase64, publicCertPem) {
   if (!sig) return false;
   const base = buildSignatureBase(orderedValues);
   try {
-    return crypto.createVerify("RSA-SHA256").update(base).verify(cert, sig, "base64");
+    // createPublicKey accepts both a bare public key and an X.509 certificate
+    // (myPOS ships a certificate), and normalises PKCS#1 the same way as above.
+    const keyObject = crypto.createPublicKey(cert);
+    return crypto.createVerify("RSA-SHA256").update(base).verify(keyObject, sig, "base64");
   } catch {
     // Malformed signature / key → treat as unverified rather than crashing the
     // IPN handler (an attacker could otherwise DoS with garbage signatures).

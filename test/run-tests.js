@@ -763,6 +763,19 @@ await runTest("mypos signing: sign→verify roundtrip, and tampering fails", () 
   assert.equal(buildSignatureBase(["a", "b"]), Buffer.from("a-b").toString("base64"));
 });
 
+await runTest("mypos signing: works with a PKCS#1 key (myPOS's format, not PKCS#8)", () => {
+  // myPOS issues -----BEGIN RSA PRIVATE KEY----- (PKCS#1). OpenSSL 3 rejects that
+  // as a raw PEM string to sign(); the helpers must normalise via createPrivateKey.
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pkcs1 = privateKey.export({ type: "pkcs1", format: "pem" });
+  assert.match(pkcs1, /BEGIN RSA PRIVATE KEY/);
+  const pub = publicKey.export({ type: "spki", format: "pem" });
+  const values = ["IPCPurchase", "1.4", "5.00", "EUR", "ORDER-9"];
+  const sig = signValues(values, pkcs1);
+  assert.ok(sig && sig.length > 0, "PKCS#1 key signs without DECODER error");
+  assert.equal(verifyValues(values, sig, pub), true);
+});
+
 await runTest("mypos buildPurchaseForm: signs the purchase and targets the sandbox gateway", () => {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
   clearMyposConfig();
