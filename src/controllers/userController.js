@@ -21,6 +21,7 @@ import UserLoadout from "../models/userLoadout.model.js";
 import Transaction from "../models/transaction.model.js";
 import LedgerEntry from "../models/ledgerEntry.model.js";
 import { v2 as cloudinary } from "cloudinary";
+import { isCloudinaryConfigured } from "../config/cloudinary.config.js";
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
 const RESERVED_USERNAMES = new Set([
@@ -1587,6 +1588,17 @@ export async function updateProfile(req, res) {
     }
 
     if (req.file) {
+      // Fast-fail with a precise reason when image hosting isn't configured,
+      // rather than attempting (and awaiting) a doomed upload.
+      if (!isCloudinaryConfigured()) {
+        console.warn("Avatar upload attempted but Cloudinary is not configured.");
+        return res.status(502).json({
+          code: "AVATAR_UPLOAD_UNAVAILABLE",
+          message:
+            "Profile photo upload isn't available right now. Please try again later.",
+        });
+      }
+
       let result;
       try {
         result = await new Promise((resolve, reject) => {
