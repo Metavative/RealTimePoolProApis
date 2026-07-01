@@ -6,6 +6,12 @@ import PaymentWebhookEvent from "../models/paymentWebhookEvent.model.js";
 import WalletHold from "../models/walletHold.model.js";
 import Settlement from "../models/settlement.model.js";
 import { resolvePaymentProvider } from "../services/payments/paymentProvider.factory.js";
+import {
+  hasMyPosConfig,
+  buildPurchaseForm,
+  verifyNotification,
+  notificationStatus,
+} from "../services/payments/providers/mypos.provider.js";
 import { hasPlatformAdminAccess, strictWalletEnabled } from "../utils/authz.js";
 
 const OPEN_INTENT_STATUSES = ["CREATED", "PENDING_PAYMENT", "PROCESSING"];
@@ -3962,4 +3968,195 @@ export async function ingestWebhookEvent(req, res) {
       message: e.message || "Failed to ingest webhook event",
     });
   }
+}
+
+// =====================================================================
+// myPOS Checkout (Online Payments v1.4) — redirect form + IPN handler
+// =====================================================================
+
+function htmlEscape(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])
+  );
+}
+
+// The public https origin myPOS redirects/notifies back to. Prefer an explicit
+// env value (Railway is behind a proxy) and fall back to the request host.
+function publicBaseUrl(req) {
+  const configured = cleanString(
+    process.env.MYPOS_RETURN_BASE_URL ||
+      process.env.PUBLIC_BASE_URL ||
+      process.env.API_PUBLIC_URL
+  );
+  if (configured) return configured.replace(/\/+$/, "");
+  const host = cleanString(req.get?.("host"));
+  const proto = cleanString(req.protocol) || "https";
+  return host ? `${proto}://${host}` : "";
+}
+
+// GET /api/payments/v2/mypos/redirect/:intentId
+// Serves an auto-submitting, RSA-signed HTML form that POSTs the purchase to the
+// myPOS gateway. Public by design (it is a browser redirect target); the intentId
+// is the unguessable token and only OPEN MYPOS intents are ever rendered.
+export async function serveMyposCheckoutRedirect(req, res) {
+  try {
+    if (!paymentsEnabled()) {
+      return res.status(503).type("text/plain").send("Payments are not enabled.");
+    }
+    if (!hasMyPosConfig()) {
+      return res.status(503).type("text/plain").send("myPOS is not configured.");
+    }
+
+    const intentId = upper(req.params.intentId);
+    const intent = await PaymentIntent.findOne({ intentId });
+    if (!intent) {
+      return res.status(404).type("text/plain").send("Payment not found.");
+    }
+    if (upper(intent.provider) !== "MYPOS") {
+      return res.status(409).type("text/plain").send("Payment is not a myPOS payment.");
+    }
+    await maybeExpireIntent(intent, "mypos_redirect");
+    if (!OPEN_INTENT_STATUSES.includes(upper(intent.status))) {
+      return res
+        .status(409)
+        .type("text/plain")
+        .send(`Payment can no longer be paid (status ${upper(intent.status)}).`);
+    }
+
+    const base = publicBaseUrl(req);
+    const urls = {
+      okUrl: `${base}/api/payments/v2/mypos/return?status=ok&order=${encodeURIComponent(intentId)}`,
+      cancelUrl: `${base}/api/payments/v2/mypos/return?status=cancel&order=${encodeURIComponent(intentId)}`,
+      notifyUrl: `${base}/api/payments/v2/mypos/notify`,
+    };
+
+    const { action, fields } = buildPurchaseForm({ intent, urls });
+
+    // Mark that checkout was launched (does not change lifecycle status).
+    appendTimeline(intent, intent.status, "myPOS checkout form served", "provider");
+    await intent.save();
+
+    const inputs = Object.entries(fields)
+      .map(
+        ([k, v]) =>
+          `<input type="hidden" name="${htmlEscape(k)}" value="${htmlEscape(v)}" />`
+      )
+      .join("\n      ");
+
+    const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Redirecting to secure payment…</title>
+  </head>
+  <body onload="document.forms[0].submit()" style="font-family:sans-serif;text-align:center;padding:2rem;">
+    <p>Redirecting you to the secure myPOS payment page…</p>
+    <form method="post" action="${htmlEscape(action)}">
+      ${inputs}
+      <noscript><button type="submit">Continue to payment</button></noscript>
+    </form>
+  </body>
+</html>`;
+
+    res.set("Cache-Control", "no-store");
+    return res.status(200).type("text/html").send(html);
+  } catch (e) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("Failed to start payment: " + (e?.message || "unknown error"));
+  }
+}
+
+// POST /api/payments/v2/mypos/notify
+// The authoritative payment result. myPOS POSTs IPCPurchaseNotify form fields
+// (incl. its Signature). We verify against the myPOS public cert, then settle the
+// matched intent idempotently via the shared ledger machinery. Always ack with a
+// plain "OK" so myPOS stops retrying a handled notification.
+export async function handleMyposNotify(req, res) {
+  try {
+    // If payments are disabled we still 200-ack so myPOS doesn't hammer retries,
+    // but we do nothing.
+    if (!paymentsEnabled() || !hasMyPosConfig()) {
+      return res.status(200).type("text/plain").send("OK");
+    }
+
+    const fields = req.body && typeof req.body === "object" ? req.body : {};
+
+    if (!verifyNotification(fields)) {
+      return res
+        .status(401)
+        .type("text/plain")
+        .send("INVALID_SIGNATURE");
+    }
+
+    const orderId = upper(fields.OrderID);
+    if (!orderId) {
+      return res.status(200).type("text/plain").send("OK");
+    }
+
+    const intent = await PaymentIntent.findOne({ intentId: orderId });
+    if (!intent) {
+      // Unknown order — ack so myPOS stops retrying; nothing to settle.
+      return res.status(200).type("text/plain").send("OK");
+    }
+    if (upper(intent.provider) !== "MYPOS") {
+      return res.status(200).type("text/plain").send("OK");
+    }
+
+    // Record the gateway transaction reference if provided.
+    const trnRef = cleanString(fields.IPC_Trnref || fields.IPCTrnRef);
+    if (trnRef) intent.providerReference = trnRef;
+
+    const nextStatus = normalizeProviderStatus(notificationStatus(fields), intent.status);
+
+    if (allowWebhookStatusTransition(intent.status, nextStatus)) {
+      if (upper(intent.status) !== upper(nextStatus)) {
+        appendTimeline(intent, nextStatus, "myPOS IPN update", "webhook");
+      } else {
+        appendTimeline(intent, intent.status, "myPOS IPN (unchanged)", "webhook");
+      }
+    } else {
+      appendTimeline(
+        intent,
+        intent.status,
+        "myPOS IPN ignored (terminal status)",
+        "webhook"
+      );
+    }
+    await intent.save();
+
+    if (upper(intent.status) === "PAID") {
+      await applyLedgerRulesForIntent(intent, { trigger: "mypos_ipn", actor: "webhook" });
+    }
+
+    return res.status(200).type("text/plain").send("OK");
+  } catch (e) {
+    // Do NOT ack on an internal error — let myPOS retry.
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("ERROR: " + (e?.message || "unknown"));
+  }
+}
+
+// GET /api/payments/v2/mypos/return
+// Lightweight hosted landing page for URL_OK / URL_Cancel. The app's webview
+// detects this URL to close the sheet; the real settlement already happened via
+// the IPN, so this page is purely informational.
+export function serveMyposReturn(req, res) {
+  const status = upper(req.query.status) === "OK" ? "OK" : "CANCEL";
+  const paid = status === "OK";
+  const html = `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${paid ? "Payment received" : "Payment cancelled"}</title></head>
+  <body style="font-family:sans-serif;text-align:center;padding:2rem;">
+    <h2>${paid ? "✅ Payment received" : "Payment cancelled"}</h2>
+    <p>${paid ? "You can return to the app now." : "No payment was taken. You can close this page."}</p>
+  </body>
+</html>`;
+  res.set("Cache-Control", "no-store");
+  return res.status(200).type("text/html").send(html);
 }

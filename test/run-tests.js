@@ -24,6 +24,18 @@ import {
 import { createMockPaymentProvider } from "../src/services/payments/providers/mock.provider.js";
 import { createMyPosPaymentProvider } from "../src/services/payments/providers/mypos.provider.js";
 import {
+  buildSignatureBase,
+  signValues,
+  verifyValues,
+} from "../src/services/payments/providers/mypos.signing.js";
+import {
+  buildPurchaseForm,
+  verifyNotification,
+  notificationStatus,
+  hasMyPosConfig,
+  myposGatewayUrl,
+} from "../src/services/payments/providers/mypos.provider.js";
+import {
   generateDoubleElim,
   progressDoubleElimination,
 } from "../src/services/tournament.service.js";
@@ -708,23 +720,118 @@ await runTest("mock provider: refundPayment falls back to a synthetic id without
   assert.equal(result.amountMinor, 0);
 });
 
+// Shared: clear all myPOS Checkout config so the provider is "inert".
+const MYPOS_CHECKOUT_VARS = [
+  "MYPOS_WALLET_NUMBER",
+  "MYPOS_SID",
+  "MYPOS_KEY_INDEX",
+  "MYPOS_PRIVATE_KEY",
+  "MYPOS_PUBLIC_CERT",
+  "MYPOS_ENVIRONMENT",
+  "MYPOS_LANGUAGE",
+];
+function clearMyposConfig() {
+  for (const k of MYPOS_CHECKOUT_VARS) delete process.env[k];
+}
+
 await runTest("mypos provider: refundPayment throws NOT_CONFIGURED until creds exist", async () => {
-  // Ensure no myPOS config is present in the test env.
-  for (const k of [
-    "MYPOS_PARTNER_CLIENT_ID",
-    "MYPOS_PARTNER_SECRET",
-    "MYPOS_MERCHANT_CLIENT_ID",
-    "MYPOS_MERCHANT_SECRET",
-    "MYPOS_PARTNER_ID",
-    "MYPOS_APPLICATION_ID",
-  ]) {
-    delete process.env[k];
-  }
+  clearMyposConfig();
   const provider = createMyPosPaymentProvider();
   await assert.rejects(
     () => provider.refundPayment({ intent: { intentId: "PAY_3" }, amountMinor: 100 }),
     (err) => err.code === "MYPOS_NOT_CONFIGURED"
   );
+});
+
+await runTest("mypos signing: sign→verify roundtrip, and tampering fails", () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const priv = privateKey.export({ type: "pkcs8", format: "pem" });
+  const pub = publicKey.export({ type: "spki", format: "pem" });
+
+  const values = ["IPCPurchase", "1.4", "EN", "10.00", "GBP", "ORDER-1"];
+  const sig = signValues(values, priv);
+  assert.ok(typeof sig === "string" && sig.length > 0);
+  assert.equal(verifyValues(values, sig, pub), true, "valid signature verifies");
+
+  // Any change to the signed values must break verification.
+  const tampered = [...values];
+  tampered[3] = "99.00";
+  assert.equal(verifyValues(tampered, sig, pub), false, "tampered amount fails");
+  // A garbage signature must be rejected, not throw.
+  assert.equal(verifyValues(values, "not-a-signature", pub), false);
+  // buildSignatureBase is deterministic base64 of the joined values.
+  assert.equal(buildSignatureBase(["a", "b"]), Buffer.from("a-b").toString("base64"));
+});
+
+await runTest("mypos buildPurchaseForm: signs the purchase and targets the sandbox gateway", () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  clearMyposConfig();
+  process.env.MYPOS_WALLET_NUMBER = "61938166610";
+  process.env.MYPOS_SID = "000000000000010";
+  process.env.MYPOS_KEY_INDEX = "1";
+  process.env.MYPOS_PRIVATE_KEY = privateKey.export({ type: "pkcs8", format: "pem" });
+  process.env.MYPOS_ENVIRONMENT = "TEST";
+  assert.equal(hasMyPosConfig(), true);
+
+  const intent = { intentId: "ORD-100", amountMinor: 1500, currency: "GBP", metadata: { description: "Entry fee" } };
+  const urls = {
+    okUrl: "https://api.example.com/api/payments/v2/mypos/return?status=ok&order=ORD-100",
+    cancelUrl: "https://api.example.com/api/payments/v2/mypos/return?status=cancel&order=ORD-100",
+    notifyUrl: "https://api.example.com/api/payments/v2/mypos/notify",
+  };
+  const { action, fields } = buildPurchaseForm({ intent, urls });
+
+  assert.equal(action, "https://www.mypos.com/vmp/checkout-test");
+  assert.equal(action, myposGatewayUrl());
+  assert.equal(fields.IPCmethod, "IPCPurchase");
+  assert.equal(fields.Amount, "15.00", "minor→decimal");
+  assert.equal(fields.OrderID, "ORD-100");
+  assert.equal(fields.URL_Notify, urls.notifyUrl);
+  assert.ok(fields.Signature && fields.Signature.length > 0, "form is signed");
+
+  // The signature must verify over the exact ordered values the provider signed.
+  const pub = publicKey.export({ type: "spki", format: "pem" });
+  const ordered = [
+    fields.IPCmethod, fields.IPCVersion, fields.IPCLanguage, fields.SID, fields.WalletNumber,
+    fields.KeyIndex, fields.Source, fields.Amount, fields.Currency, fields.OrderID,
+    fields.URL_OK, fields.URL_Cancel, fields.URL_Notify, fields.CardTokenRequest,
+    fields.PaymentParametersRequired, fields.CartItems,
+    fields.Article_1, fields.Quantity_1, fields.Price_1, fields.Amount_1, fields.Currency_1,
+  ];
+  assert.equal(verifyValues(ordered, fields.Signature, pub), true);
+  clearMyposConfig();
+});
+
+await runTest("mypos verifyNotification + notificationStatus: accept valid IPN, reject tampered", () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  clearMyposConfig();
+  // The IPN is signed by myPOS with THEIR private key; we verify with their cert.
+  process.env.MYPOS_PUBLIC_CERT = publicKey.export({ type: "spki", format: "pem" });
+  process.env.MYPOS_WALLET_NUMBER = "61938166610";
+  process.env.MYPOS_SID = "000000000000010";
+  process.env.MYPOS_KEY_INDEX = "1";
+  process.env.MYPOS_PRIVATE_KEY = "unused-for-verify";
+
+  const notify = {
+    IPCmethod: "IPCPurchaseNotify", IPCVersion: "1.4", IPCLanguage: "EN",
+    SID: "000000000000010", WalletNumber: "61938166610", KeyIndex: "1",
+    Amount: "15.00", Currency: "GBP", OrderID: "ORD-100", IPC_Trnref: "TRN-9",
+    Status: "0",
+  };
+  const orderedNotify = [
+    notify.IPCmethod, notify.IPCVersion, notify.IPCLanguage, notify.SID, notify.WalletNumber,
+    notify.KeyIndex, notify.Amount, notify.Currency, notify.OrderID, notify.IPC_Trnref,
+  ];
+  notify.Signature = signValues(orderedNotify, privateKey.export({ type: "pkcs8", format: "pem" }));
+
+  assert.equal(verifyNotification(notify), true, "well-signed IPN verifies");
+  assert.equal(notificationStatus(notify), "PAID", "Status 0 → PAID");
+
+  const tampered = { ...notify, Amount: "1.00" };
+  assert.equal(verifyNotification(tampered), false, "tampered amount fails verification");
+  assert.equal(notificationStatus({ Status: "CANCELLED" }), "CANCELLED");
+  assert.equal(notificationStatus({ Status: "7" }), "FAILED");
+  clearMyposConfig();
 });
 
 // ---- Double elimination engine ----

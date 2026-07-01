@@ -26,6 +26,9 @@ import {
   myLedgerEntries,
   myLedgerSummary,
   ingestWebhookEvent,
+  serveMyposCheckoutRedirect,
+  handleMyposNotify,
+  serveMyposReturn,
 } from "../controllers/payments.controller.js";
 
 const router = express.Router();
@@ -41,6 +44,12 @@ router.use((req, res, next) => {
 // Public contracts
 router.get("/status", v2Status);
 router.post("/webhooks/:provider", ingestWebhookEvent);
+
+// myPOS Checkout — public browser/gateway endpoints (no auth: redirect target,
+// gateway IPN, and hosted return page). Settlement authority is the signed IPN.
+router.get("/mypos/redirect/:intentId", serveMyposCheckoutRedirect);
+router.post("/mypos/notify", handleMyposNotify);
+router.get("/mypos/return", serveMyposReturn);
 
 // Auth contracts
 router.post("/intents", auth, createPaymentIntent);
