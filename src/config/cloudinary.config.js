@@ -34,7 +34,9 @@ const connectCloudinary = async () => {
 
   try {
     await cloudinary.api.ping();
-    console.log("Cloudinary is connected".bgMagenta);
+    // Plain string — don't depend on the `colors` String.prototype patch being
+    // loaded first (it prints "undefined" if this runs before colors is imported).
+    console.log("✅ Cloudinary is connected");
   } catch (err) {
     // Non-fatal: don't block boot, but make a bad credential obvious.
     console.error(
