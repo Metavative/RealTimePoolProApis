@@ -454,12 +454,43 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 4000;
 
 // --------------------------------------------------
+// Payments safety guard
+// --------------------------------------------------
+// The MOCK payment provider never talks to a real gateway: it just credits
+// wallets on request. That is exactly what we want in dev/test, and exactly
+// what must NEVER run in production with real money enabled — anyone could
+// top up their wallet for free. Refuse to boot if a production deployment
+// has FEATURE_PAYMENTS_V2 on while the provider is still MOCK.
+function assertPaymentsSafeForEnv() {
+  const bool = (name) => {
+    const raw = String(process.env[name] ?? "").trim().toLowerCase();
+    return raw === "true" || raw === "1" || raw === "yes";
+  };
+  const provider = String(process.env.PAYMENTS_PROVIDER ?? "MOCK").trim().toUpperCase();
+  const paymentsOn = bool("FEATURE_PAYMENTS_V2");
+  const isProd =
+    String(process.env.NODE_ENV ?? "").trim().toLowerCase() === "production" ||
+    String(process.env.PAYMENTS_ENVIRONMENT ?? "").trim().toUpperCase() === "PRODUCTION";
+
+  if (isProd && paymentsOn && provider === "MOCK") {
+    throw new Error(
+      "Refusing to start: production has FEATURE_PAYMENTS_V2=true but " +
+        "PAYMENTS_PROVIDER=MOCK. The MOCK provider issues free wallet credits " +
+        "and must never handle real money. Set a real provider (e.g. MYPOS) " +
+        "or disable FEATURE_PAYMENTS_V2."
+    );
+  }
+  return true;
+}
+
+// --------------------------------------------------
 // Start server
 // --------------------------------------------------
 (async () => {
   try {
     console.log("ðŸš€ Booting server...");
     assertAuthConfig();
+    assertPaymentsSafeForEnv();
     await connectDb();
     console.log("âœ… DB connected");
 
