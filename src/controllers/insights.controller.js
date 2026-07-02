@@ -6,6 +6,7 @@ import TournamentEntryOrder from "../models/tournamentEntryOrder.model.js";
 import DisputeCase from "../models/disputeCase.model.js";
 import LedgerEntry from "../models/ledgerEntry.model.js";
 import { evaluateAndAwardMilestones } from "../services/achievement.service.js";
+import { isPlatformAdmin } from "../utils/authz.js";
 
 function cleanString(v, fallback = "") {
   return String(v ?? fallback).trim();
@@ -255,11 +256,25 @@ export async function advancedLeaderboard(req, res) {
           "stats.bestWinStreak",
           "stats.rank",
           "stats.userIdTag",
+          // Role/flag fields so platform-admin/system accounts can be excluded.
+          "email",
+          "role",
+          "userType",
+          "accountType",
+          "isAdmin",
+          "isPlatformAdmin",
+          "profile.role",
+          "profile.userType",
+          "profile.type",
+          "profile.isAdmin",
+          "profile.isPlatformAdmin",
         ].join(" ")
       )
       .lean();
 
     const filtered = users
+      // Never surface platform-admin / system accounts in the player leaderboard.
+      .filter((u) => !isPlatformAdmin(u))
       .filter((u) => includeByCategory(u, category))
       .filter((u) => includeByScope(u, scope, viewerCountry, viewerRegion));
 

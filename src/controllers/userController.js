@@ -22,6 +22,7 @@ import Transaction from "../models/transaction.model.js";
 import LedgerEntry from "../models/ledgerEntry.model.js";
 import { v2 as cloudinary } from "cloudinary";
 import { isCloudinaryConfigured } from "../config/cloudinary.config.js";
+import { isPlatformAdmin } from "../utils/authz.js";
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{3,20}$/;
 const RESERVED_USERNAMES = new Set([
@@ -1113,11 +1114,26 @@ export async function leaderboard(req, res) {
             "imageUrl",
             "userAvatar",
             "avatarPath",
+            // Role/flag fields so platform-admin/system accounts can be excluded
+            // from the player leaderboard.
+            "email",
+            "role",
+            "userType",
+            "accountType",
+            "isAdmin",
+            "isPlatformAdmin",
+            "profile.role",
+            "profile.userType",
+            "profile.type",
+            "profile.isAdmin",
+            "profile.isPlatformAdmin",
         ].join(" ")
       )
       .lean();
 
     const filtered = users
+      // Never surface platform-admin / system accounts in the player leaderboard.
+      .filter((u) => !isPlatformAdmin(u))
       .filter((u) => includeByCategory(u, category))
       .filter((u) => includeByScope(u, scope, viewerCountry, viewerRegion));
 

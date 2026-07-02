@@ -35,6 +35,10 @@ const connectDb = async () => {
     }
 
     const conn = await mongoose.connect(process.env.MONGO_URI, {
+      // Optional isolated-database override (e.g. a demo/staging run against the
+      // same cluster). Unset => the database from the connection string is used,
+      // so production behaviour is unchanged.
+      ...(process.env.MONGO_DB_NAME ? { dbName: String(process.env.MONGO_DB_NAME).trim() } : {}),
       maxPoolSize: Number(process.env.MONGO_MAX_POOL || 20),
       minPoolSize: Number(process.env.MONGO_MIN_POOL || 0),
       serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECT_MS || 10000),

@@ -7,6 +7,10 @@ import WalletHold from "../models/walletHold.model.js";
 import Settlement from "../models/settlement.model.js";
 import { resolvePaymentProvider } from "../services/payments/paymentProvider.factory.js";
 import {
+  ledgerUnifiedEnabled,
+  syncAvailableBalanceCache,
+} from "../services/ledgerUnification.service.js";
+import {
   hasMyPosConfig,
   buildPurchaseForm,
   verifyNotification,
@@ -924,6 +928,25 @@ async function findSettlementByIntent(intent) {
   return Settlement.findOne({ intentId: intent._id }).lean();
 }
 
+// Keep earnings.availableBalance (the cache the app's home dashboard reads) in
+// step with the authoritative USER_WALLET ledger after any wallet money movement.
+// Deposits/withdrawals previously posted the ledger but never refreshed this cache,
+// so the dashboard could read a stale balance (e.g. £0 right after a top-up) even
+// though the wallet screen — which reads the ledger — was correct. Best-effort and
+// gated on the unified-ledger flag, matching the other U4 write-through sites.
+async function syncWalletCacheForUser(userId, currency = "GBP") {
+  try {
+    if (ledgerUnifiedEnabled() && cleanString(userId)) {
+      await syncAvailableBalanceCache({
+        userId: cleanString(userId),
+        currency: upper(currency, "GBP"),
+      });
+    }
+  } catch (_) {
+    // A stale cache self-heals on the next sync; never fail the request over it.
+  }
+}
+
 export async function applyLedgerRulesForIntent(intent, { trigger = "manual", actor = "api" } = {}) {
   if (!intent) {
     return { applied: false, reason: "intent_not_found" };
@@ -939,6 +962,7 @@ export async function applyLedgerRulesForIntent(intent, { trigger = "manual", ac
 
   if (ledgerMeta.posted === true) {
     const settlement = await findSettlementByIntent(intent);
+    await syncWalletCacheForUser(intent.userId, intent.currency);
     return {
       applied: true,
       reused: true,
@@ -973,6 +997,7 @@ export async function applyLedgerRulesForIntent(intent, { trigger = "manual", ac
           : cleanString(meta.walletTopupSettledAt),
     };
     await intent.save();
+    await syncWalletCacheForUser(intent.userId, intent.currency);
     return {
       applied: true,
       reused: true,
@@ -1036,6 +1061,7 @@ export async function applyLedgerRulesForIntent(intent, { trigger = "manual", ac
   };
   appendTimeline(intent, intent.status, "Ledger settlement posted", actor);
   await intent.save();
+  await syncWalletCacheForUser(intent.userId, intent.currency);
 
   return {
     applied: true,
@@ -2690,6 +2716,8 @@ export async function requestWalletWithdrawal(req, res) {
     const result = await createWithdrawalRequestRecord(req);
     const userId = requestUserId(req);
     const currency = upper(result.payout.currency || "GBP");
+    // A withdrawal moved money out of USER_WALLET — refresh the dashboard cache.
+    await syncWalletCacheForUser(userId, currency);
     const walletBalanceMinor = await getLedgerAccountBalanceMinor({
       accountType: "USER_WALLET",
       accountId: walletAccountId(userId),
@@ -2988,6 +3016,9 @@ export async function failWalletWithdrawal(req, res) {
       },
     ];
     await claimedPayout.save();
+
+    // The revert credited USER_WALLET back — refresh the dashboard cache.
+    await syncWalletCacheForUser(requestUserId(req), claimedPayout.currency);
 
     const walletBalanceMinor = await getLedgerAccountBalanceMinor({
       accountType: "USER_WALLET",
