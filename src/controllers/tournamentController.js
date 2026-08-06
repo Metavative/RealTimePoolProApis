@@ -384,13 +384,48 @@ export async function configureFormat(req, res) {
       req.body?.knockoutType || t.formatConfig?.knockoutType || "SINGLE_ELIM"
     ).trim();
 
-    const thirdPlacePlayoff = !!req.body?.thirdPlacePlayoff;
-    const groupRandomize =
-      req.body?.groupRandomize === undefined ? true : !!req.body.groupRandomize;
-    const groupBalanced =
-      req.body?.groupBalanced === undefined ? true : !!req.body.groupBalanced;
-    const enableKnockoutStage =
-      req.body?.enableKnockoutStage === undefined ? true : !!req.body.enableKnockoutStage;
+    // Omitted flags keep their stored value. Previously an omitted field was
+    // treated as "set it to the default", so a partial update (e.g. changing
+    // only the match length) silently switched thirdPlacePlayoff off and the
+    // other three on.
+    const keepBool = (incoming, stored, fallback) =>
+      incoming === undefined ? (stored === undefined ? fallback : !!stored) : !!incoming;
+
+    const thirdPlacePlayoff = keepBool(
+      req.body?.thirdPlacePlayoff,
+      t.formatConfig?.thirdPlacePlayoff,
+      false
+    );
+    const groupRandomize = keepBool(
+      req.body?.groupRandomize,
+      t.formatConfig?.groupRandomize,
+      true
+    );
+    const groupBalanced = keepBool(
+      req.body?.groupBalanced,
+      t.formatConfig?.groupBalanced,
+      true
+    );
+    const enableKnockoutStage = keepBool(
+      req.body?.enableKnockoutStage,
+      t.formatConfig?.enableKnockoutStage,
+      true
+    );
+
+    // Default match length in frames (race to N). Omitted => keep what is set.
+    const raceTo = Math.max(
+      0,
+      Math.min(
+        99,
+        Math.floor(
+          Number(
+            req.body?.raceTo === undefined
+              ? t.formatConfig?.raceTo || 0
+              : req.body.raceTo
+          ) || 0
+        )
+      )
+    );
 
     t.formatConfig = {
       groupCount,
@@ -400,6 +435,7 @@ export async function configureFormat(req, res) {
       groupRandomize,
       groupBalanced,
       enableKnockoutStage,
+      raceTo,
     };
 
     // keep legacy mirrors aligned for older clients / recovery

@@ -502,6 +502,68 @@ if (oneId) {
 }
 
 // ==========================================================================
+console.log("\n[6b] Match length (race to N frames)");
+// ==========================================================================
+
+const raceId = await mkKnockout(4, "KORACE");
+if (raceId) {
+  // Set a tournament-wide race to 5.
+  const cfg = await api("POST", `/api/tournaments/${raceId}/format/configure`, {
+    token: clubToken,
+    body: { raceTo: 5 },
+  });
+  check("set tournament match length 2xx", cfg.status >= 200 && cfg.status < 300, `status ${cfg.status}`);
+  let d = unwrap(await api("GET", `/api/tournaments/${raceId}`, { token: clubToken }));
+  check("raceTo persisted", Number(d?.formatConfig?.raceTo) === 5, `got ${d?.formatConfig?.raceTo}`);
+
+  // A partial configure must not clobber the other format flags.
+  check(
+    "partial configure preserved enableKnockoutStage",
+    d?.formatConfig?.enableKnockoutStage === true,
+    `got ${d?.formatConfig?.enableKnockoutStage}`
+  );
+
+  // Wrong scores for a race to 5 must be refused.
+  const short = await api("PATCH", `/api/tournaments/${raceId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_1", scoreA: 4, scoreB: 2, status: "played" },
+  });
+  check("4-2 rejected in a race to 5", short.status >= 400, `status ${short.status}`);
+
+  const over = await api("PATCH", `/api/tournaments/${raceId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_1", scoreA: 7, scoreB: 2, status: "played" },
+  });
+  check("7-2 rejected in a race to 5", over.status >= 400, `status ${over.status}`);
+
+  const both = await api("PATCH", `/api/tournaments/${raceId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_1", scoreA: 5, scoreB: 5, status: "played" },
+  });
+  check("5-5 rejected in a race to 5", both.status >= 400, `status ${both.status}`);
+
+  const good = await api("PATCH", `/api/tournaments/${raceId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_1", scoreA: 5, scoreB: 3, status: "played" },
+  });
+  check("5-3 accepted in a race to 5", good.status >= 200 && good.status < 300, `status ${good.status}`);
+
+  // Per-match override: make the second semi a race to 3.
+  const ovr = await api("PATCH", `/api/tournaments/${raceId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_2", raceTo: 3, scoreA: 3, scoreB: 1, status: "played" },
+  });
+  check("per-match override (race to 3) accepted", ovr.status >= 200 && ovr.status < 300, `status ${ovr.status}`);
+
+  d = unwrap(await api("GET", `/api/tournaments/${raceId}`, { token: clubToken }));
+  const m2 = (d?.matches || []).find((m) => m.id === "ko_r1_2");
+  check("per-match raceTo stored", Number(m2?.raceTo) === 3, `got ${m2?.raceTo}`);
+  check("both semis played, final populated", (d?.matches || []).find((m) => m.id === "ko_r2_1")?.teamA !== "TBD");
+
+  await Tournament.deleteOne({ _id: raceId });
+}
+
+// ==========================================================================
 console.log("\n[7] Signup name validation");
 // ==========================================================================
 

@@ -118,6 +118,36 @@ function isGroupMatchId(id) {
   return String(id || "").startsWith("g_");
 }
 
+// Match length in frames won. A per-match value wins (so a final can be a
+// longer race than the early rounds); otherwise the tournament default applies;
+// 0 from both means no length is enforced.
+export function effectiveRaceTo(t, match) {
+  const perMatch = Math.max(0, Math.floor(Number(match?.raceTo) || 0));
+  if (perMatch > 0) return perMatch;
+  return Math.max(0, Math.floor(Number(t?.formatConfig?.raceTo) || 0));
+}
+
+// A finished "race to N" must end with the winner on exactly N frames and the
+// loser below N. Returns an error message, or null when the result is valid.
+export function validateRaceToResult({ raceTo, scoreA, scoreB, aBye, bBye }) {
+  const target = Math.max(0, Math.floor(Number(raceTo) || 0));
+  if (target <= 0) return null; // no length configured
+  if (aBye || bBye) return null; // walkovers are not played out
+
+  const a = Math.max(0, Math.floor(Number(scoreA) || 0));
+  const b = Math.max(0, Math.floor(Number(scoreB) || 0));
+  const hi = Math.max(a, b);
+  const lo = Math.min(a, b);
+
+  if (hi !== target) {
+    return `This match is a race to ${target}: the winner must reach exactly ${target} frames (got ${hi}).`;
+  }
+  if (lo >= target) {
+    return `Both players cannot reach ${target} frames in a race to ${target}.`;
+  }
+  return null;
+}
+
 function isPlayoffMatchId(id) {
   return String(id || "").startsWith("po_");
 }
@@ -1192,6 +1222,11 @@ export async function upsertMatch(tournamentId, matchUpdate) {
   if (matchUpdate.scoreA !== undefined) m.scoreA = Number(matchUpdate.scoreA || 0);
   if (matchUpdate.scoreB !== undefined) m.scoreB = Number(matchUpdate.scoreB || 0);
 
+  // Per-match length override; 0 clears it back to the tournament default.
+  if (matchUpdate.raceTo !== undefined) {
+    m.raceTo = Math.max(0, Math.min(99, Math.floor(Number(matchUpdate.raceTo) || 0)));
+  }
+
   // ✅ status normalization (be forgiving)
   if (matchUpdate.status !== undefined) {
     const raw = String(matchUpdate.status || "scheduled").trim().toLowerCase();
@@ -1238,6 +1273,24 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     // Elimination matches cannot end in a draw — somebody has to advance.
     if (!aBye && !bBye && m.scoreA === m.scoreB) {
       const err = new Error("Elimination matches cannot end in a draw");
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+
+  // Match length (race to N frames), applies to every format.
+  if (m.status === "played") {
+    const aBye = String(m.teamA || "").trim().toUpperCase() === "BYE";
+    const bBye = String(m.teamB || "").trim().toUpperCase() === "BYE";
+    const raceMsg = validateRaceToResult({
+      raceTo: effectiveRaceTo(t, m),
+      scoreA: m.scoreA,
+      scoreB: m.scoreB,
+      aBye,
+      bBye,
+    });
+    if (raceMsg) {
+      const err = new Error(raceMsg);
       err.statusCode = 400;
       throw err;
     }

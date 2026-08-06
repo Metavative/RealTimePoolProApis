@@ -40,6 +40,8 @@ import {
   progressDoubleElimination,
   generateKnockout,
   progressKnockout,
+  effectiveRaceTo,
+  validateRaceToResult,
 } from "../src/services/tournament.service.js";
 import { summarizeDisputeTrends } from "../src/utils/disputeAnalytics.js";
 
@@ -851,6 +853,47 @@ await runTest("mypos verifyNotification + notificationStatus: accept valid IPN, 
   assert.equal(notificationStatus({ Status: "CANCELLED" }), "CANCELLED");
   assert.equal(notificationStatus({ Status: "7" }), "FAILED");
   clearMyposConfig();
+});
+
+// ---- Match length (race to N frames) ----
+
+await runTest("raceTo: per-match value overrides the tournament default", () => {
+  const t = { formatConfig: { raceTo: 5 } };
+  assert.equal(effectiveRaceTo(t, { raceTo: 9 }), 9, "per-match wins");
+  assert.equal(effectiveRaceTo(t, { raceTo: 0 }), 5, "0 inherits the default");
+  assert.equal(effectiveRaceTo(t, {}), 5, "absent inherits the default");
+  assert.equal(effectiveRaceTo({ formatConfig: {} }, {}), 0, "nothing set = unlimited");
+  assert.equal(effectiveRaceTo({}, {}), 0, "missing formatConfig = unlimited");
+});
+
+await runTest("raceTo: a finished race must end on exactly the target", () => {
+  const v = (raceTo, scoreA, scoreB) =>
+    validateRaceToResult({ raceTo, scoreA, scoreB, aBye: false, bBye: false });
+
+  assert.equal(v(5, 5, 3), null, "5-3 is a valid race to 5");
+  assert.equal(v(5, 2, 5), null, "2-5 is a valid race to 5");
+  assert.equal(v(5, 5, 0), null, "a whitewash is valid");
+
+  assert.ok(v(5, 4, 3), "nobody reached the target");
+  assert.ok(v(5, 6, 3), "winner overshot the target");
+  assert.ok(v(5, 5, 5), "both reached the target");
+  assert.ok(v(5, 0, 0), "0-0 cannot be a finished race");
+
+  // No length configured => anything goes (historic behaviour).
+  assert.equal(v(0, 7, 2), null);
+  assert.equal(v(0, 0, 0), null);
+});
+
+await runTest("raceTo: walkovers are exempt from the length rule", () => {
+  assert.equal(
+    validateRaceToResult({ raceTo: 5, scoreA: 0, scoreB: 0, aBye: true, bBye: false }),
+    null,
+    "a bye is not played out, so it cannot reach the target"
+  );
+  assert.equal(
+    validateRaceToResult({ raceTo: 5, scoreA: 1, scoreB: 0, aBye: false, bBye: true }),
+    null
+  );
 });
 
 // ---- Single elimination (knockout) engine ----

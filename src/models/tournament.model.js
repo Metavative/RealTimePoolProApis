@@ -48,6 +48,13 @@ const MatchSchema = new Schema(
     scoreA: { type: Number, default: 0 },
     scoreB: { type: Number, default: 0 },
 
+    // Match length, in frames won ("race to N" — first to N frames takes it).
+    // 0 means "inherit the tournament default" (formatConfig.raceTo); if that is
+    // also 0, no length is enforced and scores are free-form, which is how every
+    // tournament behaved before this existed.
+    // Set per match so a final can be a longer race than the early rounds.
+    raceTo: { type: Number, default: 0 },
+
     status: { type: String, default: "scheduled" }, // scheduled | played
   },
   { _id: false }
@@ -94,6 +101,9 @@ const TournamentSchema = new Schema(
       groupRandomize: { type: Boolean, default: true },
       groupBalanced: { type: Boolean, default: true },
       enableKnockoutStage: { type: Boolean, default: true },
+      // Default match length for the whole tournament, in frames won.
+      // 0 = no length enforced (free-form scores, the historic behaviour).
+      raceTo: { type: Number, default: 0 },
     },
 
     // legacy mirrors (keep for compatibility with older clients)
