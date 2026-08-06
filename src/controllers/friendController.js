@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import User from "../models/user.model.js";
 import FriendRequest from "../models/friendRequest.model.js";
 import Friendship from "../models/friendship.model.js";
+import { isPlatformAdmin } from "../utils/authz.js";
 
 // ---------- helpers ----------
 function toObjectId(id) {
@@ -47,6 +48,13 @@ function bestName(u) {
   return u?.username || u?.profile?.nickname || "";
 }
 
+// User input goes into a RegExp, so metacharacters must be neutralised. Without
+// this a search for "." matches every user, and a crafted pattern can hang the
+// event loop (ReDoS).
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function bestAvatar(u) {
   const p = u?.profile || {};
   const candidates = [p.avatarUrl, p.photo, p.profileImage, p.avatar];
@@ -75,20 +83,21 @@ export async function searchFriends(req, res) {
     if (!q) return res.json([]);
 
     const me = req.userId ? new mongoose.Types.ObjectId(req.userId) : null;
-    const regex = new RegExp(q, "i");
+    const regex = new RegExp(escapeRegex(q), "i");
 
     const limitRaw = parseInt(String(req.query.limit ?? "25"), 10);
     const limit = Number.isFinite(limitRaw)
       ? Math.max(1, Math.min(limitRaw, 50))
       : 25;
 
+    // Public identity fields ONLY. Email and phone are private: matching on them
+    // let a search for "pool" surface admin@poolpro.app, and returning them
+    // exposed one user's contact details to any other authenticated user.
     const query = {
       $or: [
         { username: regex },
         { usernameLower: regex },
         { "profile.nickname": regex },
-        { email: regex },
-        { phone: regex },
         { "stats.userIdTag": regex },
       ],
     };
@@ -101,8 +110,6 @@ export async function searchFriends(req, res) {
           "_id",
           "username",
           "usernameLower",
-          "email",
-          "phone",
           "profile.nickname",
           "profile.avatar",
           "profile.avatarUrl",
@@ -112,24 +119,41 @@ export async function searchFriends(req, res) {
           "profile.onlineStatus",
           "stats.rank",
           "stats.userIdTag",
+          // Role/flag fields so platform-admin/system accounts can be excluded.
+          // Selected for the check only — never returned to the client.
+          "email",
+          "role",
+          "userType",
+          "accountType",
+          "isAdmin",
+          "isPlatformAdmin",
+          "profile.role",
+          "profile.userType",
+          "profile.type",
+          "profile.isAdmin",
+          "profile.isPlatformAdmin",
         ].join(" ")
       )
-      .limit(limit)
+      // Over-fetch a little: the admin filter below runs after the DB limit, so
+      // without headroom an excluded admin would shrink the visible result set.
+      .limit(limit * 2)
       .lean();
 
     return res.json(
-      users.map((u) => ({
-        id: String(u._id),
-        name: bestName(u),
-        username: u.username || "",
-        email: u.email || "",
-        phone: u.phone || "",
-        avatarUrl: bestAvatar(u),
-        avatarUpdatedAt: bestAvatarUpdatedAt(u),
-        online: !!u.profile?.onlineStatus,
-        rank: u.stats?.rank || "Beginner",
-        tag: u.stats?.userIdTag || "",
-      }))
+      users
+        // Never surface platform-admin / system accounts as invitable players.
+        .filter((u) => !isPlatformAdmin(u))
+        .slice(0, limit)
+        .map((u) => ({
+          id: String(u._id),
+          name: bestName(u),
+          username: u.username || "",
+          avatarUrl: bestAvatar(u),
+          avatarUpdatedAt: bestAvatarUpdatedAt(u),
+          online: !!u.profile?.onlineStatus,
+          rank: u.stats?.rank || "Beginner",
+          tag: u.stats?.userIdTag || "",
+        }))
     );
   } catch (err) {
     console.error("searchFriends error:", err);

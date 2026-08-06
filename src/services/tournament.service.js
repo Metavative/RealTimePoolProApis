@@ -911,7 +911,7 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
     let matches = [];
     if (format === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);
     else if (format === "knockout" || format === "killer")
-      matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
+      matches = generateKnockout(keys, venue, nameByKey);
     else if (format === "double_elim" || format === "double_elimination")
       matches = generateDoubleElim(keys, venue, nameByKey);
     else matches = generateRoundRobin(keys, venue, nameByKey);
@@ -924,8 +924,11 @@ export async function regenerateFinalisedMatchesForStart(tournamentId) {
     }
     t3.matches = matches;
     t3.championName = "";
+    // Resolve any first-round byes into the next round immediately.
     if (format === "double_elim" || format === "double_elimination") {
       progressDoubleElimination(t3);
+    } else if (format === "knockout" || format === "killer") {
+      progressKnockout(t3);
     }
     await t3.save();
   }
@@ -1211,8 +1214,12 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     if (String(m.teamB || "").trim().toUpperCase() === "BYE") m.teamBName = "BYE";
   }
 
-  // playoff / double-elim validation: elimination matches cannot end in a draw
-  if ((isPlayoffMatchId(m.id) || isDoubleElimMatchId(m.id)) && m.status === "played") {
+  // playoff / knockout / double-elim validation: elimination matches cannot
+  // end in a draw — somebody has to advance.
+  if (
+    (isPlayoffMatchId(m.id) || isKnockoutMatchId(m.id) || isDoubleElimMatchId(m.id)) &&
+    m.status === "played"
+  ) {
     const aBye = String(m.teamA || "").trim().toUpperCase() === "BYE";
     const bBye = String(m.teamB || "").trim().toUpperCase() === "BYE";
     if (!aBye && !bBye && m.scoreA === m.scoreB) {
@@ -1231,6 +1238,10 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     } else {
       recomputeChampion(t);
     }
+  } else if (isKnockoutMatchId(m.id)) {
+    // Recompute the whole single-elim bracket from the played results so the
+    // winner advances and an edited result cascades to the final.
+    progressKnockout(t);
   } else if (isDoubleElimMatchId(m.id)) {
     // Recompute the whole double-elim bracket from the played results so an
     // edited result cascades through both brackets and the grand final.
@@ -1274,26 +1285,9 @@ function generateRoundRobin(keys, defaultVenue = "", nameByKey) {
   return out;
 }
 
-function generateKnockoutRound1(keys, defaultVenue = "", prefix = "ko", nameByKey) {
-  const out = [];
-  const shuffled = shuffle(keys);
-  let counter = 1;
-
-  for (let i = 0; i < shuffled.length; i += 2) {
-    const a = shuffled[i];
-    const b = i + 1 < shuffled.length ? shuffled[i + 1] : "BYE";
-    out.push(
-      makeMatchBase({
-        id: `${prefix}_${counter++}`,
-        teamA: a,
-        teamB: b,
-        venue: defaultVenue,
-        nameByKey,
-      })
-    );
-  }
-  return out;
-}
+// The single-elimination engine lives further down, next to the double-elim
+// engine whose bracket helpers it shares: see generateKnockout /
+// progressKnockout.
 
 // ============================================================================
 // Double elimination
@@ -1389,6 +1383,31 @@ function deRealWinner(m) {
   return deIsReal(k) ? k : null;
 }
 
+// Writes a derived bracket slot (one whose participants come from an earlier
+// result rather than the draw). If the participants changed, any result already
+// recorded there is stale and is cleared — that is what makes an edited earlier
+// result cascade correctly instead of leaving a phantom score downstream.
+//
+// Shared by both bracket engines (single and double elimination).
+function makeBracketSlotSetter(nameByKey) {
+  return function setSlot(m, a, b) {
+    if (!m) return;
+    const A = String(a == null || a === "" ? DE_TBD : a).trim();
+    const B = String(b == null || b === "" ? DE_TBD : b).trim();
+    if (String(m.teamA) !== A || String(m.teamB) !== B) {
+      m.teamA = A;
+      m.teamB = B;
+      m.teamAId = deIsReal(A) ? pkToUserObjectId(A) : null;
+      m.teamBId = deIsReal(B) ? pkToUserObjectId(B) : null;
+      m.scoreA = 0;
+      m.scoreB = 0;
+      m.status = "scheduled";
+    }
+    m.teamAName = deName(A, nameByKey);
+    m.teamBName = deName(B, nameByKey);
+  };
+}
+
 export function generateDoubleElim(keys, defaultVenue = "", nameByKey) {
   const real = shuffle((keys || []).filter(Boolean));
   const n = real.length;
@@ -1454,24 +1473,7 @@ export function progressDoubleElimination(t) {
   if (S < 2) return;
   const W = Math.round(Math.log2(S));
   const nameByKey = buildNameByKey(t);
-
-  // Set a derived slot; clear any stale result if the participants changed.
-  const setSlot = (m, a, b) => {
-    if (!m) return;
-    const A = String(a == null || a === "" ? DE_TBD : a).trim();
-    const B = String(b == null || b === "" ? DE_TBD : b).trim();
-    if (String(m.teamA) !== A || String(m.teamB) !== B) {
-      m.teamA = A;
-      m.teamB = B;
-      m.teamAId = deIsReal(A) ? pkToUserObjectId(A) : null;
-      m.teamBId = deIsReal(B) ? pkToUserObjectId(B) : null;
-      m.scoreA = 0;
-      m.scoreB = 0;
-      m.status = "scheduled";
-    }
-    m.teamAName = deName(A, nameByKey);
-    m.teamBName = deName(B, nameByKey);
-  };
+  const setSlot = makeBracketSlotSetter(nameByKey);
 
   // Winners bracket rounds 2..W.
   for (let r = 2; r <= W; r++) {
@@ -1541,6 +1543,143 @@ export function progressDoubleElimination(t) {
   t.championName = champion || "";
 }
 
+// ============================================================================
+// Single elimination (knockout)
+//
+// The WHOLE bracket is generated up front — ko_r{R}_{P} for round R, position P
+// — so every round including the final exists and can be scheduled before a
+// ball is struck. Only round 1 holds the actual draw; later slots start as
+// "TBD" and are filled by progressKnockout() as results come in.
+//
+// progressKnockout() recomputes every derived slot from the played results on
+// each call, so editing an earlier result cascades forward and stale downstream
+// results are cleared. Same contract as progressDoubleElimination above, and it
+// deliberately reuses that engine's slot/advancement helpers.
+//
+// HISTORY: this format used to generate round 1 ONLY, as flat `ko_1`, `ko_2`
+// ids, and upsertMatch had no branch for them — so a knockout tournament could
+// record round-1 scores and then had nowhere to go. Legacy flat ids are
+// migrated to the round-encoded scheme on the first progress call.
+// ============================================================================
+
+function isKnockoutMatchId(id) {
+  return String(id || "").startsWith("ko_");
+}
+
+function knockoutRoundOf(id) {
+  const s = String(id || "");
+  const m = /^ko_r(\d+)_(\d+)$/.exec(s);
+  if (m) return parseInt(m[1], 10);
+  // Legacy flat id: round 1 of a bracket that never had later rounds.
+  return /^ko_\d+$/.test(s) ? 1 : null;
+}
+
+function knockoutPositionOf(id) {
+  const s = String(id || "");
+  const m = /^ko_r(\d+)_(\d+)$/.exec(s);
+  if (m) return parseInt(m[2], 10);
+  const legacy = /^ko_(\d+)$/.exec(s);
+  return legacy ? parseInt(legacy[1], 10) : null;
+}
+
+export function generateKnockout(keys, defaultVenue = "", nameByKey) {
+  const real = shuffle((keys || []).filter(Boolean));
+  const n = real.length;
+  if (n < 2) return [];
+
+  const S = Math.max(2, nextPowerOf2(n)); // bracket size (power of 2)
+  const R = Math.round(Math.log2(S)); // number of rounds
+  const venue = String(defaultVenue || "").trim();
+
+  // Seeded draw so BYEs fall against the strongest seeds instead of clumping.
+  const seedOrder = standardSeedOrder(S);
+  const slotKeys = seedOrder.map((seed) => (seed <= n ? real[seed - 1] : "BYE"));
+
+  const out = [];
+
+  // Round 1 — the actual draw.
+  for (let p = 0; p < S / 2; p++) {
+    out.push(
+      makeDeMatch({
+        id: `ko_r1_${p + 1}`,
+        a: slotKeys[2 * p],
+        b: slotKeys[2 * p + 1],
+        venue,
+        nameByKey,
+      })
+    );
+  }
+
+  // Rounds 2..R — placeholders, filled in by progressKnockout().
+  for (let r = 2; r <= R; r++) {
+    const count = S / Math.pow(2, r);
+    for (let p = 1; p <= count; p++) {
+      out.push(makeDeMatch({ id: `ko_r${r}_${p}`, a: DE_TBD, b: DE_TBD, venue, nameByKey }));
+    }
+  }
+
+  return out;
+}
+
+export function progressKnockout(t) {
+  const all = Array.isArray(t.matches) ? t.matches : [];
+  const ko = all.filter((m) => isKnockoutMatchId(m.id));
+  if (ko.length === 0) return;
+
+  const nameByKey = buildNameByKey(t);
+  const venue = String(t.defaultVenue || t.playoffDefaultVenue || "").trim();
+
+  // Migrate legacy flat round-1 ids (ko_1) into the round-encoded scheme so a
+  // tournament created before the full bracket existed still progresses.
+  for (const m of ko) {
+    if (/^ko_\d+$/.test(String(m.id))) {
+      m.id = `ko_r1_${knockoutPositionOf(m.id)}`;
+    }
+  }
+
+  const round1 = ko.filter((m) => knockoutRoundOf(m.id) === 1);
+  if (round1.length === 0) return;
+
+  const S = nextPowerOf2(round1.length * 2);
+  const R = Math.round(Math.log2(S));
+
+  const byId = new Map(ko.map((m) => [String(m.id), m]));
+  const get = (id) => byId.get(String(id)) || null;
+
+  // Create any missing later rounds. Fresh brackets already have them; legacy
+  // ones (round 1 only) get the rest of the bracket built here.
+  for (let r = 2; r <= R; r++) {
+    const count = S / Math.pow(2, r);
+    for (let p = 1; p <= count; p++) {
+      const id = `ko_r${r}_${p}`;
+      if (get(id)) continue;
+      t.matches.push(makeDeMatch({ id, a: DE_TBD, b: DE_TBD, venue, nameByKey }));
+      // Read the element back rather than reusing the object we passed in:
+      // on a mongoose document `push` CASTS it into a new subdocument, leaving
+      // the original detached, and the slot writes below would then be made to
+      // an orphan that never reaches the database.
+      byId.set(id, t.matches[t.matches.length - 1]);
+    }
+  }
+
+  const setSlot = makeBracketSlotSetter(nameByKey);
+
+  // Each round is fed by the two matches above it: positions 2p-1 and 2p of the
+  // previous round feed position p of this one.
+  for (let r = 2; r <= R; r++) {
+    const count = S / Math.pow(2, r);
+    for (let p = 1; p <= count; p++) {
+      setSlot(
+        get(`ko_r${r}_${p}`),
+        deAdvancingKey(get(`ko_r${r - 1}_${2 * p - 1}`)),
+        deAdvancingKey(get(`ko_r${r - 1}_${2 * p}`))
+      );
+    }
+  }
+
+  t.championName = deRealWinner(get(`ko_r${R}_1`)) || "";
+}
+
 export async function generateMatchesForFormat(tournamentId, { format, defaultVenue }) {
   const t = await Tournament.findById(tournamentId);
   if (!t) throw new Error("Tournament not found");
@@ -1575,7 +1714,7 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
   let matches = [];
   if (f === "round_robin") matches = generateRoundRobin(keys, venue, nameByKey);
   else if (f === "knockout" || f === "killer")
-    matches = generateKnockoutRound1(keys, venue, "ko", nameByKey);
+    matches = generateKnockout(keys, venue, nameByKey);
   else if (f === "double_elim" || f === "double_elimination")
     matches = generateDoubleElim(keys, venue, nameByKey);
   else matches = generateRoundRobin(keys, venue, nameByKey);
@@ -1584,6 +1723,7 @@ export async function generateMatchesForFormat(tournamentId, { format, defaultVe
   t.championName = "";
   // Resolve any first-round byes into the next slots immediately.
   if (f === "double_elim" || f === "double_elimination") progressDoubleElimination(t);
+  else if (f === "knockout" || f === "killer") progressKnockout(t);
   await t.save();
   return t;
 }

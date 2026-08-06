@@ -28,9 +28,13 @@ const GroupSchema = new Schema(
 
 const MatchSchema = new Schema(
   {
-    id: { type: String, required: true }, // g_A_1, rr_1, ko_1, po_r1_1 ...
-    teamA: { type: String, default: "" }, // participantKey or BYE
-    teamB: { type: String, default: "" }, // participantKey or BYE
+    // g_A_1, rr_1, ko_r1_1, po_r1_1, de_wb_r1_1 ...
+    // (`ko_1` is the legacy flat knockout form, migrated on first progress)
+    id: { type: String, required: true },
+    // participantKey, or the reserved placeholders BYE (empty slot) and
+    // TBD (waiting on an earlier round's winner)
+    teamA: { type: String, default: "" },
+    teamB: { type: String, default: "" },
 
     teamAId: { type: Schema.Types.ObjectId, ref: "User", required: false },
     teamBId: { type: Schema.Types.ObjectId, ref: "User", required: false },

@@ -83,6 +83,7 @@ const LedgerEntry = (await import("../src/models/ledgerEntry.model.js")).default
 const PaymentIntent = (await import("../src/models/paymentIntent.model.js")).default;
 const { dashboard } = await import("../src/controllers/userController.js");
 const { updateProfile } = await import("../src/controllers/userController.js");
+const { searchFriends } = await import("../src/controllers/friendController.js");
 const { platformOverview } = await import("../src/controllers/admin.controller.js");
 const Match = (await import("../src/models/match.model.js")).default;
 const { applyMatchPayoutImpact } = await import("../src/controllers/dispute.controller.js");
@@ -1034,6 +1035,65 @@ await t("SECURITY: updateProfile cannot mass-assign role/admin/earnings/stats", 
 });
 
 // =====================================================================
+// SECURITY — player search must not expose or match on private contact info
+// =====================================================================
+await t("SECURITY: player search matches public identifiers only, never email/phone", async () => {
+  const searcher = await mkUser({ name: "Searcher", username: "searcher_priv" });
+
+  const target = await User.create({
+    username: "mattpotter",
+    email: "matt@privatedomain.example",
+    phone: "07700900123",
+    profile: { nickname: "Matt", role: "USER" },
+  });
+
+  // An admin whose EMAIL contains the search term but whose username does not —
+  // this is the exact case the tester hit ("pool" surfacing admin@poolpro.app).
+  await User.create({
+    username: "Administrator",
+    email: "admin@poolpro.app",
+    isPlatformAdmin: true,
+    profile: { nickname: "Administrator", role: "ADMIN" },
+  });
+
+  // 1) Searching an email fragment must NOT find anyone.
+  const resEmail = mkRes();
+  await searchFriends(playerReq(searcher, { query: { q: "poolpro" } }), resEmail);
+  assert.equal(resEmail.statusCode, 200);
+  assert.deepEqual(resEmail.body, [], "email fragments must not match any user");
+
+  // 2) Searching a phone fragment must NOT find anyone.
+  const resPhone = mkRes();
+  await searchFriends(playerReq(searcher, { query: { q: "07700900" } }), resPhone);
+  assert.deepEqual(resPhone.body, [], "phone fragments must not match any user");
+
+  // 3) Searching the username DOES find them — and the payload carries no
+  //    contact details.
+  const resName = mkRes();
+  await searchFriends(playerReq(searcher, { query: { q: "mattpot" } }), resName);
+  assert.equal(resName.body.length, 1, "username search still works");
+  const hit = resName.body[0];
+  assert.equal(hit.id, String(target._id));
+  assert.equal(hit.username, "mattpotter");
+  assert.ok(!("email" in hit), "email must not be present in the search payload");
+  assert.ok(!("phone" in hit), "phone must not be present in the search payload");
+  assert.ok(
+    !JSON.stringify(hit).includes("privatedomain"),
+    "no part of the payload may carry the email"
+  );
+
+  // 4) Platform-admin/system accounts are not invitable players.
+  const resAdmin = mkRes();
+  await searchFriends(playerReq(searcher, { query: { q: "Administrator" } }), resAdmin);
+  assert.deepEqual(resAdmin.body, [], "platform-admin accounts must not appear in search");
+
+  // 5) Regex metacharacters are escaped, so "." cannot enumerate every user.
+  const resWildcard = mkRes();
+  await searchFriends(playerReq(searcher, { query: { q: "." } }), resWildcard);
+  assert.deepEqual(resWildcard.body, [], "'.' must be a literal, not a match-all wildcard");
+});
+
+// =====================================================================
 // myPOS Mobile SDK — mobile-config + mobile/confirm
 // =====================================================================
 await t("myPOS mobile-config: 503 unless payments enabled + provider MYPOS", async () => {
@@ -1152,6 +1212,121 @@ await t("myPOS mobile/confirm: verifies, settles wallet top-up, idempotent, repl
 // pieces that were doubted (manual add, bracket engine, scheduling, payout)
 // end-to-end rather than with a hard-coded champion.
 // =====================================================================
+await t("SCOPE: knockout advances through the REAL upsertMatch path to a final", async () => {
+  // Regression for the reported bug: a 4-player knockout could record round-1
+  // scores and then had nowhere to go. Only round 1 was ever generated and
+  // upsertMatch had no branch for `ko_` ids, so no final was ever produced.
+  // This drives the same controller-facing entry point the app uses.
+  const svc = await import("../src/services/tournament.service.js");
+
+  const players = [];
+  for (let i = 0; i < 4; i++) {
+    players.push(await mkUser({ name: `KO P${i + 1}` }));
+  }
+
+  const tourn = await Tournament.create({
+    title: "Knockout Cup",
+    format: "knockout",
+    status: "DRAFT",
+    accessMode: "INVITE_ONLY",
+    entriesStatus: "OPEN",
+  });
+  const tid = String(tourn._id);
+
+  await svc.setEntrantsObjects(
+    tid,
+    players.map((p) => ({
+      participantKey: `uid:${p._id}`,
+      userId: String(p._id),
+      name: `P${p._id}`,
+    }))
+  );
+
+  await svc.generateMatchesForFormat(tid, { format: "knockout" });
+  let doc = await Tournament.findById(tid);
+
+  // The whole bracket exists up front — two semis and a final.
+  const ko = doc.matches.filter((m) => String(m.id).startsWith("ko_"));
+  assert.equal(ko.length, 3, "4 players => 3 knockout matches");
+  assert.ok(
+    doc.matches.find((m) => String(m.id) === "ko_r2_1"),
+    "the final exists before any match is played"
+  );
+
+  // Play both semi-finals through the real update path.
+  for (const mid of ["ko_r1_1", "ko_r1_2"]) {
+    await svc.upsertMatch(tid, { id: mid, scoreA: 3, scoreB: 1, status: "played" });
+  }
+
+  doc = await Tournament.findById(tid);
+  const final = doc.matches.find((m) => String(m.id) === "ko_r2_1");
+  const semi1 = doc.matches.find((m) => String(m.id) === "ko_r1_1");
+  const semi2 = doc.matches.find((m) => String(m.id) === "ko_r1_2");
+
+  assert.equal(final.teamA, semi1.teamA, "semi 1 winner advanced into the final");
+  assert.equal(final.teamB, semi2.teamA, "semi 2 winner advanced into the final");
+  assert.equal(doc.championName, "", "no champion until the final is played");
+
+  // A draw in an elimination match must be rejected — somebody has to advance.
+  await assert.rejects(
+    () => svc.upsertMatch(tid, { id: "ko_r2_1", scoreA: 2, scoreB: 2, status: "played" }),
+    /draw/i,
+    "knockout matches cannot end level"
+  );
+
+  await svc.upsertMatch(tid, { id: "ko_r2_1", scoreA: 5, scoreB: 3, status: "played" });
+
+  doc = await Tournament.findById(tid);
+  assert.equal(doc.championName, final.teamA, "the final's winner is champion");
+  assert.ok(
+    players.some((p) => `uid:${p._id}` === doc.championName),
+    "champion is one of the entrants"
+  );
+});
+
+await t("knockout: an existing stuck round-1-only tournament recovers in the DB", async () => {
+  // Tournaments created before the full bracket existed are persisted with flat
+  // `ko_N` ids and no later rounds. Verified against a real mongoose document
+  // (not a plain object) because recovery mutates subdocument ids and pushes
+  // new subdocuments into the matches array.
+  const svc = await import("../src/services/tournament.service.js");
+
+  const players = [];
+  for (let i = 0; i < 4; i++) players.push(await mkUser({ name: `Legacy P${i + 1}` }));
+  const pk = players.map((p) => `uid:${p._id}`);
+
+  const tourn = await Tournament.create({
+    title: "Legacy Knockout",
+    format: "knockout",
+    status: "ACTIVE",
+    entrants: players.map((p) => ({
+      participantKey: `uid:${p._id}`,
+      entrantId: p._id,
+      name: `P${p._id}`,
+    })),
+    matches: [
+      { id: "ko_1", teamA: pk[0], teamB: pk[1], scoreA: 2, scoreB: 0, status: "played" },
+      { id: "ko_2", teamA: pk[2], teamB: pk[3], scoreA: 0, scoreB: 3, status: "played" },
+    ],
+  });
+  const tid = String(tourn._id);
+
+  // Any match update triggers recovery through the normal controller path.
+  await svc.upsertMatch(tid, { id: "ko_1", scoreA: 2, scoreB: 0, status: "played" });
+
+  let doc = await Tournament.findById(tid);
+  const ids = doc.matches.map((m) => String(m.id)).sort();
+  assert.deepEqual(ids, ["ko_r1_1", "ko_r1_2", "ko_r2_1"], "bracket rebuilt and ids migrated");
+
+  const final = doc.matches.find((m) => String(m.id) === "ko_r2_1");
+  assert.equal(final.teamA, pk[0], "existing round-1 winners advanced");
+  assert.equal(final.teamB, pk[3]);
+
+  await svc.upsertMatch(tid, { id: "ko_r2_1", scoreA: 0, scoreB: 1, status: "played" });
+  doc = await Tournament.findById(tid);
+  assert.equal(doc.championName, pk[3], "the previously stuck tournament can now finish");
+});
+
 await t("SCOPE: organiser manually adds players -> bracket -> real champion -> prize payout", async () => {
   process.env.FEATURE_TOURNAMENT_PAYOUTS = "true";
   const svc = await import("../src/services/tournament.service.js");

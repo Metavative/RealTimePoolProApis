@@ -38,6 +38,8 @@ import {
 import {
   generateDoubleElim,
   progressDoubleElimination,
+  generateKnockout,
+  progressKnockout,
 } from "../src/services/tournament.service.js";
 import { summarizeDisputeTrends } from "../src/utils/disputeAnalytics.js";
 
@@ -849,6 +851,162 @@ await runTest("mypos verifyNotification + notificationStatus: accept valid IPN, 
   assert.equal(notificationStatus({ Status: "CANCELLED" }), "CANCELLED");
   assert.equal(notificationStatus({ Status: "7" }), "FAILED");
   clearMyposConfig();
+});
+
+// ---- Single elimination (knockout) engine ----
+
+function mkKoTournament(n) {
+  const keys = Array.from({ length: n }, (_, i) => `uid:${i + 1}`);
+  const nameByKey = new Map(keys.map((k) => [k, `P${k.slice(4)}`]));
+  const matches = generateKnockout(keys, "Table 1", nameByKey);
+  const t = {
+    matches,
+    championName: "",
+    entrants: keys.map((k) => ({ participantKey: k, name: nameByKey.get(k) })),
+  };
+  progressKnockout(t);
+  return { t, keys };
+}
+
+function koReady(m) {
+  const real = (k) => k && !["BYE", "TBD"].includes(String(k).toUpperCase());
+  return m.status !== "played" && real(m.teamA) && real(m.teamB);
+}
+
+function koPlayOut(t, pick) {
+  for (let guard = 0; guard < 1000; guard++) {
+    const m = t.matches.find((x) => x.id.startsWith("ko_") && koReady(x));
+    if (!m) break;
+    const win = pick(m);
+    m.scoreA = win === "A" ? 1 : 0;
+    m.scoreB = win === "B" ? 1 : 0;
+    m.status = "played";
+    progressKnockout(t);
+  }
+}
+
+await runTest("knockout: full bracket is generated up front (S-1 matches, one final)", () => {
+  for (const n of [2, 3, 4, 5, 8, 11, 16]) {
+    const { t } = mkKoTournament(n);
+    const S = (() => { let p = 1; while (p < n) p *= 2; return p; })();
+    const R = Math.round(Math.log2(S));
+    const ko = t.matches.filter((m) => m.id.startsWith("ko_"));
+    // A single-elim bracket of size S has S-1 matches across log2(S) rounds.
+    assert.equal(ko.length, S - 1, `n=${n}: expected ${S - 1} matches`);
+    assert.equal(
+      ko.filter((m) => m.id.startsWith("ko_r1_")).length,
+      S / 2,
+      `n=${n}: round 1 size`
+    );
+    // The final exists from the start — this is what "set up the final" needs.
+    assert.ok(ko.find((m) => m.id === `ko_r${R}_1`), `n=${n}: final must exist up front`);
+  }
+});
+
+await runTest("knockout: 4 local players play through to a decided final", () => {
+  // The exact scenario reported: 4 players, enter scores, reach a final.
+  const { t, keys } = mkKoTournament(4);
+
+  const r1 = t.matches.filter((m) => m.id.startsWith("ko_r1_"));
+  assert.equal(r1.length, 2, "two semi-finals");
+  const final = t.matches.find((m) => m.id === "ko_r2_1");
+  assert.ok(final, "a final exists before anything is played");
+  assert.equal(t.championName, "", "no champion before the final is played");
+
+  // Play both semis; teamA wins each.
+  for (const m of r1) {
+    m.scoreA = 3; m.scoreB = 1; m.status = "played";
+    progressKnockout(t);
+  }
+
+  // The final is now populated with the two semi-final winners.
+  assert.equal(final.teamA, r1[0].teamA, "semi 1 winner fills slot A");
+  assert.equal(final.teamB, r1[1].teamA, "semi 2 winner fills slot B");
+  assert.ok(koReady(final), "the final is playable");
+  assert.equal(t.championName, "", "still no champion until the final is played");
+
+  final.scoreA = 5; final.scoreB = 2; final.status = "played";
+  progressKnockout(t);
+
+  assert.equal(t.championName, final.teamA, "final winner is champion");
+  assert.ok(keys.includes(t.championName), "champion is a real entrant");
+});
+
+await runTest("knockout: every bracket size plays out to exactly one champion", () => {
+  for (const n of [2, 3, 4, 5, 8, 11, 16]) {
+    const { t, keys } = mkKoTournament(n);
+    koPlayOut(t, () => "A");
+    assert.ok(t.championName, `n=${n}: a champion should be decided`);
+    assert.ok(keys.includes(t.championName), `n=${n}: champion is a real entrant`);
+    const unplayed = t.matches.filter((m) => m.id.startsWith("ko_") && koReady(m));
+    assert.equal(unplayed.length, 0, `n=${n}: no playable match left over`);
+  }
+});
+
+await runTest("knockout: byes advance automatically without being played", () => {
+  // 3 players in a 4-slot bracket: one entrant gets a bye into the final.
+  const { t } = mkKoTournament(3);
+  const byeMatch = t.matches.find(
+    (m) => m.id.startsWith("ko_r1_") && [m.teamA, m.teamB].includes("BYE")
+  );
+  assert.ok(byeMatch, "one round-1 match should carry a bye");
+  const advancing = byeMatch.teamA === "BYE" ? byeMatch.teamB : byeMatch.teamA;
+
+  const final = t.matches.find((m) => m.id === "ko_r2_1");
+  assert.ok(
+    [final.teamA, final.teamB].includes(advancing),
+    "the bye recipient is already in the final without playing"
+  );
+  assert.notEqual(byeMatch.status, "played", "a bye is not a played match");
+});
+
+await runTest("knockout: editing an earlier result re-cascades to the final", () => {
+  const { t } = mkKoTournament(4);
+  koPlayOut(t, () => "A");
+  const championBefore = t.championName;
+
+  // Flip the first semi-final and replay from there.
+  const semi = t.matches.find((m) => m.id === "ko_r1_1");
+  const flipped = semi.teamB;
+  semi.scoreA = 0; semi.scoreB = 1; semi.status = "played";
+  progressKnockout(t);
+
+  const final = t.matches.find((m) => m.id === "ko_r2_1");
+  assert.equal(final.teamA, flipped, "the new semi winner replaces the old one");
+  assert.notEqual(final.status, "played", "the stale final result is cleared");
+  assert.equal(t.championName, "", "champion is withdrawn until the final is replayed");
+
+  final.scoreA = 1; final.scoreB = 0; final.status = "played";
+  progressKnockout(t);
+  assert.equal(t.championName, flipped, "replayed final decides the new champion");
+  assert.notEqual(t.championName, championBefore, "champion actually changed");
+});
+
+await runTest("knockout: a legacy round-1-only bracket recovers and can finish", () => {
+  // Tournaments created before the full bracket existed have flat ko_N ids and
+  // no later rounds at all. Progressing must rebuild the bracket around them.
+  const keys = ["uid:1", "uid:2", "uid:3", "uid:4"];
+  const nameByKey = new Map(keys.map((k) => [k, `P${k.slice(4)}`]));
+  const t = {
+    matches: [
+      { id: "ko_1", teamA: "uid:1", teamB: "uid:2", scoreA: 2, scoreB: 0, status: "played" },
+      { id: "ko_2", teamA: "uid:3", teamB: "uid:4", scoreA: 0, scoreB: 3, status: "played" },
+    ],
+    championName: "",
+    entrants: keys.map((k) => ({ participantKey: k, name: nameByKey.get(k) })),
+  };
+
+  progressKnockout(t);
+
+  assert.ok(t.matches.find((m) => m.id === "ko_r1_1"), "legacy ids are migrated");
+  const final = t.matches.find((m) => m.id === "ko_r2_1");
+  assert.ok(final, "the missing final is created");
+  assert.equal(final.teamA, "uid:1", "existing round-1 results still advance");
+  assert.equal(final.teamB, "uid:4");
+
+  final.scoreA = 0; final.scoreB = 1; final.status = "played";
+  progressKnockout(t);
+  assert.equal(t.championName, "uid:4", "a stuck legacy tournament can now finish");
 });
 
 // ---- Double elimination engine ----
