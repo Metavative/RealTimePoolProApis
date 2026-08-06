@@ -375,7 +375,181 @@ if (gsId) {
 }
 
 // ==========================================================================
-console.log("\n[6] Auth boundaries");
+console.log("\n[6] Tournament edge cases");
+// ==========================================================================
+
+async function mkKnockout(nPlayers, label) {
+  const c1 = await api("POST", "/api/tournaments", {
+    token: clubToken,
+    body: { name: `E2E ${label} ${stamp}`, format: "knockout" },
+  });
+  const id = String(unwrap(c1)?._id || "");
+  if (!id) return null;
+  await api("POST", `/api/tournaments/${id}/entrants`, {
+    token: clubToken,
+    body: {
+      entrants: players.slice(0, nPlayers).map((p) => ({
+        participantKey: `uid:${p._id}`,
+        userId: String(p._id),
+        name: p.profile.nickname,
+      })),
+    },
+  });
+  await api("POST", `/api/tournaments/${id}/matches/generate`, {
+    token: clubToken,
+    body: { format: "knockout" },
+  });
+  return id;
+}
+
+// 2 players: the smallest possible bracket is a single final.
+const twoId = await mkKnockout(2, "KO2");
+if (twoId) {
+  const d = unwrap(await api("GET", `/api/tournaments/${twoId}`, { token: clubToken }));
+  const ko = (d?.matches || []).filter((m) => String(m.id).startsWith("ko_"));
+  check("[2 players] exactly one match", ko.length === 1, `got ${ko.length}`);
+  await api("PATCH", `/api/tournaments/${twoId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_1", scoreA: 2, scoreB: 0, status: "played" },
+  });
+  const d2 = unwrap(await api("GET", `/api/tournaments/${twoId}`, { token: clubToken }));
+  check("[2 players] champion decided", !!d2?.championName, `${d2?.championName}`);
+  await Tournament.deleteOne({ _id: twoId });
+}
+
+// 3 players: one bye, which must advance without being played.
+const threeId = await mkKnockout(3, "KO3");
+if (threeId) {
+  const d = unwrap(await api("GET", `/api/tournaments/${threeId}`, { token: clubToken }));
+  const ko = (d?.matches || []).filter((m) => String(m.id).startsWith("ko_"));
+  const byeMatch = ko.find((m) => [m.teamA, m.teamB].includes("BYE"));
+  const final = ko.find((m) => m.id === "ko_r2_1");
+  check("[3 players] a bye exists in round 1", !!byeMatch);
+  const advanced = byeMatch && (byeMatch.teamA === "BYE" ? byeMatch.teamB : byeMatch.teamA);
+  check(
+    "[3 players] bye recipient is already in the final",
+    !!final && [final.teamA, final.teamB].includes(advanced),
+    `final=${final?.teamA}/${final?.teamB} advanced=${advanced}`
+  );
+  check("[3 players] the bye match is not marked played", byeMatch?.status !== "played");
+  await Tournament.deleteOne({ _id: threeId });
+}
+
+// Scoring an undecided slot must be refused by the SERVER, not just the app.
+const tbdId = await mkKnockout(4, "KOTBD");
+if (tbdId) {
+  const r = await api("PATCH", `/api/tournaments/${tbdId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r2_1", scoreA: 3, scoreB: 1, status: "played" },
+  });
+  check("scoring a TBD slot is rejected server-side", r.status >= 400, `status ${r.status}`);
+
+  const d = unwrap(await api("GET", `/api/tournaments/${tbdId}`, { token: clubToken }));
+  const fin = (d?.matches || []).find((m) => m.id === "ko_r2_1");
+  check("the TBD slot was not corrupted", fin?.status !== "played" && fin?.teamA === "TBD", JSON.stringify(fin));
+  await Tournament.deleteOne({ _id: tbdId });
+}
+
+// Changing the roster after generation must clear the stale bracket.
+const rosterId = await mkKnockout(4, "KOROSTER");
+if (rosterId) {
+  await api("PATCH", `/api/tournaments/${rosterId}/matches`, {
+    token: clubToken,
+    body: { id: "ko_r1_1", scoreA: 2, scoreB: 0, status: "played" },
+  });
+  const shrink = await api("POST", `/api/tournaments/${rosterId}/entrants`, {
+    token: clubToken,
+    body: {
+      entrants: players.slice(0, 3).map((p) => ({
+        participantKey: `uid:${p._id}`,
+        userId: String(p._id),
+        name: p.profile.nickname,
+      })),
+    },
+  });
+  check("roster can be changed before start", shrink.status >= 200 && shrink.status < 300, `status ${shrink.status}`);
+  const d = unwrap(await api("GET", `/api/tournaments/${rosterId}`, { token: clubToken }));
+  check(
+    "stale bracket cleared after a roster change",
+    (d?.matches || []).length === 0,
+    `${(d?.matches || []).length} matches survived`
+  );
+  check("stale champion cleared after a roster change", !d?.championName);
+  await Tournament.deleteOne({ _id: rosterId });
+}
+
+// A tournament with fewer than 2 entrants must not generate a bracket.
+const oneCreate = await api("POST", "/api/tournaments", {
+  token: clubToken,
+  body: { name: `E2E KO1 ${stamp}`, format: "knockout" },
+});
+const oneId = String(unwrap(oneCreate)?._id || "");
+if (oneId) {
+  await api("POST", `/api/tournaments/${oneId}/entrants`, {
+    token: clubToken,
+    body: {
+      entrants: [
+        { participantKey: `uid:${players[0]._id}`, userId: String(players[0]._id), name: "solo" },
+      ],
+    },
+  });
+  const g = await api("POST", `/api/tournaments/${oneId}/matches/generate`, {
+    token: clubToken,
+    body: { format: "knockout" },
+  });
+  check("generating with 1 entrant is refused", g.status >= 400, `status ${g.status}`);
+  await Tournament.deleteOne({ _id: oneId });
+}
+
+// ==========================================================================
+console.log("\n[7] Signup name validation");
+// ==========================================================================
+
+async function trySignup(first, last, i) {
+  const r = await api("POST", "/api/auth/signup", {
+    body: {
+      role: "player",
+      username: `e2esig${stamp.slice(-5)}${i}`,
+      email: `e2e_signup_${stamp}_${i}@example.test`,
+      password: "Passw0rd!23",
+      firstName: first,
+      lastName: last,
+      gender: "male",
+      age: 30,
+    },
+  });
+  return r;
+}
+
+const nameCases = [
+  ["John", "Smith", true],
+  ["Mary Anne", "Van Der Berg", true],
+  ["José", "Müller", true],
+  ["A?B", "Smith", false],
+];
+let ni = 0;
+for (const [first, last, shouldPass] of nameCases) {
+  ni += 1;
+  const r = await trySignup(first, last, ni);
+  const body = JSON.stringify(r.body);
+  const rejectedForName = body.toLowerCase().includes("invalid first/last name");
+  if (shouldPass) {
+    // Must actually get PAST name validation — assert success, not merely the
+    // absence of the name error (an unrelated 400 would otherwise look like a
+    // pass).
+    check(
+      `signup accepts "${first} ${last}"`,
+      r.status >= 200 && r.status < 300,
+      `status ${r.status} ${body.slice(0, 140)}`
+    );
+  } else {
+    check(`signup rejects "${first} ${last}"`, rejectedForName, `status ${r.status} ${body.slice(0, 140)}`);
+  }
+}
+await User.deleteMany({ email: { $regex: `^e2e_signup_${stamp}_` } });
+
+// ==========================================================================
+console.log("\n[8] Auth boundaries");
 // ==========================================================================
 
 const noAuth = await api("GET", `/api/tournaments/${tid}`);

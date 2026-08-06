@@ -216,11 +216,22 @@ function normalizeName(v) {
   return s ? s.replace(/\s+/g, " ").trim() : "";
 }
 
+// Letters (any script, so accented and non-Latin names are accepted), plus the
+// separators that legitimately appear inside names.
+//
+// The previous pattern was /^[a-zA-Z?-?s'-]+$/ — corrupted at some point, with
+// the accented-letter range and \s replaced by literal '?' characters. The
+// effect was that any name containing a SPACE ("Mary Anne", "Van Der Berg") or
+// an accent ("José", "Müller") was rejected at signup with "Invalid
+// first/last name", while a name containing '?' was accepted.
+const HUMAN_NAME_REGEX = /^\p{L}[\p{L}\p{M}\s'’.-]*$/u;
+
 function isLikelyHumanName(v) {
   const s = normalizeName(v);
   if (!s) return false;
   if (s.length < 2) return false;
-  return /^[a-zA-Z?-?s'-]+$/.test(s);
+  if (s.length > 60) return false;
+  return HUMAN_NAME_REGEX.test(s);
 }
 
 function normalizeGender(v) {

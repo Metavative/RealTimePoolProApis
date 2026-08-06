@@ -1214,14 +1214,28 @@ export async function upsertMatch(tournamentId, matchUpdate) {
     if (String(m.teamB || "").trim().toUpperCase() === "BYE") m.teamBName = "BYE";
   }
 
-  // playoff / knockout / double-elim validation: elimination matches cannot
-  // end in a draw — somebody has to advance.
+  // playoff / knockout / double-elim validation
   if (
     (isPlayoffMatchId(m.id) || isKnockoutMatchId(m.id) || isDoubleElimMatchId(m.id)) &&
     m.status === "played"
   ) {
-    const aBye = String(m.teamA || "").trim().toUpperCase() === "BYE";
-    const bBye = String(m.teamB || "").trim().toUpperCase() === "BYE";
+    const aRaw = String(m.teamA || "").trim().toUpperCase();
+    const bRaw = String(m.teamB || "").trim().toUpperCase();
+    const aBye = aRaw === "BYE";
+    const bBye = bRaw === "BYE";
+
+    // A slot still waiting on an earlier round has no players in it, so there
+    // is no result to record. Rejecting here (not just in the app) keeps a
+    // malformed or out-of-order client from writing a nonsense score.
+    if (aRaw === "TBD" || bRaw === "TBD" || aRaw === "" || bRaw === "") {
+      const err = new Error(
+        "This match is waiting on an earlier round and cannot be scored yet"
+      );
+      err.statusCode = 409;
+      throw err;
+    }
+
+    // Elimination matches cannot end in a draw — somebody has to advance.
     if (!aBye && !bBye && m.scoreA === m.scoreB) {
       const err = new Error("Elimination matches cannot end in a draw");
       err.statusCode = 400;

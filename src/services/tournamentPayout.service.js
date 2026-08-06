@@ -100,8 +100,10 @@ export function computePayouts(poolMinor, winners = [], splitBps = [10000]) {
 
   let allocated = 0;
   const payouts = payable.map((w, i) => {
-    const bps = num(splitBps[i], i === 0 ? 10000 : 0);
-    const amt = Math.floor((pool * bps) / 10000);
+    const bps = Math.max(0, num(splitBps[i], i === 0 ? 10000 : 0));
+    // Never allocate more than what is still in the pool. Without this a split
+    // array summing above 10000 bps would pay out more than the pool holds.
+    const amt = Math.min(Math.floor((pool * bps) / 10000), pool - allocated);
     allocated += amt;
     return { ...w, amountMinor: amt };
   });
